@@ -91,7 +91,7 @@ class PoseEngine:
                 cv2.line(image, points[start_idx], points[end_idx], (0, 255, 0), 2)
         return image
 
-    def process_frame(self, frame, timestamp_ms):
+    def process_frame(self, frame, timestamp_ms, draw_overlay=True):
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
@@ -99,7 +99,7 @@ class PoseEngine:
         
         metrics = self.metrics_engine.get_empty_metrics()
         
-        if result.pose_landmarks:
+        if draw_overlay and result.pose_landmarks:
             for pose_landmarks in result.pose_landmarks:
                 self._draw_landmarks(frame, pose_landmarks)
 

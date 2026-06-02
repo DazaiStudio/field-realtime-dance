@@ -38,6 +38,13 @@ osc_sender = OSCSender(
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 
+PERFORMANCE_PRESETS = {
+    "fast": {"width": 640, "height": 360, "target_fps": 20.0, "jpeg_quality": 55},
+    "balanced": {"width": 720, "height": 405, "target_fps": 24.0, "jpeg_quality": 60},
+    "quality": {"width": 960, "height": 540, "target_fps": 24.0, "jpeg_quality": 65},
+}
+DEFAULT_PERFORMANCE = "balanced"
+
 source_state = {
     "source": "live",
     "camera_index": 0,
@@ -45,10 +52,12 @@ source_state = {
     "video_path": None,
     "video_name": None,
     "loop": True,
-    "target_fps": 24.0,
-    "jpeg_quality": 60,
-    "width": 960,
-    "height": 540,
+    "performance": DEFAULT_PERFORMANCE,
+    "overlay_enabled": True,
+    "target_fps": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["target_fps"],
+    "jpeg_quality": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["jpeg_quality"],
+    "width": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["width"],
+    "height": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["height"],
     "session_id": 0,
     "osc_metrics": list(METRIC_NAMES),
     "detect_enabled": False,
@@ -313,6 +322,16 @@ def apply_live_mirror(frame):
     return frame
 
 
+def apply_performance_preset(performance: str) -> None:
+    selected = performance if performance in PERFORMANCE_PRESETS else DEFAULT_PERFORMANCE
+    preset = PERFORMANCE_PRESETS[selected]
+    source_state["performance"] = selected
+    source_state["target_fps"] = preset["target_fps"]
+    source_state["jpeg_quality"] = preset["jpeg_quality"]
+    source_state["width"] = preset["width"]
+    source_state["height"] = preset["height"]
+
+
 async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
@@ -334,7 +353,11 @@ async def stream_live():
         frame = resize_frame(frame)
 
         timestamp_ms = int(time.time() * 1000)
-        processed, metrics = engine.process_frame(frame, timestamp_ms)
+        processed, metrics = engine.process_frame(
+            frame,
+            timestamp_ms,
+            draw_overlay=bool(source_state.get("overlay_enabled", True)),
+        )
         set_latest(metrics, timestamp_ms, frame)
         encoded = encode_frame(processed)
         if encoded:
@@ -355,6 +378,7 @@ async def stream_live_preview():
         and source_state["session_id"] == session_id
         and not source_state["detect_enabled"]
     ):
+        started = time.time()
         ok, frame = cap.read()
         if not ok:
             processing_state["error"] = "Camera frame not available"
@@ -369,7 +393,8 @@ async def stream_live_preview():
             yield encoded
 
         frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
-        await asyncio.sleep(frame_interval)
+        elapsed = time.time() - started
+        await asyncio.sleep(max(0.0, frame_interval - elapsed))
 
 
 async def stream_video():
@@ -411,7 +436,11 @@ async def stream_video():
             frame = resize_frame(frame)
 
             timestamp_ms = int(time.time() * 1000)
-            processed, metrics = engine.process_frame(frame, timestamp_ms)
+            processed, metrics = engine.process_frame(
+                frame,
+                timestamp_ms,
+                draw_overlay=bool(source_state.get("overlay_enabled", True)),
+            )
             set_latest(metrics, timestamp_ms, frame)
             encoded = encode_frame(processed)
             if encoded:
@@ -497,10 +526,8 @@ async def apply_input(
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(0.25),
     osc_namespace: str = Form("/field"),
-    target_fps: float = Form(24.0),
-    jpeg_quality: int = Form(60),
-    width: int = Form(960),
-    height: int = Form(540),
+    performance: str = Form(DEFAULT_PERFORMANCE),
+    overlay_enabled: bool = Form(True),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -517,10 +544,8 @@ async def apply_input(
 
     source_state["session_id"] += 1
     source_state["detect_enabled"] = bool(detect_enabled)
-    source_state["target_fps"] = max(1.0, min(float(target_fps), 30.0))
-    source_state["jpeg_quality"] = max(35, min(int(jpeg_quality), 90))
-    source_state["width"] = max(320, min(int(width), 1280))
-    source_state["height"] = max(180, min(int(height), 720))
+    apply_performance_preset(performance)
+    source_state["overlay_enabled"] = bool(overlay_enabled)
     source_state["osc_metrics"] = list(METRIC_NAMES)
 
     if source == "live":
@@ -794,6 +819,17 @@ VIEWER_HTML = """
       border-bottom: 1px solid var(--line);
       background: #171411;
     }
+    .metric-toggle-row {
+      display: flex;
+      align-items: end;
+      gap: 8px;
+      min-height: 42px;
+      padding-bottom: 2px;
+      color: var(--text);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
     .osc-toggle-row {
       display: flex;
       align-items: center;
@@ -952,6 +988,16 @@ VIEWER_HTML = """
 
       <aside class="panel">
         <div class="metric-osc-controls">
+          <label><span class="label-row">Performance <span class="info-dot" title="Fast lowers processing resolution for smoother live detection. Quality keeps a larger processing size.">?</span></span>
+            <select id="performance" name="performance">
+              <option value="fast">fast</option>
+              <option value="balanced" selected>balanced</option>
+              <option value="quality">quality</option>
+            </select>
+          </label>
+          <label class="metric-toggle-row" title="Show or hide the skeleton drawing. Detection, metrics, and OSC continue either way.">
+            <input id="overlayEnabled" name="overlay_enabled" type="checkbox" checked /> Overlay
+          </label>
           <label><span class="label-row">Mode <span class="info-dot" title="raw: send original metric values. normalize: map output toward a bounded 0-1 range using adaptive peaks; sync_correlation maps -1..1 to 0..1.">?</span></span>
             <select id="oscMode" name="osc_mode" title="raw: original metric values. normalize: adaptive bounded output for OSC and display.">
               <option value="raw">raw</option>
@@ -1026,6 +1072,8 @@ VIEWER_HTML = """
       data.set('loop', 'true');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('performance', document.getElementById('performance').value);
+      data.set('overlay_enabled', document.getElementById('overlayEnabled').checked ? 'true' : 'false');
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -1038,8 +1086,23 @@ VIEWER_HTML = """
       }
       inputDirty = false;
       oscDirty = false;
+      runtimeDirty = false;
 
       return payload;
+    }
+
+    function scheduleRuntimeApply() {
+      runtimeDirty = true;
+      window.clearTimeout(runtimeApplyTimer);
+      runtimeApplyTimer = window.setTimeout(async () => {
+        const payload = await applySettings(isDetecting);
+        if (!payload || payload.status !== 'applied') return;
+        if (isDetecting) {
+          showDetectionStream();
+        } else {
+          showPreview();
+        }
+      }, 80);
     }
 
     function buildOscFormData() {
@@ -1099,7 +1162,9 @@ VIEWER_HTML = """
     let lastPayload = null;
     let inputDirty = false;
     let oscDirty = false;
+    let runtimeDirty = false;
     let oscApplyTimer = null;
+    let runtimeApplyTimer = null;
 
     function showPreview() {
       streamImage.classList.add('hidden');
@@ -1141,6 +1206,8 @@ VIEWER_HTML = """
       inputDirty = true;
       sourceInput.value = 'live';
     });
+    document.getElementById('performance').addEventListener('change', scheduleRuntimeApply);
+    document.getElementById('overlayEnabled').addEventListener('change', scheduleRuntimeApply);
     dropZone.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
@@ -1246,6 +1313,10 @@ VIEWER_HTML = """
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
       if (!inputDirty) {
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
+      }
+      if (!runtimeDirty) {
+        document.getElementById('performance').value = source.performance || 'balanced';
+        document.getElementById('overlayEnabled').checked = source.overlay_enabled !== false;
       }
       if (!oscDirty) {
         document.getElementById('oscHost').value = osc.host || '127.0.0.1';

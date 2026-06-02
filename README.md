@@ -14,11 +14,20 @@ Use it to:
 - mirror live camera input when needed
 - preview the input
 - toggle pose detection on/off
-- show the skeleton overlay
+- switch performance presets for live/video processing
+- show or hide the skeleton overlay
 - display 9 realtime dance metrics
 - send the 9 metrics over OSC
 
 ## Quick Start
+
+Recommended Python:
+
+```text
+Python 3.11
+```
+
+The project does not require conda specifically. A normal Python install, conda env, venv, or uv-managed Python is fine as long as `python --version` / `python3 --version` reports Python 3.11.
 
 First clone the repo, or open your existing local copy:
 
@@ -125,6 +134,18 @@ The viewer lets you change:
 - raw / normalize mode
 - Alpha (smooth) slider
 - whether OSC output is enabled
+
+## Performance
+
+The viewer has runtime performance presets:
+
+```text
+fast      640x360, 20fps target
+balanced  720x405, 24fps target
+quality   960x540, 24fps target
+```
+
+Changing `Performance` while the viewer is running restarts the local stream with the new processing size. `Overlay` only shows or hides the skeleton drawing; detection, metrics, and OSC output continue either way.
 
 `Enable OSC` turns metric output on or off for all 9 metrics.
 
