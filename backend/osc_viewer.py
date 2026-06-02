@@ -757,7 +757,7 @@ VIEWER_HTML = """
     .meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .metric-osc-controls {
       display: grid;
-      grid-template-columns: minmax(130px, 1fr) 126px 96px;
+      grid-template-columns: 126px minmax(150px, 1fr);
       gap: 10px;
       align-items: end;
       padding: 12px;
@@ -773,6 +773,20 @@ VIEWER_HTML = """
       font-size: 13px;
       text-transform: uppercase;
       letter-spacing: .06em;
+    }
+    .label-row { display: flex; align-items: center; gap: 6px; }
+    .info-dot {
+      display: inline-grid;
+      place-items: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font: 11px ui-monospace, monospace;
+      text-transform: none;
+      letter-spacing: 0;
+      cursor: help;
     }
     .range-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .range-value { color: var(--text); font: 12px ui-monospace, monospace; }
@@ -823,7 +837,7 @@ VIEWER_HTML = """
     .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
     .osc-settings {
       display: grid;
-      grid-template-columns: minmax(160px, 1fr) 88px minmax(160px, 1fr);
+      grid-template-columns: 150px 88px 160px 130px;
       gap: 10px;
       align-items: end;
     }
@@ -902,15 +916,15 @@ VIEWER_HTML = """
             <label>Prefix
               <input id="oscNamespace" name="osc_namespace" value="/field" />
             </label>
+            <label class="osc-toggle-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enable OSC</label>
           </div>
         </div>
       </section>
 
       <aside class="panel">
         <div class="metric-osc-controls">
-          <label class="osc-toggle-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enable OSC</label>
-          <label>Mode
-            <select id="oscMode" name="osc_mode">
+          <label><span class="label-row">Mode <span class="info-dot" title="raw: send original metric values. normalize: map output toward a bounded 0-1 range using adaptive peaks; sync_correlation maps -1..1 to 0..1.">?</span></span>
+            <select id="oscMode" name="osc_mode" title="raw: original metric values. normalize: adaptive bounded output for OSC and display.">
               <option value="raw">raw</option>
               <option value="normalize">normalize</option>
             </select>
@@ -947,14 +961,26 @@ VIEWER_HTML = """
       torque: 'more force',
       jerk: 'lower = smoother',
     };
+    const metricDescriptions = {
+      energy: 'Overall movement intensity from weighted limb angular velocity. Higher means more active motion.',
+      sync_velocity: 'Left/right movement magnitude balance. 1 means both sides move with similar velocity; 0 means strongly uneven.',
+      sync_correlation: 'Temporal correlation between left and right side movement. Raw range is -1 to 1, with 0 as neutral. Normalize maps it to 0 to 1.',
+      expansion: 'Body volume / spatial reach from the convex hull of the tracked joints. Higher means a larger body shape.',
+      curvature: 'Curvature of wrist and ankle trajectories. Higher means more curved or circular movement paths.',
+      height: 'Estimated body center height from the center of mass. Higher/lower depends on body level in the frame.',
+      sway: 'Horizontal center-of-mass deviation from the base of support. Lower usually means more stable.',
+      torque: 'Movement transition effort from angular acceleration. Higher means sharper forceful transitions.',
+      jerk: 'Abruptness cost from changes in acceleration. Lower generally means smoother motion; raw values can be very large.',
+    };
     const centeredMetrics = new Set(['sync_correlation']);
 
     for (const name of metricNames) {
       maxSeen[name] = 1;
       const row = document.createElement('div');
       row.className = 'metric';
+      row.title = metricDescriptions[name] || name;
       row.innerHTML = `
-        <div class="metric-label">
+        <div class="metric-label" title="${metricDescriptions[name] || name}">
           <div class="name">${name}</div>
           <div class="metric-hint">${metricHints[name] || ''}</div>
         </div>
