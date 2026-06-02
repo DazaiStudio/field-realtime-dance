@@ -63,6 +63,7 @@ processing_state = {
     "last_frame_at": None,
     "error": None,
 }
+osc_terminal_log = []
 
 
 def get_pose_engine() -> PoseEngine:
@@ -95,6 +96,7 @@ def state_payload() -> dict:
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
         "addresses": [f"{osc_sender.namespace}/{name}" for name in source_state["osc_metrics"]],
+        "osc_terminal": list(osc_terminal_log),
     }
     payload["source"]["video_path"] = None
     return payload
@@ -186,8 +188,28 @@ def set_latest(metrics: dict, timestamp_ms: int) -> None:
         key: value for key, value in metrics.items()
         if key in set(source_state["osc_metrics"])
     }
-    osc_sender.send_metrics(outbound_metrics)
+    sent_messages = osc_sender.send_metrics(outbound_metrics)
     osc_sender.send_heartbeat(timestamp_ms)
+    log_osc_messages(sent_messages)
+
+
+def log_osc_messages(messages: list[dict]) -> None:
+    if not messages:
+        return
+    timestamp = time.strftime("%H:%M:%S")
+    for message in messages:
+        value = message["value"]
+        if isinstance(value, float):
+            value = f"{value:.2f}"
+        osc_terminal_log.append(
+            {
+                "time": timestamp,
+                "address": message["address"],
+                "mode": osc_sender.mode,
+                "value": value,
+            }
+        )
+    del osc_terminal_log[:-40]
 
 
 def encode_frame(frame):
@@ -418,6 +440,7 @@ async def apply_input(
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
     processing_state["error"] = None
+    osc_terminal_log.clear()
     osc_sender.reset_state()
     return {"status": "applied", **state_payload()}
 
@@ -632,8 +655,26 @@ VIEWER_HTML = """
     .bar { height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
     .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), var(--teal)); transition: width .08s linear; }
     .address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
+    .address-title-row { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-top: 12px; }
+    .address-title-row .section-title { margin-bottom: 0; }
+    .mode-inline { width: 150px; }
     .address-list { display: grid; gap: 6px; color: var(--muted); font: 12px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
+    .osc-terminal {
+      min-height: 110px;
+      max-height: 180px;
+      overflow-y: auto;
+      display: grid;
+      align-content: start;
+      gap: 4px;
+      padding: 10px;
+      background: #0d0b09;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: #d8d0c6;
+      font: 12px ui-monospace, monospace;
+    }
+    .osc-terminal div { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
     .metric input { width: 16px; min-height: 16px; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
@@ -691,10 +732,6 @@ VIEWER_HTML = """
           <div id="metaC">input: -</div>
           <div id="metaD">osc: -</div>
         </div>
-      </section>
-
-      <aside class="panel">
-        <div id="metrics" class="metric-grid"></div>
         <div class="address-panel">
           <p class="section-title">OSC</p>
           <div class="controls-grid">
@@ -707,20 +744,28 @@ VIEWER_HTML = """
             <label>Prefix
               <input id="oscNamespace" name="osc_namespace" value="/field" />
             </label>
-            <label>Mode
-              <select id="oscMode" name="osc_mode">
-                <option value="raw">raw</option>
-                <option value="normalize">normalize</option>
-              </select>
-            </label>
             <label>Alpha
               <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
             </label>
             <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enabled</label>
           </div>
-          <p class="section-title">OSC addresses</p>
+          <div class="address-title-row">
+            <p class="section-title">OSC addresses</p>
+            <label class="mode-inline">Mode
+              <select id="oscMode" name="osc_mode">
+                <option value="raw">raw</option>
+                <option value="normalize">normalize</option>
+              </select>
+            </label>
+          </div>
           <div id="addresses" class="address-list"></div>
+          <p class="section-title">OSC terminal</p>
+          <div id="oscTerminal" class="osc-terminal"></div>
         </div>
+      </section>
+
+      <aside class="panel">
+        <div id="metrics" class="metric-grid"></div>
       </aside>
     </section>
     <input id="source" name="source" type="hidden" value="live" />
@@ -839,7 +884,11 @@ VIEWER_HTML = """
       dropZone.innerHTML = 'Drop video here<br />or click to choose';
     });
 
-    dropZone.addEventListener('click', () => videoInput.click());
+    dropZone.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      videoInput.click();
+    });
     videoInput.addEventListener('change', () => {
       if (videoInput.files.length > 0) {
         sourceInput.value = 'video';
@@ -898,11 +947,12 @@ VIEWER_HTML = """
 
     function updateAddresses(payload) {
       const addresses = payload.addresses || [];
+      const mode = payload.osc?.mode || 'raw';
       const container = document.getElementById('addresses');
       container.innerHTML = '';
       for (const address of addresses) {
         const row = document.createElement('div');
-        row.textContent = address;
+        row.textContent = `${address}  mode=${mode}`;
         container.appendChild(row);
       }
       if (addresses.length === 0) {
@@ -910,6 +960,24 @@ VIEWER_HTML = """
         row.textContent = 'No metrics selected';
         container.appendChild(row);
       }
+    }
+
+    function updateTerminal(payload) {
+      const rows = payload.osc_terminal || [];
+      const terminal = document.getElementById('oscTerminal');
+      terminal.innerHTML = '';
+      if (rows.length === 0) {
+        const row = document.createElement('div');
+        row.textContent = 'waiting for OSC output...';
+        terminal.appendChild(row);
+        return;
+      }
+      for (const item of rows.slice(-18)) {
+        const row = document.createElement('div');
+        row.textContent = `${item.time}  ${item.address}  ${item.mode}  ${item.value}`;
+        terminal.appendChild(row);
+      }
+      terminal.scrollTop = terminal.scrollHeight;
     }
 
     function update(payload) {
@@ -934,6 +1002,7 @@ VIEWER_HTML = """
         document.getElementById('metaD').textContent = `osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
       }
       updateAddresses(payload);
+      updateTerminal(payload);
 
       for (const name of metricNames) {
         const value = Number(metrics[name] ?? 0);

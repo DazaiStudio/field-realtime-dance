@@ -95,9 +95,10 @@ class OSCSender:
             "last_sent_at": self.last_sent_at,
         }
 
-    def send_metrics(self, metrics: Mapping[str, float]) -> None:
+    def send_metrics(self, metrics: Mapping[str, float]) -> list[dict]:
+        sent = []
         if not self.enabled:
-            return
+            return sent
 
         for key in METRIC_NAMES:
             if key not in metrics:
@@ -105,9 +106,12 @@ class OSCSender:
             value = self._prepare_value(key, metrics[key])
             if value is None:
                 continue
-            self._send_message(f"{self.namespace}/{key}", value)
+            address = f"{self.namespace}/{key}"
+            self._send_message(address, value)
+            sent.append({"address": address, "value": value})
 
         self.last_sent_at = time.time()
+        return sent
 
     def send_heartbeat(self, timestamp_ms: int) -> None:
         if not self.enabled:
