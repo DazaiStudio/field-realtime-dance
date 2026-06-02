@@ -97,6 +97,8 @@ The viewer's metric values follow the selected OSC mode. In `raw` mode, the page
 
 OSC settings apply at runtime. Changing mode, prefix, alpha, target, or enabled state does not require restarting detection.
 
+Metric bars are neutral readouts, not good/bad scores. Each metric has its own scale hint in the viewer; `sync_correlation` is shown around a center/neutral point.
+
 ## Camera Notes
 
 The camera dropdown uses the device names reported by the operating system. Choose the source you want to use, then press `Enter` in the viewer.

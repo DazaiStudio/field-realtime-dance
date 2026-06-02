@@ -780,24 +780,46 @@ VIEWER_HTML = """
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 122px 112px 1fr;
+      grid-template-columns: 132px 102px 1fr;
       align-items: center;
       gap: 10px;
-      min-height: 46px;
+      min-height: 52px;
       padding: 9px;
       background: var(--surface-soft);
       border: 1px solid var(--line);
       border-radius: 8px;
     }
+    .metric-label { display: grid; gap: 3px; min-width: 0; }
     .name { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
+    .metric-hint { color: #7f756b; font-size: 10px; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .value {
       font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
       text-align: right;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .bar { height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
-    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), var(--teal)); transition: width .08s linear; }
+    .bar { position: relative; height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
+    .bar.centered::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: #7f756b;
+      opacity: .75;
+      z-index: 1;
+    }
+    .fill {
+      position: absolute;
+      left: 0;
+      top: 0;
+      height: 100%;
+      width: 0%;
+      background: var(--teal);
+      opacity: .78;
+      transition: width .08s linear, left .08s linear;
+    }
     .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
     .osc-settings {
       display: grid;
@@ -900,7 +922,7 @@ VIEWER_HTML = """
         </div>
         <div id="metrics" class="metric-grid"></div>
         <div class="metric-address-panel">
-          <p class="section-title">OSC addresses</p>
+          <p class="section-title">OSC output values</p>
           <div id="addresses" class="address-list"></div>
         </div>
       </aside>
@@ -914,15 +936,30 @@ VIEWER_HTML = """
     const metricNames = %METRICS%;
     const metricsEl = document.getElementById('metrics');
     const maxSeen = {};
+    const metricHints = {
+      energy: 'more motion',
+      sync_velocity: '1 = balanced',
+      sync_correlation: 'center = neutral',
+      expansion: 'larger shape',
+      curvature: 'more curved',
+      height: 'body level',
+      sway: 'lower = stable',
+      torque: 'more force',
+      jerk: 'lower = smoother',
+    };
+    const centeredMetrics = new Set(['sync_correlation']);
 
     for (const name of metricNames) {
       maxSeen[name] = 1;
       const row = document.createElement('div');
       row.className = 'metric';
       row.innerHTML = `
-        <div class="name">${name}</div>
+        <div class="metric-label">
+          <div class="name">${name}</div>
+          <div class="metric-hint">${metricHints[name] || ''}</div>
+        </div>
         <div class="value" id="v-${name}">0.00</div>
-        <div class="bar"><div class="fill" id="b-${name}"></div></div>
+        <div class="bar" id="bar-${name}"><div class="fill" id="b-${name}"></div></div>
       `;
       metricsEl.appendChild(row);
     }
@@ -1123,6 +1160,29 @@ VIEWER_HTML = """
       return value.toFixed(2);
     }
 
+    function updateMetricBar(name, value, mode) {
+      const bar = document.getElementById(`bar-${name}`);
+      const fill = document.getElementById(`b-${name}`);
+      if (!bar || !fill) return;
+
+      if (centeredMetrics.has(name)) {
+        bar.classList.add('centered');
+        const neutral = mode === 'normalize' ? 0.5 : 0;
+        const span = mode === 'normalize' ? 0.5 : 1;
+        const delta = Math.max(-1, Math.min(1, (value - neutral) / span));
+        const width = Math.abs(delta) * 50;
+        fill.style.left = delta < 0 ? `${50 - width}%` : '50%';
+        fill.style.width = `${width}%`;
+        return;
+      }
+
+      bar.classList.remove('centered');
+      maxSeen[name] = Math.max(maxSeen[name] * 0.995, Math.abs(value), 1);
+      const width = Math.max(0, Math.min(100, Math.abs(value) / maxSeen[name] * 100));
+      fill.style.left = '0%';
+      fill.style.width = `${width}%`;
+    }
+
     function update(payload) {
       lastPayload = payload;
       const source = payload.source || {};
@@ -1161,12 +1221,10 @@ VIEWER_HTML = """
 
       for (const name of metricNames) {
         const value = Number(metrics[name] ?? 0);
-        maxSeen[name] = Math.max(maxSeen[name] * 0.995, Math.abs(value), 1);
         const valueEl = document.getElementById(`v-${name}`);
         valueEl.textContent = formatMetric(value);
         valueEl.title = Number.isFinite(value) ? value.toFixed(2) : String(value);
-        const width = Math.max(0, Math.min(100, Math.abs(value) / maxSeen[name] * 100));
-        document.getElementById(`b-${name}`).style.width = `${width}%`;
+        updateMetricBar(name, value, osc.mode || 'raw');
       }
     }
 
