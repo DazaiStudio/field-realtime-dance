@@ -1,162 +1,175 @@
-# Real-time Dance Aesthetics Analysis
+# FIELD Realtime Dance
 
-A sophisticated real-time motion analysis dashboard designed for dance and movement aesthetics. This project leverages MediaPipe's Task API for pose estimation and calculates nine distinct metrics based on biomechanical principles to provide live feedback on a dancer's performance.
+Local viewer for live camera / video dance analysis with skeleton overlay, realtime metrics, and OSC output.
 
-![Architecture](https://img.shields.io/badge/Architecture-FastAPI%20%2B%20React%20%2B%20MediaPipe-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
+This repository is a field-use fork of [`YukiHataRin/realtime-dance-analysis`](https://github.com/YukiHataRin/realtime-dance-analysis). The original project provides the MediaPipe pose pipeline and dance metric engine; this fork focuses on making a simple local viewer that the team can run for testing, rehearsals, and OSC integration.
 
-## 🌟 Key Features
+## What This Runs
 
-- **Real-time Pose Estimation**: High-fidelity 33-point body tracking using MediaPipe's Pose Landmarker.
-- **Biomechanical Metrics Engine**: Calculates 9 distinct aesthetic indicators based on H36M compatible skeleton data.
-- **WebSocket Synchronization**: Low-latency data transmission between the Python backend and React frontend.
-- **Interactive Dashboard**: 3x3 grid visualization with real-time charts and value tracking.
-- **Dynamic Skeleton Overlay**: Real-time visualization of the tracking skeleton (focusing on torso and limbs).
+The main tool is a browser viewer at `http://127.0.0.1:9100`.
 
-## 📊 The 9 Aesthetic Metrics
+Use it to:
 
-Our analysis engine decomposes movement into nine key indicators as defined in our system's pseudocode:
+- choose a live camera or drop in a video file
+- preview the input
+- toggle pose detection on/off
+- show the skeleton overlay
+- display 9 realtime dance metrics
+- send selected metrics over OSC
+- monitor OSC messages from the same page
 
-1.  **Intensity (Energy)**: Sum of limb angular velocities ($rad^2/s$). Reflects the overall physical output.
-2.  **Sync - Balance**: The magnitude ratio between left and right limb velocities ([0, 1]). Measures spatial symmetry.
-3.  **Sync - Correlation**: Rolling Pearson correlation between left and right side movements ([-1, 1]). Measures temporal synchronicity.
-4.  **Volume (Expansion)**: The 3D convex hull volume occupied by the 17 key joints. Reflects spatial extension.
-5.  **Roundness (Curvature)**: Geometric curvature ($\kappa$) of the extremities' (wrists/ankles) trajectories.
-6.  **Stability - Height**: Vertical level of the body's Center of Mass (CoM).
-7.  **Stability - Sway**: Horizontal deviation of the CoM from the Base of Support (mid-point of ankles).
-8.  **Effort (Torque)**: Sum of limb angular accelerations ($rad/s^2$). Measures the force required for transitions.
-9.  **Smoothness (Jerk)**: Time derivative of acceleration. Higher values indicate more abrupt, less fluid movements.
+## Quick Start
 
-## 🛠️ Tech Stack
+From the repo root:
 
-- **Backend**: Python 3.9+, FastAPI, MediaPipe Tasks API, OpenCV, SciPy, NumPy.
-- **Frontend**: React (Vite), Tailwind CSS, Recharts (for live data visualization), Lucide React.
-- **Communication**: WebSockets (Metrics), MJPEG (Video Stream), and OSC over UDP.
-
-## 📡 OSC Output
-
-The backend sends the 9 dance metrics over OSC at the same cadence as the live metrics broadcast.
-
-- Default target: `udp://127.0.0.1:9000`
-- Namespace: `/field`
-- Addresses: `/field/energy`, `/field/sync_velocity`, `/field/sync_correlation`, `/field/expansion`, `/field/curvature`, `/field/height`, `/field/sway`, `/field/torque`, `/field/jerk`
-- Heartbeat: `/field/heartbeat <timestamp_ms>`
-- Modes: `raw` or `normalize`
-- Smoothing: `alpha` uses EMA smoothing; `1.0` means no smoothing
-
-Environment variables:
-
-```bash
-FIELD_OSC_HOST=127.0.0.1
-FIELD_OSC_PORT=9000
-FIELD_OSC_ENABLED=1
-FIELD_OSC_MODE=raw
-FIELD_OSC_ALPHA=1.0
-FIELD_OSC_NAMESPACE=/field
+```powershell
+cd D:\Github\field-realtime-dance
+pip install -r requirements.txt
+python backend\osc_viewer.py --osc-port 9000 --web-port 9100
 ```
 
-Runtime API:
-
-```bash
-curl http://127.0.0.1:8000/api/osc/status
-
-curl -X POST http://127.0.0.1:8000/api/osc/config \
-  -H "Content-Type: application/json" \
-  -d "{\"host\":\"127.0.0.1\",\"port\":9000,\"enabled\":true,\"mode\":\"normalize\",\"alpha\":0.35}"
-```
-
-Normalization keeps bounded metrics in their natural range, maps `sync_correlation` from `[-1, 1]` to `[0, 1]`, and uses adaptive peak normalization for `energy`, `expansion`, `curvature`, `torque`, and `jerk`.
-
-### Local Input Viewer
-
-Run a local browser-based processor for live camera or video-file tests:
-
-```bash
-python backend/osc_viewer.py --osc-port 9000 --web-port 9100
-```
-
-Open `http://127.0.0.1:9100`. FIELD Realtime Dance has an input section for `Live Cam` or `Video File`; press **Apply** to process the selected input, show the skeleton overlay, display the 9 metrics, and send OSC at the same time.
-
-The viewer can also change OSC target, prefix, mode, smoothing alpha, and which metrics are sent directly from the page. Uploaded test videos are stored under `backend/viewer_uploads/` and are ignored by git.
-
-Terminal OSC monitor:
-
-```bash
-python backend/osc_monitor.py --host 127.0.0.1 --port 9000 --prefix /field
-```
-
-The monitor prints each received OSC address and formats float values to two decimals.
-
-### Video-to-OSC Test
-
-Process any input video and send the generated metrics to OSC without using the main frontend:
-
-```bash
-python backend/osc_video_test.py path/to/input.mp4 --host 127.0.0.1 --port 9000 --mode normalize --alpha 0.35
-```
-
-Recorded clips can also replay their saved metrics through OSC from the app's library using the radio button, or through the API:
-
-```bash
-curl -X POST http://127.0.0.1:8000/recordings/dance_YYYYMMDD-HHMMSS.mp4/osc/replay \
-  -H "Content-Type: application/json" \
-  -d "{\"speed\":1.0,\"loop\":false}"
-```
-
-## 🚀 Getting Started
-
-### Quick Start (One-Click Launcher)
-
-The easiest way to run the application is using the provided `start_app.py` script, which automatically handles dependency checks, model downloads, and environment setup:
-
-```bash
-python start_app.py
-```
-
-### Manual Setup (Development)
-
-#### Backend Setup
-1.  Install dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
-2.  Run the FastAPI server:
-    ```bash
-    cd backend
-    python app.py
-    ```
-    The server will start on `http://localhost:8000`.
-
-#### Frontend Setup
-1.  Navigate to the frontend directory:
-    ```bash
-    cd frontend
-    ```
-2.  Install packages:
-    ```bash
-    npm install
-    ```
-3.  Build or Run:
-    - **Development**: `npm run dev`
-    - **Production**: `npm run build`
-
-## 📂 Project Structure
+Open:
 
 ```text
-├── backend/
-│   ├── app.py              # FastAPI & WebSocket server
-│   ├── dance_metrics.py    # Metric calculation engine
-│   ├── pose_engine.py      # MediaPipe integration & drawing
-│   └── constants.py        # H36M joint mappings & weights
-├── frontend/
-│   ├── src/
-│   │   ├── components/     # VideoFeed & MetricsDashboard
-│   │   └── AppContent.jsx  # Main application logic
-│   └── dist/               # Compiled static assets
-├── pseudo_code.md          # Theoretical basis for metrics
-└── requirements.txt        # Backend dependencies
+http://127.0.0.1:9100
 ```
 
-## 📜 License
+Leave the terminal window running while using the viewer.
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+## Viewer Workflow
+
+1. Open `http://127.0.0.1:9100`.
+2. Choose a camera, or drop/click to choose a video file.
+3. Press `Enter` in the viewer.
+4. Confirm the raw preview appears.
+5. Toggle `Detect On` to start pose overlay, metrics, and OSC output.
+6. Toggle `Detect Off` to return to preview without pose detection.
+
+For video files, playback loops by default. For live camera, the viewer shows the selected camera stream and reports FPS/status below the video.
+
+## OSC
+
+Default OSC target:
+
+```text
+udp://127.0.0.1:9000
+```
+
+Default prefix:
+
+```text
+/field
+```
+
+Metric addresses:
+
+```text
+/field/energy
+/field/sync_velocity
+/field/sync_correlation
+/field/expansion
+/field/curvature
+/field/height
+/field/sway
+/field/torque
+/field/jerk
+```
+
+Heartbeat:
+
+```text
+/field/heartbeat <timestamp_ms>
+```
+
+The viewer lets you change:
+
+- OSC host
+- OSC port
+- address prefix
+- raw / normalize mode
+- smoothing alpha
+- which metrics are sent
+
+Unchecked metrics are not sent over OSC and are hidden from the address list.
+
+## OSC Monitor
+
+The viewer includes a collapsible OSC terminal. You can also run a standalone monitor:
+
+```powershell
+python backend\osc_monitor.py --host 127.0.0.1 --port 9000 --prefix /field
+```
+
+This is useful when testing whether another app is receiving the same values.
+
+## Camera Notes
+
+Camera names are listed from DirectShow on Windows, for example:
+
+```text
+0 - USB2.0 HD UVC WebCam
+1 - NDI Webcam Video 1
+9 - OBS Virtual Camera
+```
+
+If the viewer does not show camera video:
+
+- close other apps that may be using the camera
+- check Windows Camera Privacy settings
+- test the camera in the Windows Camera app
+- restart the viewer after changing virtual camera / NDI / OBS sources
+
+Only one app should own the same camera source at a time.
+
+## Test Video
+
+You can test with any local `.mp4` file. Example:
+
+```text
+C:\Users\tommy\OneDrive\work\2026_work\future-folk\04_dataset\morris_dance\clips\beetlecrushers__v18_v18a.mp4
+```
+
+Drop the file into the viewer, press `Enter`, then toggle `Detect On`.
+
+## CLI Options
+
+```powershell
+python backend\osc_viewer.py `
+  --web-host 127.0.0.1 `
+  --web-port 9100 `
+  --osc-host 127.0.0.1 `
+  --osc-port 9000 `
+  --osc-mode raw `
+  --osc-alpha 1.0 `
+  --osc-namespace /field
+```
+
+`--osc-mode` can be:
+
+- `raw`: send metric values directly
+- `normalize`: map values into a more bounded range
+
+`--osc-alpha` controls smoothing. `1.0` means no smoothing.
+
+## Project Structure
+
+```text
+backend/
+  osc_viewer.py      # Local browser viewer
+  osc_sender.py      # OSC output, normalization, smoothing
+  osc_monitor.py     # Standalone OSC monitor
+  pose_engine.py     # MediaPipe pose detection and overlay
+  dance_metrics.py   # 9 dance metric calculations
+frontend/            # Original React dashboard
+requirements.txt     # Python dependencies
+```
+
+## Development Checks
+
+Useful commands before committing changes:
+
+```powershell
+python -m compileall backend
+git diff --check
+git status --short
+```
