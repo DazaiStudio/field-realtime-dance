@@ -39,7 +39,7 @@ class OSCSender:
     ) -> None:
         self.host = host
         self.port = int(port)
-        self.namespace = namespace.rstrip("/") or "/field"
+        self.namespace = self._normalize_namespace(namespace)
         self.enabled = bool(enabled)
         self.mode = self._validate_mode(mode)
         self.alpha = self._validate_alpha(alpha)
@@ -66,7 +66,7 @@ class OSCSender:
             self.port = int(port)
             client_changed = True
         if namespace is not None:
-            self.namespace = namespace.rstrip("/") or "/field"
+            self.namespace = self._normalize_namespace(namespace)
         if enabled is not None:
             self.enabled = bool(enabled)
         if mode is not None:
@@ -173,4 +173,13 @@ class OSCSender:
         value = float(alpha)
         if not 0.0 < value <= 1.0:
             raise ValueError("OSC alpha must be > 0 and <= 1")
+        return value
+
+    @staticmethod
+    def _normalize_namespace(namespace: str) -> str:
+        value = str(namespace or "/field").strip().rstrip("/")
+        if not value:
+            return "/field"
+        if not value.startswith("/"):
+            value = f"/{value}"
         return value

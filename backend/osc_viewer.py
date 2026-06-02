@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional, Set
@@ -25,12 +26,14 @@ app = FastAPI()
 clients: Set[WebSocket] = set()
 pose_engine: Optional[PoseEngine] = None
 camera = None
+camera_cache = {"updated_at": 0.0, "cameras": []}
 osc_sender = OSCSender(
     host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
     mode=os.getenv("FIELD_OSC_MODE", "raw"),
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
+    namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 
 source_state = {
@@ -44,6 +47,7 @@ source_state = {
     "width": 640,
     "height": 360,
     "session_id": 0,
+    "osc_metrics": list(METRIC_NAMES),
     "applied_at": time.time(),
 }
 
@@ -87,9 +91,53 @@ def state_payload() -> dict:
         "source": dict(source_state),
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
+        "addresses": [f"{osc_sender.namespace}/{name}" for name in source_state["osc_metrics"]],
     }
     payload["source"]["video_path"] = None
     return payload
+
+
+def get_windows_camera_names() -> list[str]:
+    if os.name != "nt":
+        return []
+    command = (
+        "Get-CimInstance Win32_PnPEntity | "
+        "Where-Object { $_.PNPClass -in @('Camera','Image') } | "
+        "Select-Object -ExpandProperty Name"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+    except Exception:
+        return []
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def list_cameras(max_index: int = 4) -> list[dict]:
+    if time.time() - camera_cache["updated_at"] < 10 and camera_cache["cameras"]:
+        return camera_cache["cameras"]
+
+    names = get_windows_camera_names()
+    cameras = []
+    for index in range(max_index):
+        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(index, backend)
+        available = cap.isOpened()
+        cap.release()
+        if not available:
+            continue
+        name = names[len(cameras)] if len(cameras) < len(names) else f"Camera {index}"
+        cameras.append({"index": index, "name": name, "label": f"{index} - {name}"})
+    if not cameras:
+        cameras.append({"index": 0, "name": "Camera 0", "label": "0 - Camera 0"})
+    camera_cache["updated_at"] = time.time()
+    camera_cache["cameras"] = cameras
+    return cameras
 
 
 def set_latest(metrics: dict, timestamp_ms: int) -> None:
@@ -101,7 +149,11 @@ def set_latest(metrics: dict, timestamp_ms: int) -> None:
     processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
     processing_state["frame_count"] += 1
     processing_state["error"] = None
-    osc_sender.send_metrics(metrics)
+    outbound_metrics = {
+        key: value for key, value in metrics.items()
+        if key in set(source_state["osc_metrics"])
+    }
+    osc_sender.send_metrics(outbound_metrics)
     osc_sender.send_heartbeat(timestamp_ms)
 
 
@@ -207,6 +259,11 @@ async def api_state():
     return state_payload()
 
 
+@app.get("/api/cameras")
+async def api_cameras():
+    return {"cameras": list_cameras()}
+
+
 @app.post("/api/apply")
 async def apply_input(
     source: str = Form("live"),
@@ -217,10 +274,13 @@ async def apply_input(
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
+    osc_namespace: str = Form("/field"),
     target_fps: float = Form(10.0),
     jpeg_quality: int = Form(60),
     width: int = Form(640),
     height: int = Form(360),
+    osc_metrics_selected: bool = Form(False),
+    osc_metrics: Optional[list[str]] = Form(None),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -232,6 +292,7 @@ async def apply_input(
         enabled=osc_enabled,
         mode=osc_mode,
         alpha=osc_alpha,
+        namespace=osc_namespace,
     )
 
     source_state["session_id"] += 1
@@ -239,6 +300,11 @@ async def apply_input(
     source_state["jpeg_quality"] = max(35, min(int(jpeg_quality), 90))
     source_state["width"] = max(320, min(int(width), 1280))
     source_state["height"] = max(180, min(int(height), 720))
+    if osc_metrics_selected:
+        selected_metrics = [name for name in (osc_metrics or []) if name in METRIC_NAMES]
+    else:
+        selected_metrics = list(METRIC_NAMES)
+    source_state["osc_metrics"] = selected_metrics
 
     if source == "live":
         release_camera()
@@ -311,17 +377,26 @@ VIEWER_HTML = """
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>FIELD Input Viewer</title>
+  <title>FIELD Realtime Dance</title>
   <style>
     :root {
       color-scheme: dark;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0a0f1e;
-      color: #e5e7eb;
+      background: #141210;
+      color: #f4efe6;
+      --bg: #141210;
+      --surface: #1d1a17;
+      --surface-soft: #27221d;
+      --line: #3a3129;
+      --muted: #a99d91;
+      --text: #f4efe6;
+      --amber: #d98b5f;
+      --teal: #54b3a8;
+      --red: #d45d5d;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; background: #0a0f1e; color: #e5e7eb; }
-    main { max-width: 1480px; margin: 0 auto; padding: 18px; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    main { max-width: 1420px; margin: 0 auto; padding: 18px; }
     header {
       display: flex;
       align-items: center;
@@ -329,47 +404,59 @@ VIEWER_HTML = """
       gap: 14px;
       margin-bottom: 14px;
     }
-    h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
-    .status { display: flex; align-items: center; gap: 8px; color: #94a3b8; font: 13px ui-monospace, monospace; }
-    .dot { width: 10px; height: 10px; border-radius: 999px; background: #ef4444; }
-    .dot.live { background: #22c55e; box-shadow: 0 0 0 5px rgba(34,197,94,.14); }
+    h1 { margin: 0; font-size: 28px; font-weight: 720; letter-spacing: 0; }
+    .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font: 13px ui-monospace, monospace; }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--red); }
+    .dot.live { background: var(--teal); box-shadow: 0 0 0 5px rgba(84,179,168,.14); }
     .layout { display: grid; grid-template-columns: minmax(360px, 1fr) 430px; gap: 14px; align-items: start; }
     .panel {
-      background: #111827;
-      border: 1px solid #243044;
+      background: var(--surface);
+      border: 1px solid var(--line);
       border-radius: 8px;
       overflow: hidden;
     }
-    .controls { padding: 14px; display: grid; gap: 12px; }
-    .controls-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
-    label { display: grid; gap: 6px; color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .controls { padding: 14px; display: grid; gap: 14px; }
+    .section-title {
+      margin: 0 0 10px;
+      color: var(--amber);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .controls-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .wide { grid-column: span 2; }
+    .apply-row { display: grid; grid-template-columns: 1fr 150px; gap: 10px; align-items: end; }
+    .hint { color: var(--muted); font: 12px ui-monospace, monospace; align-self: center; }
+    .hidden { display: none !important; }
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
     input, select, button {
       width: 100%;
-      border: 1px solid #334155;
-      background: #0f172a;
-      color: #e5e7eb;
+      border: 1px solid var(--line);
+      background: #141210;
+      color: var(--text);
       border-radius: 8px;
       padding: 10px 11px;
       font-size: 14px;
       min-height: 42px;
     }
-    input[type="checkbox"] { width: 18px; min-height: 18px; accent-color: #22c55e; }
+    input[type="checkbox"] { width: 18px; min-height: 18px; accent-color: var(--teal); }
     button {
       cursor: pointer;
-      background: #2563eb;
-      border-color: #3b82f6;
+      background: var(--amber);
+      border-color: #f0a878;
+      color: #17120e;
       font-weight: 750;
       align-self: end;
     }
-    .check-row { display: flex; align-items: center; gap: 8px; padding-top: 22px; color: #cbd5e1; font-size: 14px; }
-    .video-wrap { position: relative; background: #020617; aspect-ratio: 16 / 9; }
+    .check-row { display: flex; align-items: center; gap: 8px; padding-top: 22px; color: var(--text); font-size: 14px; }
+    .video-wrap { position: relative; background: #090806; aspect-ratio: 16 / 9; }
     #stream { width: 100%; height: 100%; object-fit: contain; display: block; }
     .empty {
       position: absolute;
       inset: 0;
       display: grid;
       place-items: center;
-      color: #64748b;
+      color: var(--muted);
       font: 14px ui-monospace, monospace;
       pointer-events: none;
     }
@@ -377,30 +464,35 @@ VIEWER_HTML = """
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 8px;
-      border-top: 1px solid #243044;
+      border-top: 1px solid var(--line);
       padding: 10px 14px;
-      color: #94a3b8;
+      color: var(--muted);
       font: 12px ui-monospace, monospace;
     }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 150px 92px 1fr;
+      grid-template-columns: 22px 142px 82px 1fr;
       align-items: center;
       gap: 10px;
       min-height: 46px;
       padding: 9px;
-      background: #0f172a;
-      border: 1px solid #1e293b;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
       border-radius: 8px;
     }
-    .name { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
+    .name { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
     .value { font: 18px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
-    .bar { height: 7px; background: #1f2937; border-radius: 999px; overflow: hidden; }
-    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, #22c55e, #38bdf8); transition: width .08s linear; }
+    .bar { height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
+    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), var(--teal)); transition: width .08s linear; }
+    .address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
+    .address-list { display: grid; gap: 6px; color: var(--muted); font: 12px ui-monospace, monospace; }
+    .address-list div { overflow-wrap: anywhere; }
+    .metric input { width: 16px; min-height: 16px; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
       .controls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .apply-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
@@ -414,56 +506,64 @@ VIEWER_HTML = """
   <main>
     <header>
       <div>
-        <h1>FIELD Input Viewer</h1>
+        <h1>FIELD Realtime Dance</h1>
         <div class="status"><span id="dot" class="dot"></span><span id="status">idle</span></div>
       </div>
       <div class="status">pose overlay + metrics + OSC</div>
     </header>
 
     <section class="panel controls">
-      <form id="form" class="controls-grid">
-        <label>Input
-          <select id="source" name="source">
-            <option value="live">Live Cam</option>
-            <option value="video">Video File</option>
-          </select>
-        </label>
-        <label>Video
-          <input id="video" name="video" type="file" accept="video/*" />
-        </label>
-        <label>Camera
-          <input id="camera" name="camera_index" type="number" min="0" step="1" value="0" />
-        </label>
-        <label class="check-row"><input id="loop" name="loop" type="checkbox" checked /> Loop video</label>
-        <label>OSC host
-          <input id="oscHost" name="osc_host" value="127.0.0.1" />
-        </label>
-        <label>OSC port
-          <input id="oscPort" name="osc_port" type="number" min="1" max="65535" value="9000" />
-        </label>
-        <label>Mode
-          <select id="oscMode" name="osc_mode">
-            <option value="raw">raw</option>
-            <option value="normalize">normalize</option>
-          </select>
-        </label>
-        <label>Alpha
-          <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
-        </label>
-        <label>FPS
-          <input id="targetFps" name="target_fps" type="number" min="1" max="30" step="1" value="10" />
-        </label>
-        <label>JPEG
-          <input id="jpegQuality" name="jpeg_quality" type="number" min="35" max="90" step="5" value="60" />
-        </label>
-        <label>Width
-          <input id="width" name="width" type="number" min="320" max="1280" step="20" value="640" />
-        </label>
-        <label>Height
-          <input id="height" name="height" type="number" min="180" max="720" step="20" value="360" />
-        </label>
-        <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> OSC enabled</label>
-        <button type="submit">Apply</button>
+      <form id="form">
+        <div>
+          <p class="section-title">Input</p>
+          <div class="controls-grid">
+            <label>Source
+              <select id="source" name="source">
+                <option value="live">Live Cam</option>
+                <option value="video">Video File</option>
+              </select>
+            </label>
+            <label class="source-live wide">Camera
+              <select id="camera" name="camera_index">
+                <option value="0">0 - Camera 0</option>
+              </select>
+            </label>
+            <label class="source-video wide hidden">Video
+              <input id="video" name="video" type="file" accept="video/*" />
+            </label>
+            <label class="source-video check-row hidden"><input id="loop" name="loop" type="checkbox" checked /> Loop</label>
+          </div>
+        </div>
+
+        <div>
+          <p class="section-title">OSC</p>
+          <div class="controls-grid">
+            <label>Host
+              <input id="oscHost" name="osc_host" value="127.0.0.1" />
+            </label>
+            <label>Port
+              <input id="oscPort" name="osc_port" type="number" min="1" max="65535" value="9000" />
+            </label>
+            <label>Prefix
+              <input id="oscNamespace" name="osc_namespace" value="/field" />
+            </label>
+            <label>Mode
+              <select id="oscMode" name="osc_mode">
+                <option value="raw">raw</option>
+                <option value="normalize">normalize</option>
+              </select>
+            </label>
+            <label>Alpha
+              <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
+            </label>
+            <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enabled</label>
+          </div>
+        </div>
+
+        <div class="apply-row">
+          <div class="hint" id="applyHint">Apply starts processing and OSC output.</div>
+          <button type="submit">Apply</button>
+        </div>
       </form>
     </section>
 
@@ -484,6 +584,10 @@ VIEWER_HTML = """
 
       <aside class="panel">
         <div id="metrics" class="metric-grid"></div>
+        <div class="address-panel">
+          <p class="section-title">OSC addresses</p>
+          <div id="addresses" class="address-list"></div>
+        </div>
       </aside>
     </section>
   </main>
@@ -497,8 +601,9 @@ VIEWER_HTML = """
       const row = document.createElement('div');
       row.className = 'metric';
       row.innerHTML = `
+        <input class="metric-send" type="checkbox" value="${name}" checked title="Send OSC" />
         <div class="name">${name}</div>
-        <div class="value" id="v-${name}">0.000</div>
+        <div class="value" id="v-${name}">0.00</div>
         <div class="bar"><div class="fill" id="b-${name}"></div></div>
       `;
       metricsEl.appendChild(row);
@@ -510,6 +615,11 @@ VIEWER_HTML = """
       const data = new FormData(form);
       data.set('loop', document.getElementById('loop').checked ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('osc_metrics_selected', 'true');
+      data.delete('osc_metrics');
+      document.querySelectorAll('.metric-send:checked').forEach(input => {
+        data.append('osc_metrics', input.value);
+      });
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -525,6 +635,47 @@ VIEWER_HTML = """
       document.getElementById('stream').src = `/stream?t=${Date.now()}`;
     });
 
+    function updateSourceFields() {
+      const source = document.getElementById('source').value;
+      document.querySelectorAll('.source-live').forEach(el => el.classList.toggle('hidden', source !== 'live'));
+      document.querySelectorAll('.source-video').forEach(el => el.classList.toggle('hidden', source !== 'video'));
+      document.getElementById('applyHint').textContent =
+        source === 'live' ? 'Apply starts camera processing and OSC output.' : 'Apply starts video loop processing and OSC output.';
+    }
+
+    async function loadCameras() {
+      try {
+        const res = await fetch('/api/cameras');
+        const payload = await res.json();
+        const select = document.getElementById('camera');
+        select.innerHTML = '';
+        for (const camera of payload.cameras || []) {
+          const option = document.createElement('option');
+          option.value = camera.index;
+          option.textContent = camera.label;
+          select.appendChild(option);
+        }
+      } catch (error) {
+        console.warn('Camera list unavailable', error);
+      }
+    }
+
+    function updateAddresses(payload) {
+      const addresses = payload.addresses || [];
+      const container = document.getElementById('addresses');
+      container.innerHTML = '';
+      for (const address of addresses) {
+        const row = document.createElement('div');
+        row.textContent = address;
+        container.appendChild(row);
+      }
+      if (addresses.length === 0) {
+        const row = document.createElement('div');
+        row.textContent = 'No metrics selected';
+        container.appendChild(row);
+      }
+    }
+
     function update(payload) {
       const source = payload.source || {};
       const processing = payload.processing || {};
@@ -539,15 +690,20 @@ VIEWER_HTML = """
       document.getElementById('mOsc').textContent = `${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
       document.getElementById('mLoop').textContent = source.loop ? 'on' : 'off';
       document.getElementById('mFile').textContent = source.video_name || '-';
+      updateAddresses(payload);
 
       for (const name of metricNames) {
         const value = Number(metrics[name] ?? 0);
         maxSeen[name] = Math.max(maxSeen[name] * 0.995, Math.abs(value), 1);
-        document.getElementById(`v-${name}`).textContent = Number.isFinite(value) ? value.toFixed(3) : String(value);
+        document.getElementById(`v-${name}`).textContent = Number.isFinite(value) ? value.toFixed(2) : String(value);
         const width = Math.max(0, Math.min(100, Math.abs(value) / maxSeen[name] * 100));
         document.getElementById(`b-${name}`).style.width = `${width}%`;
       }
     }
+
+    document.getElementById('source').addEventListener('change', updateSourceFields);
+    updateSourceFields();
+    loadCameras();
 
     const ws = new WebSocket(`ws://${location.host}/ws`);
     ws.onmessage = event => update(JSON.parse(event.data));
@@ -565,6 +721,7 @@ def main():
     parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
     parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
     parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
+    parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
     args = parser.parse_args()
 
     osc_sender.configure(
@@ -572,9 +729,13 @@ def main():
         port=args.osc_port,
         mode=args.osc_mode,
         alpha=args.osc_alpha,
+        namespace=args.osc_namespace,
     )
     print(f"FIELD input viewer: http://{args.web_host}:{args.web_port}")
-    print(f"OSC output: udp://{args.osc_host}:{args.osc_port} mode={args.osc_mode} alpha={args.osc_alpha}")
+    print(
+        f"OSC output: udp://{args.osc_host}:{args.osc_port} "
+        f"prefix={args.osc_namespace} mode={args.osc_mode} alpha={args.osc_alpha}"
+    )
     uvicorn.run(app, host=args.web_host, port=args.web_port)
 
 

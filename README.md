@@ -75,9 +75,9 @@ Run a local browser-based processor for live camera or video-file tests:
 python backend/osc_viewer.py --osc-port 9000 --web-port 9100
 ```
 
-Open `http://127.0.0.1:9100`. The viewer has an input section for `Live Cam` or `Video File`; press **Apply** to process the selected input, show the skeleton overlay, display the 9 metrics, and send OSC at the same time.
+Open `http://127.0.0.1:9100`. FIELD Realtime Dance has an input section for `Live Cam` or `Video File`; press **Apply** to process the selected input, show the skeleton overlay, display the 9 metrics, and send OSC at the same time.
 
-The viewer can also change OSC target, mode, and smoothing alpha directly from the page. Uploaded test videos are stored under `backend/viewer_uploads/` and are ignored by git.
+The viewer can also change OSC target, prefix, mode, smoothing alpha, and which metrics are sent directly from the page. Uploaded test videos are stored under `backend/viewer_uploads/` and are ignored by git.
 
 ### Video-to-OSC Test
 
