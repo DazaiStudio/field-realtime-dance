@@ -232,6 +232,30 @@ async def stream_live():
     processing_state["running"] = False
 
 
+async def stream_live_preview():
+    session_id = source_state["session_id"]
+    cap = open_camera(int(source_state["camera_index"]))
+
+    while (
+        source_state["source"] == "live"
+        and source_state["session_id"] == session_id
+        and not source_state["detect_enabled"]
+    ):
+        ok, frame = cap.read()
+        if not ok:
+            processing_state["error"] = "Camera frame not available"
+            await asyncio.sleep(0.2)
+            continue
+
+        processing_state["error"] = None
+        encoded = encode_frame(frame)
+        if encoded:
+            yield encoded
+
+        frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
+        await asyncio.sleep(frame_interval)
+
+
 async def stream_video():
     processing_state["running"] = True
     session_id = source_state["session_id"]
@@ -407,6 +431,11 @@ async def stream():
     else:
         generator = stream_live()
     return StreamingResponse(generator, media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/preview_stream")
+async def preview_stream():
+    return StreamingResponse(stream_live_preview(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.websocket("/ws")
@@ -782,6 +811,8 @@ VIEWER_HTML = """
         previewVideo.play().catch(() => {});
       } else {
         previewVideo.classList.add('hidden');
+        streamImage.classList.remove('hidden');
+        streamImage.src = `/preview_stream?t=${Date.now()}`;
       }
     }
 
