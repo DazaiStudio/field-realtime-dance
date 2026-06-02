@@ -46,6 +46,7 @@ class OSCSender:
         self.client = SimpleUDPClient(self.host, self.port)
         self._smoothed: Dict[str, float] = {}
         self._peaks: Dict[str, float] = {}
+        self.last_prepared_metrics: Dict[str, float] = {}
         self.last_sent_at: Optional[float] = None
 
     def configure(
@@ -83,6 +84,7 @@ class OSCSender:
     def reset_state(self) -> None:
         self._smoothed.clear()
         self._peaks.clear()
+        self.last_prepared_metrics.clear()
 
     def get_status(self) -> dict:
         return {
@@ -95,10 +97,9 @@ class OSCSender:
             "last_sent_at": self.last_sent_at,
         }
 
-    def send_metrics(self, metrics: Mapping[str, float]) -> list[dict]:
+    def send_metrics(self, metrics: Mapping[str, float], send_keys: Optional[set[str]] = None) -> list[dict]:
         sent = []
-        if not self.enabled:
-            return sent
+        self.last_prepared_metrics = {}
 
         for key in METRIC_NAMES:
             if key not in metrics:
@@ -106,11 +107,17 @@ class OSCSender:
             value = self._prepare_value(key, metrics[key])
             if value is None:
                 continue
+            self.last_prepared_metrics[key] = value
+            if send_keys is not None and key not in send_keys:
+                continue
+            if not self.enabled:
+                continue
             address = f"{self.namespace}/{key}"
             self._send_message(address, value)
             sent.append({"address": address, "value": value})
 
-        self.last_sent_at = time.time()
+        if sent:
+            self.last_sent_at = time.time()
         return sent
 
     def send_heartbeat(self, timestamp_ms: int) -> None:

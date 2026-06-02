@@ -10,7 +10,8 @@ The main tool is a browser viewer at `http://127.0.0.1:9100`.
 
 Use it to:
 
-- choose a live camera or drop in a video file
+- choose a live camera or click to choose a video file
+- mirror live camera input when needed
 - preview the input
 - toggle pose detection on/off
 - show the skeleton overlay
@@ -39,11 +40,12 @@ Leave the terminal window running while using the viewer.
 ## Viewer Workflow
 
 1. Open `http://127.0.0.1:9100`.
-2. Choose a camera, or drop/click to choose a video file.
-3. Press `Enter` in the viewer.
-4. Confirm the raw preview appears.
-5. Toggle `Detect On` to start pose overlay, metrics, and OSC output.
-6. Toggle `Detect Off` to return to preview without pose detection.
+2. Choose a camera, or click to choose a video file.
+3. Enable `Mirror camera` if the live camera should be horizontally flipped.
+4. Press `Enter` in the viewer.
+5. Confirm the raw preview appears.
+6. Toggle `Detect On` to start pose overlay, metrics, and OSC output.
+7. Toggle `Detect Off` to return to preview without pose detection.
 
 For video files, playback loops by default. For live camera, the viewer shows the selected camera stream and reports FPS/status below the video.
 
@@ -92,6 +94,8 @@ The viewer lets you change:
 
 Unchecked metrics are not sent over OSC and are hidden from the address list.
 
+The viewer's metric values follow the selected OSC mode. In `raw` mode, the page shows raw output values. In `normalize` mode, the page shows the same normalized values that are sent over OSC.
+
 ## OSC Monitor
 
 The viewer includes a collapsible OSC terminal. You can also run a standalone monitor:
@@ -121,6 +125,8 @@ If the viewer does not show camera video:
 
 Only one app should own the same camera source at a time.
 
+`Mirror camera` only affects live camera input. Video files are not mirrored.
+
 ## Test Video
 
 You can test with any local `.mp4` file. Example:
@@ -129,7 +135,7 @@ You can test with any local `.mp4` file. Example:
 C:\Users\tommy\OneDrive\work\2026_work\future-folk\04_dataset\morris_dance\clips\beetlecrushers__v18_v18a.mp4
 ```
 
-Drop the file into the viewer, press `Enter`, then toggle `Detect On`.
+Click the video chooser in the viewer, select the file, press `Enter`, then toggle `Detect On`.
 
 ## CLI Options
 

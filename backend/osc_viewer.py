@@ -40,6 +40,7 @@ osc_sender = OSCSender(
 source_state = {
     "source": "live",
     "camera_index": 0,
+    "mirror_live": False,
     "video_path": None,
     "video_name": None,
     "loop": True,
@@ -60,6 +61,7 @@ processing_state = {
     "elapsed_seconds": 0.0,
     "fps": 0.0,
     "latest_metrics": {},
+    "latest_raw_metrics": {},
     "latest_timestamp_ms": None,
     "last_frame_at": None,
     "signal_mean": None,
@@ -223,7 +225,7 @@ def scan_camera_signals(max_cameras: int = 10) -> dict:
 def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
-    processing_state["latest_metrics"] = metrics
+    processing_state["latest_raw_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["last_frame_at"] = time.time()
     processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
@@ -240,11 +242,8 @@ def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
         processing_state["error"] = "Camera signal is very dark"
     else:
         processing_state["error"] = None
-    outbound_metrics = {
-        key: value for key, value in metrics.items()
-        if key in set(source_state["osc_metrics"])
-    }
-    sent_messages = osc_sender.send_metrics(outbound_metrics)
+    sent_messages = osc_sender.send_metrics(metrics, send_keys=set(source_state["osc_metrics"]))
+    processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
     osc_sender.send_heartbeat(timestamp_ms)
     log_osc_messages(sent_messages)
 
@@ -302,6 +301,12 @@ def resize_frame(frame):
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
+def apply_live_mirror(frame):
+    if source_state.get("mirror_live"):
+        return cv2.flip(frame, 1)
+    return frame
+
+
 async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
@@ -319,6 +324,7 @@ async def stream_live():
             processing_state["error"] = "Camera frame not available"
             await asyncio.sleep(0.2)
             continue
+        frame = apply_live_mirror(frame)
         frame = resize_frame(frame)
 
         timestamp_ms = int(time.time() * 1000)
@@ -348,6 +354,7 @@ async def stream_live_preview():
             processing_state["error"] = "Camera frame not available"
             await asyncio.sleep(0.2)
             continue
+        frame = apply_live_mirror(frame)
         frame = resize_frame(frame)
 
         set_preview_frame(frame)
@@ -450,6 +457,7 @@ async def api_camera_scan():
 async def apply_input(
     source: str = Form("live"),
     camera_index: int = Form(0),
+    mirror_live: bool = Form(False),
     loop: bool = Form(True),
     detect_enabled: bool = Form(False),
     osc_host: str = Form("127.0.0.1"),
@@ -496,6 +504,7 @@ async def apply_input(
             {
                 "source": "live",
                 "camera_index": int(camera_index),
+                "mirror_live": bool(mirror_live),
                 "video_path": None,
                 "video_name": None,
                 "loop": bool(loop),
@@ -518,6 +527,7 @@ async def apply_input(
             {
                 "source": "video",
                 "camera_index": int(camera_index),
+                "mirror_live": bool(mirror_live),
                 "loop": bool(loop),
                 "applied_at": time.time(),
             }
@@ -528,6 +538,7 @@ async def apply_input(
     processing_state["elapsed_seconds"] = 0.0
     processing_state["fps"] = 0.0
     processing_state["latest_metrics"] = {}
+    processing_state["latest_raw_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
@@ -678,6 +689,17 @@ VIEWER_HTML = """
     }
     .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; }
     .camera-row { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: end; }
+    .mirror-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .mirror-row input { width: 15px; min-height: 15px; }
     .or { color: var(--muted); align-self: center; padding-bottom: 11px; font: 12px ui-monospace, monospace; }
     .drop-zone {
       min-height: 66px;
@@ -690,7 +712,6 @@ VIEWER_HTML = """
       text-align: center;
       cursor: pointer;
     }
-    .drop-zone.active { border-color: var(--teal); color: var(--text); background: rgba(84,179,168,.08); }
     .drop-zone.has-file { border-color: var(--amber); color: var(--text); }
     .detect-button {
       position: absolute;
@@ -837,12 +858,13 @@ VIEWER_HTML = """
                     <select id="camera" name="camera_index">
                       <option value="0">0 - Camera 0</option>
                     </select>
+                    <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" /> Mirror camera</span>
                   </div>
                 </label>
                 <div class="or">or</div>
                 <label>Video
                   <input id="video" name="video" type="file" accept="video/*" class="hidden" />
-                  <div id="dropZone" class="drop-zone">Drop video here<br />or click to choose</div>
+                  <div id="dropZone" class="drop-zone">Click to choose video</div>
                 </label>
               </div>
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
@@ -937,6 +959,8 @@ VIEWER_HTML = """
         alert(payload.error || 'Apply failed');
         return payload;
       }
+      inputDirty = false;
+      oscDirty = false;
 
       return payload;
     }
@@ -973,6 +997,8 @@ VIEWER_HTML = """
     let selectedVideoUrl = null;
     let isDetecting = false;
     let lastPayload = null;
+    let inputDirty = false;
+    let oscDirty = false;
 
     function showPreview() {
       streamImage.classList.add('hidden');
@@ -1002,12 +1028,17 @@ VIEWER_HTML = """
     }
 
     document.getElementById('camera').addEventListener('change', () => {
+      inputDirty = true;
       sourceInput.value = 'live';
       videoInput.value = '';
       selectedVideoUrl = null;
       previewVideo.removeAttribute('src');
       dropZone.classList.remove('has-file');
-      dropZone.innerHTML = 'Drop video here<br />or click to choose';
+      dropZone.textContent = 'Click to choose video';
+    });
+    document.getElementById('mirrorLive').addEventListener('change', () => {
+      inputDirty = true;
+      sourceInput.value = 'live';
     });
     dropZone.addEventListener('click', event => {
       event.preventDefault();
@@ -1016,6 +1047,7 @@ VIEWER_HTML = """
     });
     videoInput.addEventListener('change', () => {
       if (videoInput.files.length > 0) {
+        inputDirty = true;
         sourceInput.value = 'video';
         if (selectedVideoUrl) URL.revokeObjectURL(selectedVideoUrl);
         selectedVideoUrl = URL.createObjectURL(videoInput.files[0]);
@@ -1023,25 +1055,6 @@ VIEWER_HTML = """
         dropZone.textContent = videoInput.files[0].name;
         showPreview();
       }
-    });
-    dropZone.addEventListener('dragover', event => {
-      event.preventDefault();
-      dropZone.classList.add('active');
-    });
-    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('active'));
-    dropZone.addEventListener('drop', event => {
-      event.preventDefault();
-      dropZone.classList.remove('active');
-      if (!event.dataTransfer.files.length) return;
-      const transfer = new DataTransfer();
-      transfer.items.add(event.dataTransfer.files[0]);
-      videoInput.files = transfer.files;
-      sourceInput.value = 'video';
-      if (selectedVideoUrl) URL.revokeObjectURL(selectedVideoUrl);
-      selectedVideoUrl = URL.createObjectURL(event.dataTransfer.files[0]);
-      dropZone.classList.add('has-file');
-      dropZone.textContent = event.dataTransfer.files[0].name;
-      showPreview();
     });
     document.getElementById('changeInputButton').addEventListener('click', () => {
       document.getElementById('inputOverlay').classList.remove('compact');
@@ -1132,6 +1145,17 @@ VIEWER_HTML = """
       const osc = payload.osc || {};
       const metrics = processing.latest_metrics || {};
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
+      if (!inputDirty) {
+        document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
+      }
+      if (!oscDirty) {
+        document.getElementById('oscHost').value = osc.host || '127.0.0.1';
+        document.getElementById('oscPort').value = osc.port || 9000;
+        document.getElementById('oscNamespace').value = osc.namespace || '/field';
+        document.getElementById('oscAlpha').value = osc.alpha ?? 1;
+        document.getElementById('oscMode').value = osc.mode || 'raw';
+        document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
+      }
 
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
       document.getElementById('status').textContent =
@@ -1145,7 +1169,7 @@ VIEWER_HTML = """
         const cameraSelect = document.getElementById('camera');
         const cameraLabel = cameraSelect.options[cameraSelect.selectedIndex]?.textContent || source.camera_index || '-';
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
-        document.getElementById('metaD').textContent = `osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
+        document.getElementById('metaD').textContent = `mirror: ${source.mirror_live ? 'on' : 'off'} / osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
       }
       updateAddresses(payload);
       updateTerminal(payload);
@@ -1161,7 +1185,19 @@ VIEWER_HTML = """
       }
     }
 
-    document.getElementById('oscNamespace').addEventListener('input', () => updateAddresses());
+    function markOscDirty() {
+      oscDirty = true;
+    }
+
+    ['oscHost', 'oscPort', 'oscAlpha', 'oscMode', 'oscEnabled'].forEach(id => {
+      const input = document.getElementById(id);
+      input.addEventListener('input', markOscDirty);
+      input.addEventListener('change', markOscDirty);
+    });
+    document.getElementById('oscNamespace').addEventListener('input', () => {
+      markOscDirty();
+      updateAddresses();
+    });
     document.querySelectorAll('.metric-send').forEach(input => {
       input.addEventListener('change', () => updateAddresses());
     });
