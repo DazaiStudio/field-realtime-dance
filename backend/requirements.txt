@@ -5,3 +5,4 @@ opencv-python
 mediapipe
 numpy
 scipy
+python-osc>=1.8.0

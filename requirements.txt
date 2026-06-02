@@ -10,3 +10,4 @@ numpy
 
 # 科學計算 (用於凸包體積計算等)
 scipy
+python-osc>=1.8.0

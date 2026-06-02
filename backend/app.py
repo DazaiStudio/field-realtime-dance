@@ -6,8 +6,10 @@ import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from pose_engine import PoseEngine
-from typing import List
+from osc_sender import OSCSender
+from typing import Optional
 
 app = FastAPI()
 
@@ -23,12 +25,49 @@ app.add_middleware(
 camera = None
 pose_engine = None
 latest_metrics = {}
+latest_metrics_timestamp_ms = 0
 recording_state = {
     "is_recording": False,
     "writer": None,
     "filename": None,
     "metrics_buffer": []
 }
+osc_replay_task = None
+osc_replay_state = {
+    "is_replaying": False,
+    "filename": None,
+    "started_at": None,
+}
+
+
+def parse_bool(value, default=True):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+osc_sender = OSCSender(
+    host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
+    port=int(os.getenv("FIELD_OSC_PORT", "9000")),
+    enabled=parse_bool(os.getenv("FIELD_OSC_ENABLED"), True),
+    mode=os.getenv("FIELD_OSC_MODE", "raw"),
+    alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
+    namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
+)
+
+
+class OSCConfigRequest(BaseModel):
+    host: Optional[str] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    enabled: Optional[bool] = None
+    mode: Optional[str] = None
+    alpha: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    namespace: Optional[str] = None
+
+
+class OSCReplayRequest(BaseModel):
+    speed: float = Field(default=1.0, gt=0.0, le=8.0)
+    loop: bool = False
 
 # Ensure recordings directory exists
 RECORDINGS_DIR = "recordings"
@@ -36,6 +75,13 @@ if not os.path.exists(RECORDINGS_DIR):
     os.makedirs(RECORDINGS_DIR)
 
 connected_clients = []
+
+
+def send_osc_metrics(metrics, timestamp_ms=None):
+    if not metrics:
+        return
+    osc_sender.send_metrics(metrics)
+    osc_sender.send_heartbeat(timestamp_ms or int(time.time() * 1000))
 
 def init_camera():
     global camera, pose_engine
@@ -47,7 +93,7 @@ def init_camera():
         pose_engine = PoseEngine(model_path='../pose_landmarker_full.task')
 
 async def generate_frames():
-    global camera, pose_engine, latest_metrics, recording_state
+    global camera, pose_engine, latest_metrics, latest_metrics_timestamp_ms, recording_state
     init_camera()
     
     while True:
@@ -61,6 +107,7 @@ async def generate_frames():
         # Process frame
         processed_frame, metrics = pose_engine.process_frame(frame, timestamp_ms)
         latest_metrics = metrics
+        latest_metrics_timestamp_ms = timestamp_ms
         
         # Handle recording
         if recording_state["is_recording"] and recording_state["writer"] is not None:
@@ -93,6 +140,20 @@ def shutdown_event():
 @app.get("/video_feed")
 async def video_feed():
     return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/osc/status")
+async def get_osc_status():
+    status = osc_sender.get_status()
+    status["replay"] = dict(osc_replay_state)
+    return status
+
+
+@app.post("/api/osc/config")
+async def configure_osc(config: OSCConfigRequest):
+    values = config.dict(exclude_unset=True)
+    osc_sender.configure(**values)
+    return osc_sender.get_status()
 
 # Recording Endpoints
 @app.post("/record/start")
@@ -168,19 +229,99 @@ async def get_recording_metrics(filename: str):
     return data
 
 
+async def replay_recording_metrics(filename: str, metrics_data, speed: float, loop: bool):
+    global osc_replay_state
+    osc_replay_state = {
+        "is_replaying": True,
+        "filename": filename,
+        "started_at": time.time(),
+    }
+
+    try:
+        while True:
+            if not metrics_data:
+                break
+
+            previous_time = metrics_data[0].get("time")
+            for item in metrics_data:
+                current_time = item.get("time")
+                if previous_time is not None and current_time is not None:
+                    delay = max(0.0, (current_time - previous_time) / 1000.0 / speed)
+                    await asyncio.sleep(delay)
+
+                metrics = {k: v for k, v in item.items() if k != "time"}
+                replay_timestamp = int(current_time) if current_time is not None else int(time.time() * 1000)
+                send_osc_metrics(metrics, replay_timestamp)
+                previous_time = current_time
+
+            if not loop:
+                break
+    except asyncio.CancelledError:
+        raise
+    finally:
+        osc_replay_state = {
+            "is_replaying": False,
+            "filename": None,
+            "started_at": None,
+        }
+
+
+@app.post("/recordings/{filename}/osc/replay")
+async def start_osc_replay(filename: str, request: Optional[OSCReplayRequest] = None):
+    global osc_replay_task
+    request = request or OSCReplayRequest()
+
+    json_filename = filename.replace(".mp4", ".json")
+    json_path = os.path.join(RECORDINGS_DIR, json_filename)
+    if not os.path.exists(json_path):
+        return {"status": "metrics_not_found", "filename": filename}
+
+    with open(json_path, 'r') as f:
+        metrics_data = json.load(f)
+
+    if osc_replay_task is not None and not osc_replay_task.done():
+        osc_replay_task.cancel()
+
+    osc_replay_task = asyncio.create_task(
+        replay_recording_metrics(filename, metrics_data, request.speed, request.loop)
+    )
+    return {
+        "status": "started",
+        "filename": filename,
+        "speed": request.speed,
+        "loop": request.loop,
+        "osc": osc_sender.get_status(),
+    }
+
+
+@app.post("/recordings/osc/stop")
+async def stop_osc_replay():
+    global osc_replay_task
+    if osc_replay_task is not None and not osc_replay_task.done():
+        osc_replay_task.cancel()
+        return {"status": "stopped"}
+    return {"status": "not_replaying"}
+
+
 # Background task to broadcast metrics
 async def broadcast_metrics():
+    last_osc_timestamp_ms = 0
     while True:
-        if connected_clients and latest_metrics:
-            disconnected = []
-            message = json.dumps(latest_metrics)
-            for client in connected_clients:
-                try:
-                    await client.send_text(message)
-                except Exception:
-                    disconnected.append(client)
-            for d in disconnected:
-                connected_clients.remove(d)
+        if latest_metrics:
+            if latest_metrics_timestamp_ms != last_osc_timestamp_ms:
+                send_osc_metrics(latest_metrics, latest_metrics_timestamp_ms)
+                last_osc_timestamp_ms = latest_metrics_timestamp_ms
+
+            if connected_clients:
+                disconnected = []
+                message = json.dumps(latest_metrics)
+                for client in connected_clients:
+                    try:
+                        await client.send_text(message)
+                    except Exception:
+                        disconnected.append(client)
+                for d in disconnected:
+                    connected_clients.remove(d)
         await asyncio.sleep(1/30) # Map to ~30 FPS broadcast
 
 @app.websocket("/ws/metrics")
@@ -198,6 +339,14 @@ async def websocket_endpoint(websocket: WebSocket):
 # Start background broadcasting task
 @app.on_event("startup")
 async def start_broadcaster():
+    status = osc_sender.get_status()
+    if status["enabled"]:
+        print(
+            f"OSC enabled -> {status['host']}:{status['port']} "
+            f"mode={status['mode']} alpha={status['alpha']}"
+        )
+    else:
+        print("OSC disabled")
     asyncio.create_task(broadcast_metrics())
 
 if __name__ == "__main__":
