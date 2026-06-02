@@ -24,8 +24,20 @@ def ensure_model():
         print("Download complete.")
 
 def start_backend():
-    print("Starting FastAPI backend on http://127.0.0.1:8000 ...")
     env = os.environ.copy()
+    env.setdefault("FIELD_OSC_HOST", "127.0.0.1")
+    env.setdefault("FIELD_OSC_PORT", "9000")
+    env.setdefault("FIELD_OSC_ENABLED", "1")
+    env.setdefault("FIELD_OSC_MODE", "raw")
+    env.setdefault("FIELD_OSC_ALPHA", "1.0")
+    print("Starting FastAPI backend on http://127.0.0.1:8000 ...")
+    print(
+        "OSC default -> "
+        f"{env['FIELD_OSC_HOST']}:{env['FIELD_OSC_PORT']} "
+        f"enabled={env['FIELD_OSC_ENABLED']} "
+        f"mode={env['FIELD_OSC_MODE']} "
+        f"alpha={env['FIELD_OSC_ALPHA']}"
+    )
     # Path to app.py is inside backend folder
     backend_process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "8000"],

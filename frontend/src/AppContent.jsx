@@ -114,6 +114,18 @@ function AppContent() {
     }
   };
 
+  const handleReplayRecordingOsc = async (filename) => {
+    try {
+      await fetch(`${baseUrl}/recordings/${filename}/osc/replay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed: 1.0, loop: false })
+      });
+    } catch (e) {
+      console.error("Failed to replay recording OSC", e);
+    }
+  };
+
   const handleBackToLive = () => {
     setViewMode('live');
     setPlayingFile(null);
@@ -218,6 +230,7 @@ function AppContent() {
                   <RecordingGallery 
                     recordings={recordings} 
                     onPlay={handlePlayRecording} 
+                    onReplayOsc={handleReplayRecordingOsc}
                   />
               </div>
           </div>

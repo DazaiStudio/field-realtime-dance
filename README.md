@@ -31,7 +31,67 @@ Our analysis engine decomposes movement into nine key indicators as defined in o
 
 - **Backend**: Python 3.9+, FastAPI, MediaPipe Tasks API, OpenCV, SciPy, NumPy.
 - **Frontend**: React (Vite), Tailwind CSS, Recharts (for live data visualization), Lucide React.
-- **Communication**: WebSockets (Metrics) and MJPEG (Video Stream).
+- **Communication**: WebSockets (Metrics), MJPEG (Video Stream), and OSC over UDP.
+
+## 📡 OSC Output
+
+The backend sends the 9 dance metrics over OSC at the same cadence as the live metrics broadcast.
+
+- Default target: `udp://127.0.0.1:9000`
+- Namespace: `/field`
+- Addresses: `/field/energy`, `/field/sync_velocity`, `/field/sync_correlation`, `/field/expansion`, `/field/curvature`, `/field/height`, `/field/sway`, `/field/torque`, `/field/jerk`
+- Heartbeat: `/field/heartbeat <timestamp_ms>`
+- Modes: `raw` or `normalize`
+- Smoothing: `alpha` uses EMA smoothing; `1.0` means no smoothing
+
+Environment variables:
+
+```bash
+FIELD_OSC_HOST=127.0.0.1
+FIELD_OSC_PORT=9000
+FIELD_OSC_ENABLED=1
+FIELD_OSC_MODE=raw
+FIELD_OSC_ALPHA=1.0
+FIELD_OSC_NAMESPACE=/field
+```
+
+Runtime API:
+
+```bash
+curl http://127.0.0.1:8000/api/osc/status
+
+curl -X POST http://127.0.0.1:8000/api/osc/config \
+  -H "Content-Type: application/json" \
+  -d "{\"host\":\"127.0.0.1\",\"port\":9000,\"enabled\":true,\"mode\":\"normalize\",\"alpha\":0.35}"
+```
+
+Normalization keeps bounded metrics in their natural range, maps `sync_correlation` from `[-1, 1]` to `[0, 1]`, and uses adaptive peak normalization for `energy`, `expansion`, `curvature`, `torque`, and `jerk`.
+
+### Local OSC Web Viewer
+
+Run a local OSC receiver with a browser UI:
+
+```bash
+python backend/osc_viewer.py --osc-port 9000 --web-port 9100
+```
+
+Open `http://127.0.0.1:9100`. The viewer listens for `/field/*`, shows the latest metric values, and can update the backend OSC `mode` and `alpha`.
+
+### Video-to-OSC Test
+
+Process any input video and send the generated metrics to OSC without using the main frontend:
+
+```bash
+python backend/osc_video_test.py path/to/input.mp4 --host 127.0.0.1 --port 9000 --mode normalize --alpha 0.35
+```
+
+Recorded clips can also replay their saved metrics through OSC from the app's library using the radio button, or through the API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/recordings/dance_YYYYMMDD-HHMMSS.mp4/osc/replay \
+  -H "Content-Type: application/json" \
+  -d "{\"speed\":1.0,\"loop\":false}"
+```
 
 ## 🚀 Getting Started
 

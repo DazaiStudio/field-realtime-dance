@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { Play, Download, Trash2, X, Film } from 'lucide-react';
+import { Play, Download, Trash2, X, Film, Radio } from 'lucide-react';
 
-const RecordingGallery = ({ recordings, onPlay, onDelete }) => {
+const RecordingGallery = ({ recordings, onPlay, onReplayOsc, onDelete }) => {
   if (!recordings || recordings.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-slate-400 p-8">
@@ -38,6 +38,13 @@ const RecordingGallery = ({ recordings, onPlay, onDelete }) => {
                     title="Play"
                 >
                     <Play className="w-4 h-4 fill-current" />
+                </button>
+                <button
+                    onClick={() => onReplayOsc?.(file)}
+                    className="p-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white transition-colors"
+                    title="Replay OSC"
+                >
+                    <Radio className="w-4 h-4" />
                 </button>
                 <a 
                     href={`http://${window.location.hostname}:8000/recordings/${file}`}
