@@ -10,7 +10,7 @@ The main tool is a browser viewer at `http://127.0.0.1:9100`.
 
 Use it to:
 
-- choose a live camera or click to choose a video file
+- choose a live camera or click to upload a video file
 - mirror live camera input when needed
 - preview the input
 - toggle pose detection on/off
@@ -54,8 +54,8 @@ Leave the terminal window running while using the viewer.
 ## Viewer Workflow
 
 1. Open `http://127.0.0.1:9100`.
-2. Choose a camera, or click to choose a video file.
-3. Enable `Mirror camera` if the live camera should be horizontally flipped.
+2. Choose a camera, or click to upload a video file.
+3. `Mirror camera` is enabled by default; turn it off if you want unmirrored live camera input.
 4. Press `Enter` in the viewer.
 5. Confirm the raw preview appears.
 6. Toggle `Detect On` to start pose overlay, metrics, and OSC output.
@@ -108,7 +108,7 @@ The viewer's metric values follow the selected OSC mode. In `raw` mode, the page
 
 OSC settings apply at runtime. Changing mode, prefix, alpha, target, or enabled state does not require restarting detection.
 
-Metric bars are neutral readouts, not good/bad scores. Each metric has its own scale hint in the viewer; `sync_correlation` is shown around a center/neutral point.
+Metric bars are neutral readouts, not good/bad scores. Each metric has its own scale hint in the viewer. In `raw` mode, `sync_correlation` uses the center as neutral because its range is `-1..1`; in `normalize` mode, it displays left-to-right like the `0..1` OSC value.
 
 ## Camera Notes
 
@@ -134,7 +134,7 @@ You can test with any local `.mp4` file. Example:
 path/to/test-video.mp4
 ```
 
-Click the video chooser in the viewer, select the file, press `Enter`, then toggle `Detect On`.
+Click `Click to upload video` in the viewer, select the file, press `Enter`, then toggle `Detect On`.
 
 ## CLI Options
 
@@ -145,7 +145,7 @@ python backend/osc_viewer.py \
   --osc-host 127.0.0.1 \
   --osc-port 9000 \
   --osc-mode raw \
-  --osc-alpha 1.0 \
+  --osc-alpha 0.25 \
   --osc-namespace /field
 ```
 
@@ -154,7 +154,7 @@ python backend/osc_viewer.py \
 - `raw`: send metric values directly
 - `normalize`: map values into a more bounded range
 
-`--osc-alpha` controls smoothing. `1.0` means no smoothing; lower values are smoother.
+`--osc-alpha` controls smoothing. The default is `0.25`; `1.0` means no smoothing, and lower values are smoother.
 
 ## Project Structure
 

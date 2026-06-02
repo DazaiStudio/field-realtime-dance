@@ -40,7 +40,7 @@ class OSCSender:
         namespace: str = "/field",
         enabled: bool = True,
         mode: str = "raw",
-        alpha: float = 1.0,
+        alpha: float = 0.25,
     ) -> None:
         self.host = host
         self.port = int(port)

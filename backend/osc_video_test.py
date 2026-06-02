@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument("--host", default=os.getenv("FIELD_OSC_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
     parser.add_argument("--mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
-    parser.add_argument("--alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
+    parser.add_argument("--alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "0.25")))
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--no-preview", action="store_true")
     return parser.parse_args()

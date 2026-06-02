@@ -34,14 +34,14 @@ osc_sender = OSCSender(
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
     mode=os.getenv("FIELD_OSC_MODE", "raw"),
-    alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
+    alpha=float(os.getenv("FIELD_OSC_ALPHA", "0.25")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 
 source_state = {
     "source": "live",
     "camera_index": 0,
-    "mirror_live": False,
+    "mirror_live": True,
     "video_path": None,
     "video_name": None,
     "loop": True,
@@ -465,7 +465,7 @@ async def apply_osc_config(
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("raw"),
-    osc_alpha: float = Form(1.0),
+    osc_alpha: float = Form(0.25),
     osc_namespace: str = Form("/field"),
 ):
     osc_sender.configure(
@@ -495,7 +495,7 @@ async def apply_input(
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("raw"),
-    osc_alpha: float = Form(1.0),
+    osc_alpha: float = Form(0.25),
     osc_namespace: str = Form("/field"),
     target_fps: float = Form(24.0),
     jpeg_quality: int = Form(60),
@@ -717,7 +717,7 @@ VIEWER_HTML = """
       border: 1px solid var(--line);
       border-radius: 8px;
     }
-    .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; }
+    .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: start; }
     .camera-row { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: end; }
     .mirror-row {
       display: flex;
@@ -730,17 +730,19 @@ VIEWER_HTML = """
       letter-spacing: 0;
     }
     .mirror-row input { width: 15px; min-height: 15px; }
-    .or { color: var(--muted); align-self: center; padding-bottom: 11px; font: 12px ui-monospace, monospace; }
+    .or { color: var(--muted); align-self: start; padding-top: 33px; font: 12px ui-monospace, monospace; }
     .drop-zone {
-      min-height: 66px;
+      min-height: 42px;
+      height: 42px;
       display: grid;
       place-items: center;
-      border: 1px dashed #6b5b4d;
+      border: 1px solid var(--line);
       border-radius: 8px;
       color: var(--muted);
-      padding: 10px;
+      padding: 10px 11px;
       text-align: center;
       cursor: pointer;
+      background: #211f1c;
     }
     .drop-zone.has-file { border-color: var(--amber); color: var(--text); }
     .detect-button {
@@ -893,7 +895,6 @@ VIEWER_HTML = """
         <h1>FIELD Realtime Dance</h1>
         <div class="status"><span id="dot" class="dot"></span><span id="status">idle</span></div>
       </div>
-      <div class="status">pose overlay + metrics + OSC</div>
     </header>
 
     <form id="form">
@@ -911,13 +912,13 @@ VIEWER_HTML = """
                     <select id="camera" name="camera_index">
                       <option value="0">0 - Camera 0</option>
                     </select>
-                    <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" /> Mirror camera</span>
+                    <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" checked /> Mirror camera</span>
                   </div>
                 </label>
                 <div class="or">or</div>
                 <label>Video
                   <input id="video" name="video" type="file" accept="video/*" class="hidden" />
-                  <div id="dropZone" class="drop-zone">Click to choose video</div>
+                  <div id="dropZone" class="drop-zone">Click to upload video</div>
                 </label>
               </div>
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
@@ -957,8 +958,8 @@ VIEWER_HTML = """
               <option value="normalize">normalize</option>
             </select>
           </label>
-          <label><span class="range-label-row"><span>Alpha (smooth)</span><span id="oscAlphaValue" class="range-value">1.00</span></span>
-            <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="1" />
+          <label><span class="range-label-row"><span>Alpha (smooth)</span><span id="oscAlphaValue" class="range-value">0.25</span></span>
+            <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="0.25" />
             <span class="range-hint">Lower = smoother</span>
           </label>
         </div>
@@ -982,7 +983,7 @@ VIEWER_HTML = """
     const metricHints = {
       energy: 'more motion',
       sync_velocity: '1 = balanced',
-      sync_correlation: 'center = neutral',
+      sync_correlation: 'neutral: 0 raw / .5 norm',
       expansion: 'larger shape',
       curvature: 'more curved',
       height: 'body level',
@@ -993,7 +994,7 @@ VIEWER_HTML = """
     const metricDescriptions = {
       energy: 'Overall movement intensity from weighted limb angular velocity. Higher means more active motion.',
       sync_velocity: 'Left/right movement magnitude balance. 1 means both sides move with similar velocity; 0 means strongly uneven.',
-      sync_correlation: 'Temporal correlation between left and right side movement. Raw range is -1 to 1, with 0 as neutral. Normalize maps it to 0 to 1.',
+      sync_correlation: 'Temporal correlation between left and right side movement. Raw range is -1 to 1, with 0 as neutral. Normalize maps it to 0 to 1, where 0.5 is neutral.',
       expansion: 'Body volume / spatial reach from the convex hull of the tracked joints. Higher means a larger body shape.',
       curvature: 'Curvature of wrist and ankle trajectories. Higher means more curved or circular movement paths.',
       height: 'Estimated body center height from the center of mass. Higher/lower depends on body level in the frame.',
@@ -1134,7 +1135,7 @@ VIEWER_HTML = """
       selectedVideoUrl = null;
       previewVideo.removeAttribute('src');
       dropZone.classList.remove('has-file');
-      dropZone.textContent = 'Click to choose video';
+      dropZone.textContent = 'Click to upload video';
     });
     document.getElementById('mirrorLive').addEventListener('change', () => {
       inputDirty = true;
@@ -1204,7 +1205,7 @@ VIEWER_HTML = """
     }
 
     function syncAlphaLabel() {
-      const alpha = Number(document.getElementById('oscAlpha').value || 1);
+      const alpha = Number(document.getElementById('oscAlpha').value || 0.25);
       document.getElementById('oscAlphaValue').textContent = alpha.toFixed(2);
     }
 
@@ -1220,11 +1221,9 @@ VIEWER_HTML = """
       const fill = document.getElementById(`b-${name}`);
       if (!bar || !fill) return;
 
-      if (centeredMetrics.has(name)) {
+      if (centeredMetrics.has(name) && mode !== 'normalize') {
         bar.classList.add('centered');
-        const neutral = mode === 'normalize' ? 0.5 : 0;
-        const span = mode === 'normalize' ? 0.5 : 1;
-        const delta = Math.max(-1, Math.min(1, (value - neutral) / span));
+        const delta = Math.max(-1, Math.min(1, value));
         const width = Math.abs(delta) * 50;
         fill.style.left = delta < 0 ? `${50 - width}%` : '50%';
         fill.style.width = `${width}%`;
@@ -1252,7 +1251,7 @@ VIEWER_HTML = """
         document.getElementById('oscHost').value = osc.host || '127.0.0.1';
         document.getElementById('oscPort').value = osc.port || 9000;
         document.getElementById('oscNamespace').value = osc.namespace || '/field';
-        document.getElementById('oscAlpha').value = osc.alpha ?? 1;
+        document.getElementById('oscAlpha').value = osc.alpha ?? 0.25;
         syncAlphaLabel();
         document.getElementById('oscMode').value = osc.mode || 'raw';
         document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
@@ -1326,7 +1325,7 @@ def main():
     parser.add_argument("--osc-host", default=os.getenv("FIELD_OSC_HOST", "127.0.0.1"))
     parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
     parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
-    parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
+    parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "0.25")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
     args = parser.parse_args()
 

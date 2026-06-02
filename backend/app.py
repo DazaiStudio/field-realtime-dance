@@ -51,7 +51,7 @@ osc_sender = OSCSender(
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=parse_bool(os.getenv("FIELD_OSC_ENABLED"), True),
     mode=os.getenv("FIELD_OSC_MODE", "raw"),
-    alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
+    alpha=float(os.getenv("FIELD_OSC_ALPHA", "0.25")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 
