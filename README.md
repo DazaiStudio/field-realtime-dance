@@ -51,6 +51,30 @@ http://127.0.0.1:9100
 
 Leave the terminal window running while using the viewer.
 
+## Update Existing Clone
+
+If the repo is already cloned on this machine, do not clone it again. Stop the viewer if it is running, then update from GitHub:
+
+Windows PowerShell:
+
+```powershell
+cd path\to\field-realtime-dance
+git pull
+pip install -r requirements.txt
+python backend\osc_viewer.py --osc-port 9000 --web-port 9100
+```
+
+macOS / Linux:
+
+```bash
+cd /path/to/field-realtime-dance
+git pull
+python3 -m pip install -r requirements.txt
+python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100
+```
+
+Open `http://127.0.0.1:9100` after the viewer starts.
+
 ## Viewer Workflow
 
 1. Open `http://127.0.0.1:9100`.
