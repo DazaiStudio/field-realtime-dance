@@ -677,7 +677,7 @@ VIEWER_HTML = """
       border-radius: 8px;
     }
     .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; }
-    .camera-row { display: grid; grid-template-columns: 1fr 74px; gap: 8px; align-items: end; }
+    .camera-row { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: end; }
     .or { color: var(--muted); align-self: center; padding-bottom: 11px; font: 12px ui-monospace, monospace; }
     .drop-zone {
       min-height: 66px;
@@ -837,7 +837,6 @@ VIEWER_HTML = """
                     <select id="camera" name="camera_index">
                       <option value="0">0 - Camera 0</option>
                     </select>
-                    <button id="scanCameraButton" type="button">Scan</button>
                   </div>
                 </label>
                 <div class="or">or</div>
@@ -963,33 +962,6 @@ VIEWER_HTML = """
       }
     }
 
-    async function scanCameras() {
-      const button = document.getElementById('scanCameraButton');
-      button.textContent = '...';
-      button.disabled = true;
-      try {
-        const res = await fetch('/api/cameras/scan');
-        const payload = await res.json();
-        const signals = payload.signals || {};
-        const select = document.getElementById('camera');
-        select.innerHTML = '';
-        for (const camera of payload.cameras || []) {
-          const signal = signals[String(camera.index)];
-          const suffix = signal ? ` [${signal.status}]` : '';
-          const option = document.createElement('option');
-          option.value = camera.index;
-          option.textContent = `${camera.label}${suffix}`;
-          option.dataset.status = signal?.status || 'unknown';
-          select.appendChild(option);
-        }
-      } catch (error) {
-        console.warn('Camera scan unavailable', error);
-      } finally {
-        button.textContent = 'Scan';
-        button.disabled = false;
-      }
-    }
-
     const videoInput = document.getElementById('video');
     const dropZone = document.getElementById('dropZone');
     const sourceInput = document.getElementById('source');
@@ -1037,8 +1009,6 @@ VIEWER_HTML = """
       dropZone.classList.remove('has-file');
       dropZone.innerHTML = 'Drop video here<br />or click to choose';
     });
-    document.getElementById('scanCameraButton').addEventListener('click', scanCameras);
-
     dropZone.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
