@@ -39,12 +39,19 @@ source_state = {
     "video_path": None,
     "video_name": None,
     "loop": True,
+    "target_fps": 10.0,
+    "jpeg_quality": 60,
+    "width": 640,
+    "height": 360,
+    "session_id": 0,
     "applied_at": time.time(),
 }
 
 processing_state = {
     "running": False,
     "frame_count": 0,
+    "started_at": None,
+    "elapsed_seconds": 0.0,
     "latest_metrics": {},
     "latest_timestamp_ms": None,
     "last_frame_at": None,
@@ -70,8 +77,8 @@ def open_camera(index: int):
     global camera
     if camera is None:
         camera = cv2.VideoCapture(index)
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(source_state["width"]))
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(source_state["height"]))
     return camera
 
 
@@ -86,9 +93,12 @@ def state_payload() -> dict:
 
 
 def set_latest(metrics: dict, timestamp_ms: int) -> None:
+    if processing_state["started_at"] is None:
+        processing_state["started_at"] = time.time()
     processing_state["latest_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["last_frame_at"] = time.time()
+    processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
     processing_state["frame_count"] += 1
     processing_state["error"] = None
     osc_sender.send_metrics(metrics)
@@ -96,7 +106,8 @@ def set_latest(metrics: dict, timestamp_ms: int) -> None:
 
 
 def encode_frame(frame):
-    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    quality = int(source_state["jpeg_quality"])
+    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         return None
     return (
@@ -107,10 +118,12 @@ def encode_frame(frame):
 
 async def stream_live():
     processing_state["running"] = True
+    session_id = source_state["session_id"]
     cap = open_camera(int(source_state["camera_index"]))
     engine = get_pose_engine()
 
-    while source_state["source"] == "live":
+    while source_state["source"] == "live" and source_state["session_id"] == session_id:
+        started = time.time()
         ok, frame = cap.read()
         if not ok:
             processing_state["error"] = "Camera frame not available"
@@ -123,17 +136,20 @@ async def stream_live():
         encoded = encode_frame(processed)
         if encoded:
             yield encoded
-        await asyncio.sleep(1 / 30)
+        frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
+        elapsed = time.time() - started
+        await asyncio.sleep(max(0.0, frame_interval - elapsed))
 
     processing_state["running"] = False
 
 
 async def stream_video():
     processing_state["running"] = True
+    session_id = source_state["session_id"]
     release_camera()
     engine = get_pose_engine()
 
-    while source_state["source"] == "video":
+    while source_state["source"] == "video" and source_state["session_id"] == session_id:
         video_path = source_state.get("video_path")
         if not video_path:
             processing_state["error"] = "No video selected"
@@ -141,14 +157,21 @@ async def stream_video():
             continue
 
         cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        target_fps = max(float(source_state["target_fps"]), 1.0)
+        fps = min(source_fps, target_fps)
         frame_interval = 1.0 / max(fps, 1.0)
+        frame_skip = max(1, round(source_fps / target_fps))
+        frame_index = 0
 
-        while source_state["source"] == "video":
+        while source_state["source"] == "video" and source_state["session_id"] == session_id:
             started = time.time()
             ok, frame = cap.read()
             if not ok:
                 break
+            frame_index += 1
+            if frame_skip > 1 and frame_index % frame_skip != 1:
+                continue
 
             timestamp_ms = int(time.time() * 1000)
             processed, metrics = engine.process_frame(frame, timestamp_ms)
@@ -194,6 +217,10 @@ async def apply_input(
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
+    target_fps: float = Form(10.0),
+    jpeg_quality: int = Form(60),
+    width: int = Form(640),
+    height: int = Form(360),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -206,6 +233,12 @@ async def apply_input(
         mode=osc_mode,
         alpha=osc_alpha,
     )
+
+    source_state["session_id"] += 1
+    source_state["target_fps"] = max(1.0, min(float(target_fps), 30.0))
+    source_state["jpeg_quality"] = max(35, min(int(jpeg_quality), 90))
+    source_state["width"] = max(320, min(int(width), 1280))
+    source_state["height"] = max(180, min(int(height), 720))
 
     if source == "live":
         release_camera()
@@ -241,6 +274,8 @@ async def apply_input(
         )
 
     processing_state["frame_count"] = 0
+    processing_state["started_at"] = None
+    processing_state["elapsed_seconds"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
@@ -306,7 +341,7 @@ VIEWER_HTML = """
       overflow: hidden;
     }
     .controls { padding: 14px; display: grid; gap: 12px; }
-    .controls-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .controls-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
     label { display: grid; gap: 6px; color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
     input, select, button {
       width: 100%;
@@ -340,7 +375,7 @@ VIEWER_HTML = """
     }
     .meta {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 8px;
       border-top: 1px solid #243044;
       padding: 10px 14px;
@@ -415,6 +450,18 @@ VIEWER_HTML = """
         <label>Alpha
           <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
         </label>
+        <label>FPS
+          <input id="targetFps" name="target_fps" type="number" min="1" max="30" step="1" value="10" />
+        </label>
+        <label>JPEG
+          <input id="jpegQuality" name="jpeg_quality" type="number" min="35" max="90" step="5" value="60" />
+        </label>
+        <label>Width
+          <input id="width" name="width" type="number" min="320" max="1280" step="20" value="640" />
+        </label>
+        <label>Height
+          <input id="height" name="height" type="number" min="180" max="720" step="20" value="360" />
+        </label>
         <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> OSC enabled</label>
         <button type="submit">Apply</button>
       </form>
@@ -428,8 +475,9 @@ VIEWER_HTML = """
         </div>
         <div class="meta">
           <div>source: <span id="mSource">-</span></div>
-          <div>frames: <span id="mFrames">0</span></div>
+          <div>seconds: <span id="mSeconds">0.0</span></div>
           <div>osc: <span id="mOsc">-</span></div>
+          <div>loop: <span id="mLoop">on</span></div>
           <div>file: <span id="mFile">-</span></div>
         </div>
       </section>
@@ -487,8 +535,9 @@ VIEWER_HTML = """
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
       document.getElementById('status').textContent = processing.error || (age < 2 ? 'processing' : 'waiting');
       document.getElementById('mSource').textContent = source.source || '-';
-      document.getElementById('mFrames').textContent = processing.frame_count || 0;
+      document.getElementById('mSeconds').textContent = Number(processing.elapsed_seconds || 0).toFixed(1);
       document.getElementById('mOsc').textContent = `${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
+      document.getElementById('mLoop').textContent = source.loop ? 'on' : 'off';
       document.getElementById('mFile').textContent = source.video_name || '-';
 
       for (const name of metricNames) {
