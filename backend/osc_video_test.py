@@ -53,7 +53,6 @@ def main():
                 timestamp_ms = int(frame_index * frame_interval * 1000)
                 processed, metrics = pose_engine.process_frame(frame, timestamp_ms)
                 sender.send_metrics(metrics)
-                sender.send_heartbeat(timestamp_ms)
 
                 if not args.no_preview:
                     cv2.imshow("FIELD OSC video test", processed)

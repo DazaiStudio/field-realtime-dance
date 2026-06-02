@@ -83,12 +83,6 @@ Metric addresses:
 /field/jerk
 ```
 
-Heartbeat:
-
-```text
-/field/heartbeat <timestamp_ms>
-```
-
 The viewer lets you change:
 
 - OSC host
@@ -101,6 +95,8 @@ The viewer lets you change:
 Unchecked metrics are not sent over OSC and are hidden from the address list.
 
 The viewer's metric values follow the selected OSC mode. In `raw` mode, the page shows raw output values. In `normalize` mode, the page shows the same normalized values that are sent over OSC.
+
+OSC settings apply at runtime. Changing mode, prefix, alpha, target, enabled state, or selected metrics does not require restarting detection.
 
 ## OSC Monitor
 

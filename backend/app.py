@@ -81,7 +81,6 @@ def send_osc_metrics(metrics, timestamp_ms=None):
     if not metrics:
         return
     osc_sender.send_metrics(metrics)
-    osc_sender.send_heartbeat(timestamp_ms or int(time.time() * 1000))
 
 def init_camera():
     global camera, pose_engine

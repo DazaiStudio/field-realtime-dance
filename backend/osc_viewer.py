@@ -244,7 +244,6 @@ def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
         processing_state["error"] = None
     sent_messages = osc_sender.send_metrics(metrics, send_keys=set(source_state["osc_metrics"]))
     processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
-    osc_sender.send_heartbeat(timestamp_ms)
     log_osc_messages(sent_messages)
 
 
@@ -451,6 +450,36 @@ async def api_cameras():
 @app.get("/api/cameras/scan")
 async def api_camera_scan():
     return {"cameras": list_cameras(), "signals": scan_camera_signals()}
+
+
+@app.post("/api/osc/config")
+async def apply_osc_config(
+    osc_host: str = Form("127.0.0.1"),
+    osc_port: int = Form(9000),
+    osc_enabled: bool = Form(True),
+    osc_mode: str = Form("raw"),
+    osc_alpha: float = Form(1.0),
+    osc_namespace: str = Form("/field"),
+    osc_metrics_selected: bool = Form(False),
+    osc_metrics: Optional[list[str]] = Form(None),
+):
+    osc_sender.configure(
+        host=osc_host,
+        port=osc_port,
+        enabled=osc_enabled,
+        mode=osc_mode,
+        alpha=osc_alpha,
+        namespace=osc_namespace,
+    )
+    if osc_metrics_selected:
+        source_state["osc_metrics"] = [name for name in (osc_metrics or []) if name in METRIC_NAMES]
+
+    raw_metrics = processing_state.get("latest_raw_metrics") or {}
+    if raw_metrics:
+        osc_sender.send_metrics(raw_metrics, send_keys=set())
+        processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
+
+    return {"status": "applied", **state_payload()}
 
 
 @app.post("/api/apply")
@@ -965,6 +994,33 @@ VIEWER_HTML = """
       return payload;
     }
 
+    function buildOscFormData() {
+      const data = new FormData();
+      data.set('osc_host', document.getElementById('oscHost').value);
+      data.set('osc_port', document.getElementById('oscPort').value);
+      data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('osc_mode', document.getElementById('oscMode').value);
+      data.set('osc_alpha', document.getElementById('oscAlpha').value);
+      data.set('osc_namespace', document.getElementById('oscNamespace').value);
+      data.set('osc_metrics_selected', 'true');
+      document.querySelectorAll('.metric-send:checked').forEach(input => {
+        data.append('osc_metrics', input.value);
+      });
+      return data;
+    }
+
+    async function applyOscSettings() {
+      const res = await fetch('/api/osc/config', { method: 'POST', body: buildOscFormData() });
+      const payload = await res.json();
+      if (payload.status !== 'applied') {
+        console.warn('OSC config failed', payload.error || payload);
+        return payload;
+      }
+      oscDirty = false;
+      update(payload);
+      return payload;
+    }
+
     document.getElementById('form').addEventListener('submit', async (event) => {
       event.preventDefault();
     });
@@ -999,6 +1055,7 @@ VIEWER_HTML = """
     let lastPayload = null;
     let inputDirty = false;
     let oscDirty = false;
+    let oscApplyTimer = null;
 
     function showPreview() {
       streamImage.classList.add('hidden');
@@ -1189,17 +1246,28 @@ VIEWER_HTML = """
       oscDirty = true;
     }
 
+    function scheduleOscApply(delay = 300) {
+      markOscDirty();
+      window.clearTimeout(oscApplyTimer);
+      oscApplyTimer = window.setTimeout(() => {
+        applyOscSettings().catch(error => console.warn('OSC config failed', error));
+      }, delay);
+    }
+
     ['oscHost', 'oscPort', 'oscAlpha', 'oscMode', 'oscEnabled'].forEach(id => {
       const input = document.getElementById(id);
-      input.addEventListener('input', markOscDirty);
-      input.addEventListener('change', markOscDirty);
+      input.addEventListener('input', () => scheduleOscApply());
+      input.addEventListener('change', () => scheduleOscApply(0));
     });
     document.getElementById('oscNamespace').addEventListener('input', () => {
-      markOscDirty();
+      scheduleOscApply();
       updateAddresses();
     });
     document.querySelectorAll('.metric-send').forEach(input => {
-      input.addEventListener('change', () => updateAddresses());
+      input.addEventListener('change', () => {
+        updateAddresses();
+        scheduleOscApply(0);
+      });
     });
 
     loadCameras();

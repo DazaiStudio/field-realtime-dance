@@ -120,11 +120,6 @@ class OSCSender:
             self.last_sent_at = time.time()
         return sent
 
-    def send_heartbeat(self, timestamp_ms: int) -> None:
-        if not self.enabled:
-            return
-        self._send_message(f"{self.namespace}/heartbeat", int(timestamp_ms))
-
     def _prepare_value(self, key: str, value: object) -> Optional[float]:
         try:
             numeric = float(value)
