@@ -98,7 +98,7 @@ def state_payload() -> dict:
         "source": dict(source_state),
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
-        "addresses": [f"{osc_sender.namespace}/{name}" for name in source_state["osc_metrics"]],
+        "addresses": [f"{osc_sender.namespace}/{name}" for name in METRIC_NAMES],
     }
     payload["source"]["video_path"] = None
     return payload
@@ -240,7 +240,7 @@ def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
         processing_state["error"] = "Camera signal is very dark"
     else:
         processing_state["error"] = None
-    osc_sender.send_metrics(metrics, send_keys=set(source_state["osc_metrics"]))
+    osc_sender.send_metrics(metrics)
     processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
 
 
@@ -439,8 +439,6 @@ async def apply_osc_config(
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form("/field"),
-    osc_metrics_selected: bool = Form(False),
-    osc_metrics: Optional[list[str]] = Form(None),
 ):
     osc_sender.configure(
         host=osc_host,
@@ -450,9 +448,6 @@ async def apply_osc_config(
         alpha=osc_alpha,
         namespace=osc_namespace,
     )
-    if osc_metrics_selected:
-        source_state["osc_metrics"] = [name for name in (osc_metrics or []) if name in METRIC_NAMES]
-
     raw_metrics = processing_state.get("latest_raw_metrics") or {}
     if raw_metrics:
         osc_sender.send_metrics(raw_metrics, send_keys=set())
@@ -478,8 +473,6 @@ async def apply_input(
     jpeg_quality: int = Form(60),
     width: int = Form(960),
     height: int = Form(540),
-    osc_metrics_selected: bool = Form(False),
-    osc_metrics: Optional[list[str]] = Form(None),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -500,11 +493,7 @@ async def apply_input(
     source_state["jpeg_quality"] = max(35, min(int(jpeg_quality), 90))
     source_state["width"] = max(320, min(int(width), 1280))
     source_state["height"] = max(180, min(int(height), 720))
-    if osc_metrics_selected:
-        selected_metrics = [name for name in (osc_metrics or []) if name in METRIC_NAMES]
-    else:
-        selected_metrics = list(METRIC_NAMES)
-    source_state["osc_metrics"] = selected_metrics
+    source_state["osc_metrics"] = list(METRIC_NAMES)
 
     if source == "live":
         release_camera()
@@ -781,7 +770,7 @@ VIEWER_HTML = """
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 122px 112px 1fr 22px;
+      grid-template-columns: 122px 112px 1fr;
       align-items: center;
       gap: 10px;
       min-height: 46px;
@@ -809,7 +798,6 @@ VIEWER_HTML = """
     .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
     .address-list { display: grid; gap: 6px; color: var(--muted); font: 12px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
-    .metric input { width: 16px; min-height: 16px; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
       .controls-grid, .osc-settings, .metric-osc-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -924,7 +912,6 @@ VIEWER_HTML = """
         <div class="name">${name}</div>
         <div class="value" id="v-${name}">0.00</div>
         <div class="bar"><div class="fill" id="b-${name}"></div></div>
-        <input class="metric-send" type="checkbox" value="${name}" checked title="Send OSC" />
       `;
       metricsEl.appendChild(row);
     }
@@ -935,11 +922,6 @@ VIEWER_HTML = """
       data.set('loop', 'true');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
-      data.set('osc_metrics_selected', 'true');
-      data.delete('osc_metrics');
-      document.querySelectorAll('.metric-send:checked').forEach(input => {
-        data.append('osc_metrics', input.value);
-      });
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -964,10 +946,6 @@ VIEWER_HTML = """
       data.set('osc_mode', document.getElementById('oscMode').value);
       data.set('osc_alpha', document.getElementById('oscAlpha').value);
       data.set('osc_namespace', document.getElementById('oscNamespace').value);
-      data.set('osc_metrics_selected', 'true');
-      document.querySelectorAll('.metric-send:checked').forEach(input => {
-        data.append('osc_metrics', input.value);
-      });
       return data;
     }
 
@@ -1109,25 +1087,15 @@ VIEWER_HTML = """
       return value;
     }
 
-    function selectedMetricNames() {
-      return Array.from(document.querySelectorAll('.metric-send:checked')).map(input => input.value);
-    }
-
     function updateAddresses(payload = lastPayload) {
       const metrics = payload?.processing?.latest_metrics || {};
       const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
-      const selected = selectedMetricNames();
       const container = document.getElementById('addresses');
       container.innerHTML = '';
-      for (const name of selected) {
+      for (const name of metricNames) {
         const row = document.createElement('div');
         const value = Number(metrics[name] ?? 0);
         row.textContent = `${prefix}/${name}  ${formatMetric(value)}`;
-        container.appendChild(row);
-      }
-      if (selected.length === 0) {
-        const row = document.createElement('div');
-        row.textContent = 'No metrics selected';
         container.appendChild(row);
       }
     }
@@ -1206,13 +1174,6 @@ VIEWER_HTML = """
       scheduleOscApply();
       updateAddresses();
     });
-    document.querySelectorAll('.metric-send').forEach(input => {
-      input.addEventListener('change', () => {
-        updateAddresses();
-        scheduleOscApply(0);
-      });
-    });
-
     loadCameras();
 
     const ws = new WebSocket(`ws://${location.host}/ws`);

@@ -16,7 +16,7 @@ Use it to:
 - toggle pose detection on/off
 - show the skeleton overlay
 - display 9 realtime dance metrics
-- send selected metrics over OSC
+- send the 9 metrics over OSC
 
 ## Quick Start
 
@@ -89,13 +89,13 @@ The viewer lets you change:
 - address prefix
 - raw / normalize mode
 - smoothing alpha
-- which metrics are sent
+- whether OSC output is enabled
 
-Unchecked metrics are not sent over OSC and are hidden from the address list.
+`Enable OSC` turns metric output on or off for all 9 metrics.
 
 The viewer's metric values follow the selected OSC mode. In `raw` mode, the page shows raw output values. In `normalize` mode, the page shows the same normalized values that are sent over OSC.
 
-OSC settings apply at runtime. Changing mode, prefix, alpha, target, enabled state, or selected metrics does not require restarting detection.
+OSC settings apply at runtime. Changing mode, prefix, alpha, target, or enabled state does not require restarting detection.
 
 ## Camera Notes
 
