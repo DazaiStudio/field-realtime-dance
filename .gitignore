@@ -23,6 +23,7 @@ env/
 # Video / Data Storage
 backend/recordings/
 backend/viewer_uploads/
+qa_screenshots/
 
 # OS / IDE
 .DS_Store

@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import cv2
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
 from osc_sender import METRIC_NAMES, OSCSender
@@ -42,7 +42,7 @@ source_state = {
     "video_path": None,
     "video_name": None,
     "loop": True,
-    "target_fps": 10.0,
+    "target_fps": 15.0,
     "jpeg_quality": 60,
     "width": 640,
     "height": 360,
@@ -61,6 +61,7 @@ processing_state = {
     "latest_metrics": {},
     "latest_timestamp_ms": None,
     "last_frame_at": None,
+    "signal_mean": None,
     "error": None,
 }
 osc_terminal_log = []
@@ -173,7 +174,7 @@ def list_cameras(max_index: int = 4) -> list[dict]:
     return cameras
 
 
-def set_latest(metrics: dict, timestamp_ms: int) -> None:
+def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_metrics"] = metrics
@@ -181,9 +182,18 @@ def set_latest(metrics: dict, timestamp_ms: int) -> None:
     processing_state["last_frame_at"] = time.time()
     processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
     processing_state["frame_count"] += 1
-    elapsed = max(processing_state["elapsed_seconds"], 1e-6)
-    processing_state["fps"] = processing_state["frame_count"] / elapsed
-    processing_state["error"] = None
+    if frame is not None:
+        processing_state["signal_mean"] = float(frame.mean())
+    if processing_state["elapsed_seconds"] > 0.25:
+        processing_state["fps"] = processing_state["frame_count"] / processing_state["elapsed_seconds"]
+    if (
+        source_state["source"] == "live"
+        and processing_state["signal_mean"] is not None
+        and processing_state["signal_mean"] < 3
+    ):
+        processing_state["error"] = "Camera signal is very dark"
+    else:
+        processing_state["error"] = None
     outbound_metrics = {
         key: value for key, value in metrics.items()
         if key in set(source_state["osc_metrics"])
@@ -191,6 +201,22 @@ def set_latest(metrics: dict, timestamp_ms: int) -> None:
     sent_messages = osc_sender.send_metrics(outbound_metrics)
     osc_sender.send_heartbeat(timestamp_ms)
     log_osc_messages(sent_messages)
+
+
+def set_preview_frame(frame=None) -> None:
+    if processing_state["started_at"] is None:
+        processing_state["started_at"] = time.time()
+    processing_state["last_frame_at"] = time.time()
+    processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
+    processing_state["frame_count"] += 1
+    if frame is not None:
+        processing_state["signal_mean"] = float(frame.mean())
+    if processing_state["elapsed_seconds"] > 0.25:
+        processing_state["fps"] = processing_state["frame_count"] / processing_state["elapsed_seconds"]
+    if processing_state["signal_mean"] is not None and processing_state["signal_mean"] < 3:
+        processing_state["error"] = "Camera signal is very dark"
+    else:
+        processing_state["error"] = None
 
 
 def log_osc_messages(messages: list[dict]) -> None:
@@ -205,7 +231,6 @@ def log_osc_messages(messages: list[dict]) -> None:
             {
                 "time": timestamp,
                 "address": message["address"],
-                "mode": osc_sender.mode,
                 "value": value,
             }
         )
@@ -243,7 +268,7 @@ async def stream_live():
 
         timestamp_ms = int(time.time() * 1000)
         processed, metrics = engine.process_frame(frame, timestamp_ms)
-        set_latest(metrics, timestamp_ms)
+        set_latest(metrics, timestamp_ms, frame)
         encoded = encode_frame(processed)
         if encoded:
             yield encoded
@@ -269,7 +294,7 @@ async def stream_live_preview():
             await asyncio.sleep(0.2)
             continue
 
-        processing_state["error"] = None
+        set_preview_frame(frame)
         encoded = encode_frame(frame)
         if encoded:
             yield encoded
@@ -318,7 +343,7 @@ async def stream_video():
 
             timestamp_ms = int(time.time() * 1000)
             processed, metrics = engine.process_frame(frame, timestamp_ms)
-            set_latest(metrics, timestamp_ms)
+            set_latest(metrics, timestamp_ms, frame)
             encoded = encode_frame(processed)
             if encoded:
                 yield encoded
@@ -345,6 +370,11 @@ async def index():
     return HTMLResponse(VIEWER_HTML)
 
 
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
+
 @app.get("/api/state")
 async def api_state():
     return state_payload()
@@ -367,7 +397,7 @@ async def apply_input(
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form("/field"),
-    target_fps: float = Form(10.0),
+    target_fps: float = Form(15.0),
     jpeg_quality: int = Form(60),
     width: int = Form(640),
     height: int = Form(360),
@@ -439,6 +469,7 @@ async def apply_input(
     processing_state["latest_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
+    processing_state["signal_mean"] = None
     processing_state["error"] = None
     osc_terminal_log.clear()
     osc_sender.reset_state()
@@ -525,7 +556,7 @@ VIEWER_HTML = """
       text-transform: uppercase;
       letter-spacing: .08em;
     }
-    .controls-grid { display: grid; grid-template-columns: 1fr 92px 1fr 110px 92px; gap: 10px; align-items: end; }
+    .controls-grid { display: grid; grid-template-columns: 1fr 92px 1fr 110px 120px; gap: 10px; align-items: end; }
     .hint { color: var(--muted); font: 12px ui-monospace, monospace; align-self: center; }
     .hidden { display: none !important; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
@@ -638,10 +669,11 @@ VIEWER_HTML = """
       color: var(--muted);
       font: 12px ui-monospace, monospace;
     }
+    .meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 22px 142px 82px 1fr;
+      grid-template-columns: 22px 128px 118px 1fr;
       align-items: center;
       gap: 10px;
       min-height: 46px;
@@ -651,7 +683,12 @@ VIEWER_HTML = """
       border-radius: 8px;
     }
     .name { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
-    .value { font: 18px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+    .value {
+      font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .bar { height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
     .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), var(--teal)); transition: width .08s linear; }
     .address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
@@ -947,12 +984,11 @@ VIEWER_HTML = """
 
     function updateAddresses(payload) {
       const addresses = payload.addresses || [];
-      const mode = payload.osc?.mode || 'raw';
       const container = document.getElementById('addresses');
       container.innerHTML = '';
       for (const address of addresses) {
         const row = document.createElement('div');
-        row.textContent = `${address}  mode=${mode}`;
+        row.textContent = address;
         container.appendChild(row);
       }
       if (addresses.length === 0) {
@@ -974,7 +1010,7 @@ VIEWER_HTML = """
       }
       for (const item of rows.slice(-18)) {
         const row = document.createElement('div');
-        row.textContent = `${item.time}  ${item.address}  ${item.mode}  ${item.value}`;
+        row.textContent = `${item.time}  ${item.address}  ${item.value}`;
         terminal.appendChild(row);
       }
       terminal.scrollTop = terminal.scrollHeight;
