@@ -42,10 +42,10 @@ source_state = {
     "video_path": None,
     "video_name": None,
     "loop": True,
-    "target_fps": 15.0,
+    "target_fps": 24.0,
     "jpeg_quality": 60,
-    "width": 640,
-    "height": 360,
+    "width": 960,
+    "height": 540,
     "session_id": 0,
     "osc_metrics": list(METRIC_NAMES),
     "detect_enabled": False,
@@ -248,6 +248,14 @@ def encode_frame(frame):
     )
 
 
+def resize_frame(frame):
+    target_width = int(source_state["width"])
+    target_height = int(source_state["height"])
+    if frame.shape[1] == target_width and frame.shape[0] == target_height:
+        return frame
+    return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+
 async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
@@ -265,6 +273,7 @@ async def stream_live():
             processing_state["error"] = "Camera frame not available"
             await asyncio.sleep(0.2)
             continue
+        frame = resize_frame(frame)
 
         timestamp_ms = int(time.time() * 1000)
         processed, metrics = engine.process_frame(frame, timestamp_ms)
@@ -293,6 +302,7 @@ async def stream_live_preview():
             processing_state["error"] = "Camera frame not available"
             await asyncio.sleep(0.2)
             continue
+        frame = resize_frame(frame)
 
         set_preview_frame(frame)
         encoded = encode_frame(frame)
@@ -323,9 +333,8 @@ async def stream_video():
         cap = cv2.VideoCapture(str(video_path))
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         target_fps = max(float(source_state["target_fps"]), 1.0)
-        fps = min(source_fps, target_fps)
-        frame_interval = 1.0 / max(fps, 1.0)
         frame_skip = max(1, round(source_fps / target_fps))
+        frame_interval = frame_skip / max(source_fps, 1.0)
         frame_index = 0
 
         while (
@@ -340,6 +349,7 @@ async def stream_video():
             frame_index += 1
             if frame_skip > 1 and frame_index % frame_skip != 1:
                 continue
+            frame = resize_frame(frame)
 
             timestamp_ms = int(time.time() * 1000)
             processed, metrics = engine.process_frame(frame, timestamp_ms)
@@ -397,10 +407,10 @@ async def apply_input(
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form("/field"),
-    target_fps: float = Form(15.0),
+    target_fps: float = Form(24.0),
     jpeg_quality: int = Form(60),
-    width: int = Form(640),
-    height: int = Form(360),
+    width: int = Form(960),
+    height: int = Form(540),
     osc_metrics_selected: bool = Form(False),
     osc_metrics: Optional[list[str]] = Form(None),
     video: Optional[UploadFile] = File(None),
@@ -633,7 +643,7 @@ VIEWER_HTML = """
     .detect-button {
       position: absolute;
       right: 14px;
-      bottom: 14px;
+      top: 14px;
       width: auto;
       min-width: 112px;
       z-index: 2;
@@ -652,7 +662,7 @@ VIEWER_HTML = """
     .change-input {
       position: absolute;
       left: 14px;
-      bottom: 14px;
+      top: 14px;
       width: auto;
       min-width: 118px;
       z-index: 2;
@@ -673,7 +683,7 @@ VIEWER_HTML = """
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 22px 128px 118px 1fr;
+      grid-template-columns: 22px 122px 130px 1fr;
       align-items: center;
       gap: 10px;
       min-height: 46px;
@@ -691,14 +701,38 @@ VIEWER_HTML = """
     }
     .bar { height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
     .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), var(--teal)); transition: width .08s linear; }
-    .address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
+    .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
+    .osc-settings {
+      display: grid;
+      grid-template-columns: minmax(160px, 1fr) 88px minmax(160px, 1fr) 96px 120px 92px;
+      gap: 10px;
+      align-items: end;
+    }
+    .osc-output-grid {
+      display: grid;
+      grid-template-columns: minmax(220px, .8fr) minmax(320px, 1.2fr);
+      gap: 12px;
+      margin-top: 12px;
+    }
     .address-title-row { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-top: 12px; }
     .address-title-row .section-title { margin-bottom: 0; }
     .mode-inline { width: 150px; }
     .address-list { display: grid; gap: 6px; color: var(--muted); font: 12px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
+    .terminal-details {
+      margin-top: 12px;
+    }
+    .terminal-details summary {
+      cursor: pointer;
+      color: var(--amber);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      list-style-position: inside;
+      margin-bottom: 10px;
+    }
     .osc-terminal {
-      min-height: 110px;
+      min-height: 168px;
       max-height: 180px;
       overflow-y: auto;
       display: grid;
@@ -715,12 +749,12 @@ VIEWER_HTML = """
     .metric input { width: 16px; min-height: 16px; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
-      .controls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls-grid, .osc-settings, .osc-output-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .apply-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .meta { grid-template-columns: 1fr; }
+      .controls-grid, .osc-settings, .osc-output-grid, .meta { grid-template-columns: 1fr; }
       .metric { grid-template-columns: 1fr; }
       .value { text-align: left; }
     }
@@ -771,7 +805,7 @@ VIEWER_HTML = """
         </div>
         <div class="address-panel">
           <p class="section-title">OSC</p>
-          <div class="controls-grid">
+          <div class="osc-settings">
             <label>Host
               <input id="oscHost" name="osc_host" value="127.0.0.1" />
             </label>
@@ -784,20 +818,20 @@ VIEWER_HTML = """
             <label>Alpha
               <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
             </label>
-            <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enabled</label>
-          </div>
-          <div class="address-title-row">
-            <p class="section-title">OSC addresses</p>
-            <label class="mode-inline">Mode
+            <label>Mode
               <select id="oscMode" name="osc_mode">
                 <option value="raw">raw</option>
                 <option value="normalize">normalize</option>
               </select>
             </label>
+            <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enabled</label>
           </div>
+          <p class="section-title">OSC addresses</p>
           <div id="addresses" class="address-list"></div>
-          <p class="section-title">OSC terminal</p>
-          <div id="oscTerminal" class="osc-terminal"></div>
+          <details class="terminal-details">
+            <summary>OSC terminal</summary>
+              <div id="oscTerminal" class="osc-terminal"></div>
+          </details>
         </div>
       </section>
 
@@ -884,6 +918,7 @@ VIEWER_HTML = """
 
     let selectedVideoUrl = null;
     let isDetecting = false;
+    let lastPayload = null;
 
     function showPreview() {
       streamImage.classList.add('hidden');
@@ -982,16 +1017,30 @@ VIEWER_HTML = """
       }
     });
 
-    function updateAddresses(payload) {
-      const addresses = payload.addresses || [];
+    function normalizePrefix(prefix) {
+      let value = (prefix || '/field').trim().replace(/\/+$/, '');
+      if (!value) value = '/field';
+      if (!value.startsWith('/')) value = `/${value}`;
+      return value;
+    }
+
+    function selectedMetricNames() {
+      return Array.from(document.querySelectorAll('.metric-send:checked')).map(input => input.value);
+    }
+
+    function updateAddresses(payload = lastPayload) {
+      const metrics = payload?.processing?.latest_metrics || {};
+      const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
+      const selected = selectedMetricNames();
       const container = document.getElementById('addresses');
       container.innerHTML = '';
-      for (const address of addresses) {
+      for (const name of selected) {
         const row = document.createElement('div');
-        row.textContent = address;
+        const value = Number(metrics[name] ?? 0);
+        row.textContent = `${prefix}/${name}  ${formatMetric(value)}`;
         container.appendChild(row);
       }
-      if (addresses.length === 0) {
+      if (selected.length === 0) {
         const row = document.createElement('div');
         row.textContent = 'No metrics selected';
         container.appendChild(row);
@@ -1016,7 +1065,15 @@ VIEWER_HTML = """
       terminal.scrollTop = terminal.scrollHeight;
     }
 
+    function formatMetric(value) {
+      if (!Number.isFinite(value)) return String(value);
+      const abs = Math.abs(value);
+      if (abs >= 1000000) return value.toExponential(2);
+      return value.toFixed(2);
+    }
+
     function update(payload) {
+      lastPayload = payload;
       const source = payload.source || {};
       const processing = payload.processing || {};
       const osc = payload.osc || {};
@@ -1043,11 +1100,18 @@ VIEWER_HTML = """
       for (const name of metricNames) {
         const value = Number(metrics[name] ?? 0);
         maxSeen[name] = Math.max(maxSeen[name] * 0.995, Math.abs(value), 1);
-        document.getElementById(`v-${name}`).textContent = Number.isFinite(value) ? value.toFixed(2) : String(value);
+        const valueEl = document.getElementById(`v-${name}`);
+        valueEl.textContent = formatMetric(value);
+        valueEl.title = Number.isFinite(value) ? value.toFixed(2) : String(value);
         const width = Math.max(0, Math.min(100, Math.abs(value) / maxSeen[name] * 100));
         document.getElementById(`b-${name}`).style.width = `${width}%`;
       }
     }
+
+    document.getElementById('oscNamespace').addEventListener('input', () => updateAddresses());
+    document.querySelectorAll('.metric-send').forEach(input => {
+      input.addEventListener('change', () => updateAddresses());
+    });
 
     loadCameras();
 
