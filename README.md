@@ -60,6 +60,8 @@ http://127.0.0.1:9100
 
 Leave the terminal window running while using the viewer.
 
+Use `backend/osc_viewer.py` for the local browser viewer. Do not start the viewer with `backend/osc_video_test.py`; that script is only for sending OSC from one video file without the web UI.
+
 ## Update Existing Clone
 
 If the repo is already cloned on this machine, do not clone it again. Stop the viewer if it is running, then update from GitHub:
@@ -183,6 +185,8 @@ Click `Click to upload video` in the viewer, select the file, press `Enter`, the
 
 ## CLI Options
 
+Local browser viewer:
+
 ```bash
 python backend/osc_viewer.py \
   --web-host 127.0.0.1 \
@@ -201,12 +205,21 @@ python backend/osc_viewer.py \
 
 `--osc-alpha` controls smoothing. The default is `0.25`; `1.0` means no smoothing, and lower values are smoother.
 
+Standalone video-to-OSC test, without the browser viewer:
+
+```bash
+python backend/osc_video_test.py path/to/video.mp4 --osc-port 9000 --loop
+```
+
+`osc_video_test.py` needs a video path and does not accept `--web-port`.
+
 ## Project Structure
 
 ```text
 backend/
   osc_viewer.py      # Local browser viewer
   osc_sender.py      # OSC output, normalization, smoothing
+  osc_video_test.py  # Standalone video-to-OSC test, no web UI
   osc_monitor.py     # Standalone OSC monitor
   pose_engine.py     # MediaPipe pose detection and overlay
   dance_metrics.py   # 9 dance metric calculations

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Set
 from uuid import uuid4
@@ -23,7 +24,6 @@ REPO_ROOT = BASE_DIR.parent
 UPLOAD_DIR = BASE_DIR / "viewer_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-app = FastAPI()
 clients: Set[WebSocket] = set()
 pose_engine: Optional[PoseEngine] = None
 camera = None
@@ -77,6 +77,17 @@ processing_state = {
     "signal_mean": None,
     "error": None,
 }
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    release_camera()
+    if pose_engine is not None:
+        pose_engine.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def get_pose_engine() -> PoseEngine:
@@ -454,13 +465,6 @@ async def stream_video():
             break
 
     processing_state["running"] = False
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    release_camera()
-    if pose_engine is not None:
-        pose_engine.close()
 
 
 @app.get("/")
@@ -1252,7 +1256,7 @@ VIEWER_HTML = """
     });
 
     function normalizePrefix(prefix) {
-      let value = (prefix || '/field').trim().replace(/\/+$/, '');
+      let value = (prefix || '/field').trim().replace(/\\/+$/, '');
       if (!value) value = '/field';
       if (!value.startsWith('/')) value = `/${value}`;
       return value;
