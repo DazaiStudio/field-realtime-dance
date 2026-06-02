@@ -48,6 +48,7 @@ source_state = {
     "height": 360,
     "session_id": 0,
     "osc_metrics": list(METRIC_NAMES),
+    "detect_enabled": False,
     "applied_at": time.time(),
 }
 
@@ -56,6 +57,7 @@ processing_state = {
     "frame_count": 0,
     "started_at": None,
     "elapsed_seconds": 0.0,
+    "fps": 0.0,
     "latest_metrics": {},
     "latest_timestamp_ms": None,
     "last_frame_at": None,
@@ -177,6 +179,8 @@ def set_latest(metrics: dict, timestamp_ms: int) -> None:
     processing_state["last_frame_at"] = time.time()
     processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
     processing_state["frame_count"] += 1
+    elapsed = max(processing_state["elapsed_seconds"], 1e-6)
+    processing_state["fps"] = processing_state["frame_count"] / elapsed
     processing_state["error"] = None
     outbound_metrics = {
         key: value for key, value in metrics.items()
@@ -203,7 +207,11 @@ async def stream_live():
     cap = open_camera(int(source_state["camera_index"]))
     engine = get_pose_engine()
 
-    while source_state["source"] == "live" and source_state["session_id"] == session_id:
+    while (
+        source_state["source"] == "live"
+        and source_state["session_id"] == session_id
+        and source_state["detect_enabled"]
+    ):
         started = time.time()
         ok, frame = cap.read()
         if not ok:
@@ -230,7 +238,11 @@ async def stream_video():
     release_camera()
     engine = get_pose_engine()
 
-    while source_state["source"] == "video" and source_state["session_id"] == session_id:
+    while (
+        source_state["source"] == "video"
+        and source_state["session_id"] == session_id
+        and source_state["detect_enabled"]
+    ):
         video_path = source_state.get("video_path")
         if not video_path:
             processing_state["error"] = "No video selected"
@@ -245,7 +257,11 @@ async def stream_video():
         frame_skip = max(1, round(source_fps / target_fps))
         frame_index = 0
 
-        while source_state["source"] == "video" and source_state["session_id"] == session_id:
+        while (
+            source_state["source"] == "video"
+            and source_state["session_id"] == session_id
+            and source_state["detect_enabled"]
+        ):
             started = time.time()
             ok, frame = cap.read()
             if not ok:
@@ -298,6 +314,7 @@ async def apply_input(
     source: str = Form("live"),
     camera_index: int = Form(0),
     loop: bool = Form(True),
+    detect_enabled: bool = Form(False),
     osc_host: str = Form("127.0.0.1"),
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
@@ -325,6 +342,7 @@ async def apply_input(
     )
 
     source_state["session_id"] += 1
+    source_state["detect_enabled"] = bool(detect_enabled)
     source_state["target_fps"] = max(1.0, min(float(target_fps), 30.0))
     source_state["jpeg_quality"] = max(35, min(int(jpeg_quality), 90))
     source_state["width"] = max(320, min(int(width), 1280))
@@ -371,6 +389,7 @@ async def apply_input(
     processing_state["frame_count"] = 0
     processing_state["started_at"] = None
     processing_state["elapsed_seconds"] = 0.0
+    processing_state["fps"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
@@ -381,6 +400,8 @@ async def apply_input(
 
 @app.get("/stream")
 async def stream():
+    if not source_state["detect_enabled"]:
+        return StreamingResponse(iter(()), media_type="multipart/x-mixed-replace; boundary=frame")
     if source_state["source"] == "video":
         generator = stream_video()
     else:
@@ -477,7 +498,8 @@ VIEWER_HTML = """
     }
     .check-row { display: flex; align-items: center; gap: 8px; padding-top: 22px; color: var(--text); font-size: 14px; }
     .video-wrap { position: relative; background: #090806; aspect-ratio: 16 / 9; }
-    #stream { width: 100%; height: 100%; object-fit: contain; display: block; }
+    #stream, #previewVideo { width: 100%; height: 100%; object-fit: contain; display: block; }
+    #previewVideo.hidden, #stream.hidden { display: none; }
     .empty {
       position: absolute;
       inset: 0;
@@ -534,6 +556,16 @@ VIEWER_HTML = """
       z-index: 2;
       box-shadow: 0 10px 30px rgba(0,0,0,.22);
     }
+    .detect-button.off {
+      background: rgba(29, 26, 23, .84);
+      color: var(--text);
+      border-color: var(--line);
+    }
+    .enter-button {
+      width: auto;
+      min-width: 96px;
+      justify-self: end;
+    }
     .change-input {
       position: absolute;
       left: 14px;
@@ -547,7 +579,7 @@ VIEWER_HTML = """
     }
     .meta {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 8px;
       border-top: 1px solid var(--line);
       padding: 10px 14px;
@@ -601,7 +633,8 @@ VIEWER_HTML = """
     <section class="layout">
       <section class="panel">
         <div class="video-wrap">
-          <img id="stream" alt="Processed pose stream" />
+          <video id="previewVideo" class="hidden" controls loop muted playsinline></video>
+          <img id="stream" class="hidden" alt="Processed pose stream" />
           <div id="inputOverlay" class="input-overlay">
             <div class="input-card">
               <p class="section-title">Input</p>
@@ -617,17 +650,17 @@ VIEWER_HTML = """
                   <div id="dropZone" class="drop-zone">Drop video here<br />or click to choose</div>
                 </label>
               </div>
+              <button id="enterInputButton" class="enter-button" type="button">Enter</button>
             </div>
           </div>
           <button id="changeInputButton" class="change-input" type="button">Change Input</button>
-          <button id="detectButton" class="detect-button" type="submit">Detect</button>
+          <button id="detectButton" class="detect-button off" type="button">Detect Off</button>
         </div>
         <div class="meta">
-          <div>source: <span id="mSource">-</span></div>
-          <div>seconds: <span id="mSeconds">0.0</span></div>
-          <div>osc: <span id="mOsc">-</span></div>
-          <div>loop: <span id="mLoop">on</span></div>
-          <div>file: <span id="mFile">-</span></div>
+          <div id="metaA">source: -</div>
+          <div id="metaB">fps: 0.0</div>
+          <div id="metaC">input: -</div>
+          <div id="metaD">osc: -</div>
         </div>
       </section>
 
@@ -663,6 +696,7 @@ VIEWER_HTML = """
     </section>
     <input id="source" name="source" type="hidden" value="live" />
     <input id="loop" name="loop" type="hidden" value="true" />
+    <input id="detectEnabled" name="detect_enabled" type="hidden" value="false" />
     </form>
   </main>
   <script>
@@ -683,11 +717,11 @@ VIEWER_HTML = """
       metricsEl.appendChild(row);
     }
 
-    document.getElementById('form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const form = event.currentTarget;
+    async function applySettings(detectEnabled) {
+      const form = document.getElementById('form');
       const data = new FormData(form);
       data.set('loop', 'true');
+      data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
       data.set('osc_metrics_selected', 'true');
       data.delete('osc_metrics');
@@ -702,11 +736,14 @@ VIEWER_HTML = """
       const payload = await res.json();
       if (payload.status !== 'applied') {
         alert(payload.error || 'Apply failed');
-        return;
+        return payload;
       }
 
-      document.getElementById('inputOverlay').classList.add('compact');
-      document.getElementById('stream').src = `/stream?t=${Date.now()}`;
+      return payload;
+    }
+
+    document.getElementById('form').addEventListener('submit', async (event) => {
+      event.preventDefault();
     });
 
     async function loadCameras() {
@@ -729,10 +766,44 @@ VIEWER_HTML = """
     const videoInput = document.getElementById('video');
     const dropZone = document.getElementById('dropZone');
     const sourceInput = document.getElementById('source');
+    const detectInput = document.getElementById('detectEnabled');
+    const streamImage = document.getElementById('stream');
+    const previewVideo = document.getElementById('previewVideo');
+    const detectButton = document.getElementById('detectButton');
+
+    let selectedVideoUrl = null;
+    let isDetecting = false;
+
+    function showPreview() {
+      streamImage.classList.add('hidden');
+      if (sourceInput.value === 'video' && selectedVideoUrl) {
+        previewVideo.src = selectedVideoUrl;
+        previewVideo.classList.remove('hidden');
+        previewVideo.play().catch(() => {});
+      } else {
+        previewVideo.classList.add('hidden');
+      }
+    }
+
+    function showDetectionStream() {
+      previewVideo.pause();
+      previewVideo.classList.add('hidden');
+      streamImage.classList.remove('hidden');
+      streamImage.src = `/stream?t=${Date.now()}`;
+    }
+
+    function setDetectButton(enabled) {
+      isDetecting = enabled;
+      detectInput.value = enabled ? 'true' : 'false';
+      detectButton.textContent = enabled ? 'Detect On' : 'Detect Off';
+      detectButton.classList.toggle('off', !enabled);
+    }
 
     document.getElementById('camera').addEventListener('change', () => {
       sourceInput.value = 'live';
       videoInput.value = '';
+      selectedVideoUrl = null;
+      previewVideo.removeAttribute('src');
       dropZone.classList.remove('has-file');
       dropZone.innerHTML = 'Drop video here<br />or click to choose';
     });
@@ -741,8 +812,11 @@ VIEWER_HTML = """
     videoInput.addEventListener('change', () => {
       if (videoInput.files.length > 0) {
         sourceInput.value = 'video';
+        if (selectedVideoUrl) URL.revokeObjectURL(selectedVideoUrl);
+        selectedVideoUrl = URL.createObjectURL(videoInput.files[0]);
         dropZone.classList.add('has-file');
         dropZone.textContent = videoInput.files[0].name;
+        showPreview();
       }
     });
     dropZone.addEventListener('dragover', event => {
@@ -758,11 +832,37 @@ VIEWER_HTML = """
       transfer.items.add(event.dataTransfer.files[0]);
       videoInput.files = transfer.files;
       sourceInput.value = 'video';
+      if (selectedVideoUrl) URL.revokeObjectURL(selectedVideoUrl);
+      selectedVideoUrl = URL.createObjectURL(event.dataTransfer.files[0]);
       dropZone.classList.add('has-file');
       dropZone.textContent = event.dataTransfer.files[0].name;
+      showPreview();
     });
     document.getElementById('changeInputButton').addEventListener('click', () => {
       document.getElementById('inputOverlay').classList.remove('compact');
+    });
+    document.getElementById('enterInputButton').addEventListener('click', async () => {
+      setDetectButton(false);
+      const payload = await applySettings(false);
+      if (!payload || payload.status !== 'applied') return;
+      document.getElementById('inputOverlay').classList.add('compact');
+      showPreview();
+    });
+    detectButton.addEventListener('click', async () => {
+      const nextState = !isDetecting;
+      setDetectButton(nextState);
+      const payload = await applySettings(nextState);
+      if (!payload || payload.status !== 'applied') {
+        setDetectButton(!nextState);
+        return;
+      }
+      document.getElementById('inputOverlay').classList.add('compact');
+      if (nextState) {
+        showDetectionStream();
+      } else {
+        streamImage.removeAttribute('src');
+        showPreview();
+      }
     });
 
     function updateAddresses(payload) {
@@ -789,12 +889,19 @@ VIEWER_HTML = """
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
 
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
-      document.getElementById('status').textContent = processing.error || (age < 2 ? 'processing' : 'waiting');
-      document.getElementById('mSource').textContent = source.source || '-';
-      document.getElementById('mSeconds').textContent = Number(processing.elapsed_seconds || 0).toFixed(1);
-      document.getElementById('mOsc').textContent = `${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
-      document.getElementById('mLoop').textContent = source.loop ? 'on' : 'off';
-      document.getElementById('mFile').textContent = source.video_name || '-';
+      document.getElementById('status').textContent =
+        processing.error || (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off');
+      document.getElementById('metaA').textContent = `source: ${source.source || '-'}`;
+      document.getElementById('metaB').textContent = `fps: ${Number(processing.fps || 0).toFixed(1)}`;
+      if (source.source === 'video') {
+        document.getElementById('metaC').textContent = `time: ${Number(processing.elapsed_seconds || 0).toFixed(1)}s`;
+        document.getElementById('metaD').textContent = `file: ${source.video_name || '-'} / loop ${source.loop ? 'on' : 'off'}`;
+      } else {
+        const cameraSelect = document.getElementById('camera');
+        const cameraLabel = cameraSelect.options[cameraSelect.selectedIndex]?.textContent || source.camera_index || '-';
+        document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
+        document.getElementById('metaD').textContent = `osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
+      }
       updateAddresses(payload);
 
       for (const name of metricNames) {

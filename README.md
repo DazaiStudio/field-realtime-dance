@@ -79,6 +79,14 @@ Open `http://127.0.0.1:9100`. FIELD Realtime Dance has an input section for `Liv
 
 The viewer can also change OSC target, prefix, mode, smoothing alpha, and which metrics are sent directly from the page. Uploaded test videos are stored under `backend/viewer_uploads/` and are ignored by git.
 
+Terminal OSC monitor:
+
+```bash
+python backend/osc_monitor.py --host 127.0.0.1 --port 9000 --prefix /field
+```
+
+The monitor prints each received OSC address and formats float values to two decimals.
+
 ### Video-to-OSC Test
 
 Process any input video and send the generated metrics to OSC without using the main frontend:
