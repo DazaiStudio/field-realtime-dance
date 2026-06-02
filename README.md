@@ -21,10 +21,16 @@ Use it to:
 
 ## Quick Start
 
-From the repo root:
+First clone the repo, or open your existing local copy:
 
 ```powershell
-cd D:\Github\field-realtime-dance
+git clone https://github.com/DazaiStudio/field-realtime-dance.git
+cd field-realtime-dance
+```
+
+Install dependencies and start the viewer:
+
+```powershell
 pip install -r requirements.txt
 python backend\osc_viewer.py --osc-port 9000 --web-port 9100
 ```
@@ -108,20 +114,14 @@ This is useful when testing whether another app is receiving the same values.
 
 ## Camera Notes
 
-Camera names are listed from DirectShow on Windows, for example:
-
-```text
-0 - USB2.0 HD UVC WebCam
-1 - NDI Webcam Video 1
-9 - OBS Virtual Camera
-```
+The camera dropdown uses the device names reported by the operating system. Choose the source you want to use, then press `Enter` in the viewer.
 
 If the viewer does not show camera video:
 
 - close other apps that may be using the camera
 - check Windows Camera Privacy settings
 - test the camera in the Windows Camera app
-- restart the viewer after changing virtual camera / NDI / OBS sources
+- restart the viewer after changing camera or virtual-camera sources
 
 Only one app should own the same camera source at a time.
 
@@ -132,7 +132,7 @@ Only one app should own the same camera source at a time.
 You can test with any local `.mp4` file. Example:
 
 ```text
-C:\Users\tommy\OneDrive\work\2026_work\future-folk\04_dataset\morris_dance\clips\beetlecrushers__v18_v18a.mp4
+path\to\test-video.mp4
 ```
 
 Click the video chooser in the viewer, select the file, press `Enter`, then toggle `Detect On`.
