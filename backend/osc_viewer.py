@@ -776,6 +776,7 @@ VIEWER_HTML = """
     }
     .range-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .range-value { color: var(--text); font: 12px ui-monospace, monospace; }
+    .range-hint { color: var(--muted); font-size: 11px; text-transform: none; letter-spacing: 0; }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
@@ -894,6 +895,7 @@ VIEWER_HTML = """
           </label>
           <label><span class="range-label-row"><span>Alpha (smooth)</span><span id="oscAlphaValue" class="range-value">1.00</span></span>
             <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="1" />
+            <span class="range-hint">Lower = smoother</span>
           </label>
         </div>
         <div id="metrics" class="metric-grid"></div>
