@@ -27,6 +27,7 @@ clients: Set[WebSocket] = set()
 pose_engine: Optional[PoseEngine] = None
 camera = None
 camera_cache = {"updated_at": 0.0, "cameras": []}
+camera_signal_cache = {"updated_at": 0.0, "signals": {}}
 osc_sender = OSCSender(
     host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
@@ -172,6 +173,51 @@ def list_cameras(max_index: int = 4) -> list[dict]:
     camera_cache["updated_at"] = time.time()
     camera_cache["cameras"] = cameras
     return cameras
+
+
+def test_camera_signal(index: int) -> dict:
+    backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(index, backend)
+    opened = cap.isOpened()
+    ok = False
+    mean = None
+    shape = None
+    if opened:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(source_state["width"]))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(source_state["height"]))
+        for _ in range(4):
+            ok, frame = cap.read()
+        if ok:
+            mean = float(frame.mean())
+            shape = [int(frame.shape[1]), int(frame.shape[0])]
+    cap.release()
+
+    if not opened:
+        status = "unavailable"
+    elif not ok:
+        status = "no frame"
+    elif mean is not None and mean < 3:
+        status = "dark"
+    else:
+        status = "ok"
+
+    return {"index": index, "opened": opened, "read": ok, "mean": mean, "shape": shape, "status": status}
+
+
+def scan_camera_signals(max_cameras: int = 10) -> dict:
+    if time.time() - camera_signal_cache["updated_at"] < 20 and camera_signal_cache["signals"]:
+        return camera_signal_cache["signals"]
+
+    release_camera()
+    cameras = list_cameras()
+    signals = {}
+    for camera_info in cameras[:max_cameras]:
+        index = int(camera_info["index"])
+        signals[str(index)] = test_camera_signal(index)
+
+    camera_signal_cache["updated_at"] = time.time()
+    camera_signal_cache["signals"] = signals
+    return signals
 
 
 def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
@@ -393,6 +439,11 @@ async def api_state():
 @app.get("/api/cameras")
 async def api_cameras():
     return {"cameras": list_cameras()}
+
+
+@app.get("/api/cameras/scan")
+async def api_camera_scan():
+    return {"cameras": list_cameras(), "signals": scan_camera_signals()}
 
 
 @app.post("/api/apply")
@@ -626,6 +677,7 @@ VIEWER_HTML = """
       border-radius: 8px;
     }
     .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; }
+    .camera-row { display: grid; grid-template-columns: 1fr 74px; gap: 8px; align-items: end; }
     .or { color: var(--muted); align-self: center; padding-bottom: 11px; font: 12px ui-monospace, monospace; }
     .drop-zone {
       min-height: 66px;
@@ -781,9 +833,12 @@ VIEWER_HTML = """
               <p class="section-title">Input</p>
               <div class="input-row">
                 <label>Camera
-                  <select id="camera" name="camera_index">
-                    <option value="0">0 - Camera 0</option>
-                  </select>
+                  <div class="camera-row">
+                    <select id="camera" name="camera_index">
+                      <option value="0">0 - Camera 0</option>
+                    </select>
+                    <button id="scanCameraButton" type="button">Scan</button>
+                  </div>
                 </label>
                 <div class="or">or</div>
                 <label>Video
@@ -908,6 +963,33 @@ VIEWER_HTML = """
       }
     }
 
+    async function scanCameras() {
+      const button = document.getElementById('scanCameraButton');
+      button.textContent = '...';
+      button.disabled = true;
+      try {
+        const res = await fetch('/api/cameras/scan');
+        const payload = await res.json();
+        const signals = payload.signals || {};
+        const select = document.getElementById('camera');
+        select.innerHTML = '';
+        for (const camera of payload.cameras || []) {
+          const signal = signals[String(camera.index)];
+          const suffix = signal ? ` [${signal.status}]` : '';
+          const option = document.createElement('option');
+          option.value = camera.index;
+          option.textContent = `${camera.label}${suffix}`;
+          option.dataset.status = signal?.status || 'unknown';
+          select.appendChild(option);
+        }
+      } catch (error) {
+        console.warn('Camera scan unavailable', error);
+      } finally {
+        button.textContent = 'Scan';
+        button.disabled = false;
+      }
+    }
+
     const videoInput = document.getElementById('video');
     const dropZone = document.getElementById('dropZone');
     const sourceInput = document.getElementById('source');
@@ -955,6 +1037,7 @@ VIEWER_HTML = """
       dropZone.classList.remove('has-file');
       dropZone.innerHTML = 'Drop video here<br />or click to choose';
     });
+    document.getElementById('scanCameraButton').addEventListener('click', scanCameras);
 
     dropZone.addEventListener('click', event => {
       event.preventDefault();
