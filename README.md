@@ -17,7 +17,6 @@ Use it to:
 - show the skeleton overlay
 - display 9 realtime dance metrics
 - send selected metrics over OSC
-- monitor OSC messages from the same page
 
 ## Quick Start
 
@@ -97,16 +96,6 @@ Unchecked metrics are not sent over OSC and are hidden from the address list.
 The viewer's metric values follow the selected OSC mode. In `raw` mode, the page shows raw output values. In `normalize` mode, the page shows the same normalized values that are sent over OSC.
 
 OSC settings apply at runtime. Changing mode, prefix, alpha, target, enabled state, or selected metrics does not require restarting detection.
-
-## OSC Monitor
-
-The viewer includes a collapsible OSC terminal. You can also run a standalone monitor:
-
-```powershell
-python backend\osc_monitor.py --host 127.0.0.1 --port 9000 --prefix /field
-```
-
-This is useful when testing whether another app is receiving the same values.
 
 ## Camera Notes
 

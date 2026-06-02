@@ -67,7 +67,6 @@ processing_state = {
     "signal_mean": None,
     "error": None,
 }
-osc_terminal_log = []
 
 
 def get_pose_engine() -> PoseEngine:
@@ -100,7 +99,6 @@ def state_payload() -> dict:
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
         "addresses": [f"{osc_sender.namespace}/{name}" for name in source_state["osc_metrics"]],
-        "osc_terminal": list(osc_terminal_log),
     }
     payload["source"]["video_path"] = None
     return payload
@@ -242,9 +240,8 @@ def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
         processing_state["error"] = "Camera signal is very dark"
     else:
         processing_state["error"] = None
-    sent_messages = osc_sender.send_metrics(metrics, send_keys=set(source_state["osc_metrics"]))
+    osc_sender.send_metrics(metrics, send_keys=set(source_state["osc_metrics"]))
     processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
-    log_osc_messages(sent_messages)
 
 
 def set_preview_frame(frame=None) -> None:
@@ -261,24 +258,6 @@ def set_preview_frame(frame=None) -> None:
         processing_state["error"] = "Camera signal is very dark"
     else:
         processing_state["error"] = None
-
-
-def log_osc_messages(messages: list[dict]) -> None:
-    if not messages:
-        return
-    timestamp = time.strftime("%H:%M:%S")
-    for message in messages:
-        value = message["value"]
-        if isinstance(value, float):
-            value = f"{value:.2f}"
-        osc_terminal_log.append(
-            {
-                "time": timestamp,
-                "address": message["address"],
-                "value": value,
-            }
-        )
-    del osc_terminal_log[:-40]
 
 
 def encode_frame(frame):
@@ -572,7 +551,6 @@ async def apply_input(
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
     processing_state["error"] = None
-    osc_terminal_log.clear()
     osc_sender.reset_state()
     return {"status": "applied", **state_payload()}
 
@@ -680,7 +658,6 @@ VIEWER_HTML = """
       font-weight: 750;
       align-self: end;
     }
-    .check-row { display: flex; align-items: center; gap: 8px; padding-top: 22px; color: var(--text); font-size: 14px; }
     .video-wrap { position: relative; background: #090806; aspect-ratio: 16 / 9; }
     #stream, #previewVideo { width: 100%; height: 100%; object-fit: contain; display: block; }
     #previewVideo.hidden, #stream.hidden { display: none; }
@@ -782,10 +759,29 @@ VIEWER_HTML = """
       font: 12px ui-monospace, monospace;
     }
     .meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .metric-osc-controls {
+      display: grid;
+      grid-template-columns: minmax(130px, 1fr) 126px 96px;
+      gap: 10px;
+      align-items: end;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #171411;
+    }
+    .osc-toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 42px;
+      color: var(--text);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 22px 122px 130px 1fr;
+      grid-template-columns: 122px 112px 1fr 22px;
       align-items: center;
       gap: 10px;
       min-height: 46px;
@@ -806,59 +802,25 @@ VIEWER_HTML = """
     .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
     .osc-settings {
       display: grid;
-      grid-template-columns: minmax(160px, 1fr) 88px minmax(160px, 1fr) 96px 120px 92px;
+      grid-template-columns: minmax(160px, 1fr) 88px minmax(160px, 1fr);
       gap: 10px;
       align-items: end;
     }
-    .osc-output-grid {
-      display: grid;
-      grid-template-columns: minmax(220px, .8fr) minmax(320px, 1.2fr);
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .address-title-row { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-top: 12px; }
-    .address-title-row .section-title { margin-bottom: 0; }
-    .mode-inline { width: 150px; }
+    .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
     .address-list { display: grid; gap: 6px; color: var(--muted); font: 12px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
-    .terminal-details {
-      margin-top: 12px;
-    }
-    .terminal-details summary {
-      cursor: pointer;
-      color: var(--amber);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-      list-style-position: inside;
-      margin-bottom: 10px;
-    }
-    .osc-terminal {
-      min-height: 168px;
-      max-height: 180px;
-      overflow-y: auto;
-      display: grid;
-      align-content: start;
-      gap: 4px;
-      padding: 10px;
-      background: #0d0b09;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      color: #d8d0c6;
-      font: 12px ui-monospace, monospace;
-    }
-    .osc-terminal div { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
     .metric input { width: 16px; min-height: 16px; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
-      .controls-grid, .osc-settings, .osc-output-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls-grid, .osc-settings, .metric-osc-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .apply-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-settings, .osc-output-grid, .meta { grid-template-columns: 1fr; }
-      .metric { grid-template-columns: 1fr; }
-      .value { text-align: left; }
+      .controls-grid, .osc-settings, .metric-osc-controls, .meta { grid-template-columns: 1fr; }
+      .metric { grid-template-columns: minmax(0, 1fr) auto; }
+      .metric .value { text-align: right; }
+      .metric .bar { grid-column: 1 / -1; }
     }
   </style>
 </head>
@@ -920,28 +882,28 @@ VIEWER_HTML = """
             <label>Prefix
               <input id="oscNamespace" name="osc_namespace" value="/field" />
             </label>
-            <label>Alpha
-              <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
-            </label>
-            <label>Mode
-              <select id="oscMode" name="osc_mode">
-                <option value="raw">raw</option>
-                <option value="normalize">normalize</option>
-              </select>
-            </label>
-            <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enabled</label>
           </div>
-          <p class="section-title">OSC addresses</p>
-          <div id="addresses" class="address-list"></div>
-          <details class="terminal-details">
-            <summary>OSC terminal</summary>
-              <div id="oscTerminal" class="osc-terminal"></div>
-          </details>
         </div>
       </section>
 
       <aside class="panel">
+        <div class="metric-osc-controls">
+          <label class="osc-toggle-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enable OSC</label>
+          <label>Mode
+            <select id="oscMode" name="osc_mode">
+              <option value="raw">raw</option>
+              <option value="normalize">normalize</option>
+            </select>
+          </label>
+          <label>Alpha
+            <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
+          </label>
+        </div>
         <div id="metrics" class="metric-grid"></div>
+        <div class="metric-address-panel">
+          <p class="section-title">OSC addresses</p>
+          <div id="addresses" class="address-list"></div>
+        </div>
       </aside>
     </section>
     <input id="source" name="source" type="hidden" value="live" />
@@ -959,10 +921,10 @@ VIEWER_HTML = """
       const row = document.createElement('div');
       row.className = 'metric';
       row.innerHTML = `
-        <input class="metric-send" type="checkbox" value="${name}" checked title="Send OSC" />
         <div class="name">${name}</div>
         <div class="value" id="v-${name}">0.00</div>
         <div class="bar"><div class="fill" id="b-${name}"></div></div>
+        <input class="metric-send" type="checkbox" value="${name}" checked title="Send OSC" />
       `;
       metricsEl.appendChild(row);
     }
@@ -1170,24 +1132,6 @@ VIEWER_HTML = """
       }
     }
 
-    function updateTerminal(payload) {
-      const rows = payload.osc_terminal || [];
-      const terminal = document.getElementById('oscTerminal');
-      terminal.innerHTML = '';
-      if (rows.length === 0) {
-        const row = document.createElement('div');
-        row.textContent = 'waiting for OSC output...';
-        terminal.appendChild(row);
-        return;
-      }
-      for (const item of rows.slice(-18)) {
-        const row = document.createElement('div');
-        row.textContent = `${item.time}  ${item.address}  ${item.value}`;
-        terminal.appendChild(row);
-      }
-      terminal.scrollTop = terminal.scrollHeight;
-    }
-
     function formatMetric(value) {
       if (!Number.isFinite(value)) return String(value);
       const abs = Math.abs(value);
@@ -1229,7 +1173,6 @@ VIEWER_HTML = """
         document.getElementById('metaD').textContent = `mirror: ${source.mirror_live ? 'on' : 'off'} / osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
       }
       updateAddresses(payload);
-      updateTerminal(payload);
 
       for (const name of metricNames) {
         const value = Number(metrics[name] ?? 0);
