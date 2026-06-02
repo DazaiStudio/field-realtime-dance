@@ -67,15 +67,17 @@ curl -X POST http://127.0.0.1:8000/api/osc/config \
 
 Normalization keeps bounded metrics in their natural range, maps `sync_correlation` from `[-1, 1]` to `[0, 1]`, and uses adaptive peak normalization for `energy`, `expansion`, `curvature`, `torque`, and `jerk`.
 
-### Local OSC Web Viewer
+### Local Input Viewer
 
-Run a local OSC receiver with a browser UI:
+Run a local browser-based processor for live camera or video-file tests:
 
 ```bash
 python backend/osc_viewer.py --osc-port 9000 --web-port 9100
 ```
 
-Open `http://127.0.0.1:9100`. The viewer listens for `/field/*`, shows the latest metric values, and can update the backend OSC `mode` and `alpha`.
+Open `http://127.0.0.1:9100`. The viewer has an input section for `Live Cam` or `Video File`; press **Apply** to process the selected input, show the skeleton overlay, display the 9 metrics, and send OSC at the same time.
+
+The viewer can also change OSC target, mode, and smoothing alpha directly from the page. Uploaded test videos are stored under `backend/viewer_uploads/` and are ignored by git.
 
 ### Video-to-OSC Test
 
