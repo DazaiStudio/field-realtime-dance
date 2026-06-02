@@ -80,7 +80,8 @@ def release_camera() -> None:
 def open_camera(index: int):
     global camera
     if camera is None:
-        camera = cv2.VideoCapture(index)
+        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+        camera = cv2.VideoCapture(index, backend)
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(source_state["width"]))
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(source_state["height"]))
     return camera
@@ -118,9 +119,37 @@ def get_windows_camera_names() -> list[str]:
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
+def get_directshow_camera_names() -> list[str]:
+    if os.name != "nt":
+        return []
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+    except Exception:
+        return []
+    try:
+        return [name.strip() for name in FilterGraph().get_input_devices() if name.strip()]
+    except Exception:
+        return []
+
+
 def list_cameras(max_index: int = 4) -> list[dict]:
     if time.time() - camera_cache["updated_at"] < 10 and camera_cache["cameras"]:
         return camera_cache["cameras"]
+
+    directshow_names = get_directshow_camera_names()
+    if directshow_names:
+        cameras = [
+            {
+                "index": index,
+                "name": name,
+                "label": f"{index} - {name}",
+                "source": "DirectShow",
+            }
+            for index, name in enumerate(directshow_names)
+        ]
+        camera_cache["updated_at"] = time.time()
+        camera_cache["cameras"] = cameras
+        return cameras
 
     names = get_windows_camera_names()
     cameras = []
@@ -132,9 +161,9 @@ def list_cameras(max_index: int = 4) -> list[dict]:
         if not available:
             continue
         name = names[len(cameras)] if len(cameras) < len(names) else f"Camera {index}"
-        cameras.append({"index": index, "name": name, "label": f"{index} - {name}"})
+        cameras.append({"index": index, "name": name, "label": f"{index} - {name}", "source": "OpenCV"})
     if not cameras:
-        cameras.append({"index": 0, "name": "Camera 0", "label": "0 - Camera 0"})
+        cameras.append({"index": 0, "name": "Camera 0", "label": "0 - Camera 0", "source": "Fallback"})
     camera_cache["updated_at"] = time.time()
     camera_cache["cameras"] = cameras
     return cameras
@@ -415,7 +444,7 @@ VIEWER_HTML = """
       border-radius: 8px;
       overflow: hidden;
     }
-    .controls { padding: 14px; display: grid; gap: 14px; }
+    .controls { padding: 12px; }
     .section-title {
       margin: 0 0 10px;
       color: var(--amber);
@@ -423,9 +452,7 @@ VIEWER_HTML = """
       text-transform: uppercase;
       letter-spacing: .08em;
     }
-    .controls-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .wide { grid-column: span 2; }
-    .apply-row { display: grid; grid-template-columns: 1fr 150px; gap: 10px; align-items: end; }
+    .controls-grid { display: grid; grid-template-columns: 1fr 92px 1fr 110px 92px; gap: 10px; align-items: end; }
     .hint { color: var(--muted); font: 12px ui-monospace, monospace; align-self: center; }
     .hidden { display: none !important; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
@@ -459,6 +486,64 @@ VIEWER_HTML = """
       color: var(--muted);
       font: 14px ui-monospace, monospace;
       pointer-events: none;
+    }
+    .input-overlay {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+      background: rgba(9, 8, 6, .76);
+      backdrop-filter: blur(4px);
+      transition: opacity .18s ease;
+    }
+    .input-overlay.compact {
+      pointer-events: none;
+      opacity: 0;
+    }
+    .input-card {
+      width: min(620px, 100%);
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+      background: rgba(29, 26, 23, .92);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; }
+    .or { color: var(--muted); align-self: center; padding-bottom: 11px; font: 12px ui-monospace, monospace; }
+    .drop-zone {
+      min-height: 66px;
+      display: grid;
+      place-items: center;
+      border: 1px dashed #6b5b4d;
+      border-radius: 8px;
+      color: var(--muted);
+      padding: 10px;
+      text-align: center;
+      cursor: pointer;
+    }
+    .drop-zone.active { border-color: var(--teal); color: var(--text); background: rgba(84,179,168,.08); }
+    .drop-zone.has-file { border-color: var(--amber); color: var(--text); }
+    .detect-button {
+      position: absolute;
+      right: 14px;
+      bottom: 14px;
+      width: auto;
+      min-width: 112px;
+      z-index: 2;
+      box-shadow: 0 10px 30px rgba(0,0,0,.22);
+    }
+    .change-input {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      width: auto;
+      min-width: 118px;
+      z-index: 2;
+      background: rgba(29, 26, 23, .84);
+      color: var(--text);
+      border-color: var(--line);
     }
     .meta {
       display: grid;
@@ -512,30 +597,43 @@ VIEWER_HTML = """
       <div class="status">pose overlay + metrics + OSC</div>
     </header>
 
-    <section class="panel controls">
-      <form id="form">
-        <div>
-          <p class="section-title">Input</p>
-          <div class="controls-grid">
-            <label>Source
-              <select id="source" name="source">
-                <option value="live">Live Cam</option>
-                <option value="video">Video File</option>
-              </select>
-            </label>
-            <label class="source-live wide">Camera
-              <select id="camera" name="camera_index">
-                <option value="0">0 - Camera 0</option>
-              </select>
-            </label>
-            <label class="source-video wide hidden">Video
-              <input id="video" name="video" type="file" accept="video/*" />
-            </label>
-            <label class="source-video check-row hidden"><input id="loop" name="loop" type="checkbox" checked /> Loop</label>
+    <form id="form">
+    <section class="layout">
+      <section class="panel">
+        <div class="video-wrap">
+          <img id="stream" alt="Processed pose stream" />
+          <div id="inputOverlay" class="input-overlay">
+            <div class="input-card">
+              <p class="section-title">Input</p>
+              <div class="input-row">
+                <label>Camera
+                  <select id="camera" name="camera_index">
+                    <option value="0">0 - Camera 0</option>
+                  </select>
+                </label>
+                <div class="or">or</div>
+                <label>Video
+                  <input id="video" name="video" type="file" accept="video/*" class="hidden" />
+                  <div id="dropZone" class="drop-zone">Drop video here<br />or click to choose</div>
+                </label>
+              </div>
+            </div>
           </div>
+          <button id="changeInputButton" class="change-input" type="button">Change Input</button>
+          <button id="detectButton" class="detect-button" type="submit">Detect</button>
         </div>
+        <div class="meta">
+          <div>source: <span id="mSource">-</span></div>
+          <div>seconds: <span id="mSeconds">0.0</span></div>
+          <div>osc: <span id="mOsc">-</span></div>
+          <div>loop: <span id="mLoop">on</span></div>
+          <div>file: <span id="mFile">-</span></div>
+        </div>
+      </section>
 
-        <div>
+      <aside class="panel">
+        <div id="metrics" class="metric-grid"></div>
+        <div class="address-panel">
           <p class="section-title">OSC</p>
           <div class="controls-grid">
             <label>Host
@@ -558,38 +656,14 @@ VIEWER_HTML = """
             </label>
             <label class="check-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enabled</label>
           </div>
-        </div>
-
-        <div class="apply-row">
-          <div class="hint" id="applyHint">Apply starts processing and OSC output.</div>
-          <button type="submit">Apply</button>
-        </div>
-      </form>
-    </section>
-
-    <section class="layout" style="margin-top:14px">
-      <section class="panel">
-        <div class="video-wrap">
-          <img id="stream" alt="Processed pose stream" />
-          <div id="empty" class="empty">Choose input and press Apply</div>
-        </div>
-        <div class="meta">
-          <div>source: <span id="mSource">-</span></div>
-          <div>seconds: <span id="mSeconds">0.0</span></div>
-          <div>osc: <span id="mOsc">-</span></div>
-          <div>loop: <span id="mLoop">on</span></div>
-          <div>file: <span id="mFile">-</span></div>
-        </div>
-      </section>
-
-      <aside class="panel">
-        <div id="metrics" class="metric-grid"></div>
-        <div class="address-panel">
           <p class="section-title">OSC addresses</p>
           <div id="addresses" class="address-list"></div>
         </div>
       </aside>
     </section>
+    <input id="source" name="source" type="hidden" value="live" />
+    <input id="loop" name="loop" type="hidden" value="true" />
+    </form>
   </main>
   <script>
     const metricNames = %METRICS%;
@@ -613,7 +687,7 @@ VIEWER_HTML = """
       event.preventDefault();
       const form = event.currentTarget;
       const data = new FormData(form);
-      data.set('loop', document.getElementById('loop').checked ? 'true' : 'false');
+      data.set('loop', 'true');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
       data.set('osc_metrics_selected', 'true');
       data.delete('osc_metrics');
@@ -631,17 +705,9 @@ VIEWER_HTML = """
         return;
       }
 
-      document.getElementById('empty').style.display = 'none';
+      document.getElementById('inputOverlay').classList.add('compact');
       document.getElementById('stream').src = `/stream?t=${Date.now()}`;
     });
-
-    function updateSourceFields() {
-      const source = document.getElementById('source').value;
-      document.querySelectorAll('.source-live').forEach(el => el.classList.toggle('hidden', source !== 'live'));
-      document.querySelectorAll('.source-video').forEach(el => el.classList.toggle('hidden', source !== 'video'));
-      document.getElementById('applyHint').textContent =
-        source === 'live' ? 'Apply starts camera processing and OSC output.' : 'Apply starts video loop processing and OSC output.';
-    }
 
     async function loadCameras() {
       try {
@@ -659,6 +725,45 @@ VIEWER_HTML = """
         console.warn('Camera list unavailable', error);
       }
     }
+
+    const videoInput = document.getElementById('video');
+    const dropZone = document.getElementById('dropZone');
+    const sourceInput = document.getElementById('source');
+
+    document.getElementById('camera').addEventListener('change', () => {
+      sourceInput.value = 'live';
+      videoInput.value = '';
+      dropZone.classList.remove('has-file');
+      dropZone.innerHTML = 'Drop video here<br />or click to choose';
+    });
+
+    dropZone.addEventListener('click', () => videoInput.click());
+    videoInput.addEventListener('change', () => {
+      if (videoInput.files.length > 0) {
+        sourceInput.value = 'video';
+        dropZone.classList.add('has-file');
+        dropZone.textContent = videoInput.files[0].name;
+      }
+    });
+    dropZone.addEventListener('dragover', event => {
+      event.preventDefault();
+      dropZone.classList.add('active');
+    });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('active'));
+    dropZone.addEventListener('drop', event => {
+      event.preventDefault();
+      dropZone.classList.remove('active');
+      if (!event.dataTransfer.files.length) return;
+      const transfer = new DataTransfer();
+      transfer.items.add(event.dataTransfer.files[0]);
+      videoInput.files = transfer.files;
+      sourceInput.value = 'video';
+      dropZone.classList.add('has-file');
+      dropZone.textContent = event.dataTransfer.files[0].name;
+    });
+    document.getElementById('changeInputButton').addEventListener('click', () => {
+      document.getElementById('inputOverlay').classList.remove('compact');
+    });
 
     function updateAddresses(payload) {
       const addresses = payload.addresses || [];
@@ -701,8 +806,6 @@ VIEWER_HTML = """
       }
     }
 
-    document.getElementById('source').addEventListener('change', updateSourceFields);
-    updateSourceFields();
     loadCameras();
 
     const ws = new WebSocket(`ws://${location.host}/ws`);
