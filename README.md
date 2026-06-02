@@ -81,8 +81,8 @@ Metric addresses:
 
 ```text
 /field/energy
-/field/sync_velocity
-/field/sync_correlation
+/field/sync_vel
+/field/sync_corr
 /field/expansion
 /field/curvature
 /field/height
@@ -90,6 +90,8 @@ Metric addresses:
 /field/torque
 /field/jerk
 ```
+
+All 9 metric messages send one float value. There are no integer metric messages.
 
 The viewer lets you change:
 
@@ -110,7 +112,7 @@ Metric bars are neutral readouts, not good/bad scores. Each metric has its own s
 
 ## Camera Notes
 
-The camera dropdown uses the device names reported by the operating system when available. On macOS, OpenCV may show generic names such as `Camera 0`; choose the source you want to use, then press `Enter` in the viewer.
+The camera dropdown uses the device names reported by the operating system when available. On macOS, the viewer reads names from `system_profiler`; if macOS/OpenCV cannot map a device name to an index, it may still show a generic name such as `Camera 0`.
 
 If the viewer does not show camera video:
 

@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional, Set
@@ -13,7 +14,7 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
-from osc_sender import METRIC_NAMES, OSCSender
+from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
 from pose_engine import PoseEngine
 
 
@@ -98,7 +99,7 @@ def state_payload() -> dict:
         "source": dict(source_state),
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
-        "addresses": [f"{osc_sender.namespace}/{name}" for name in METRIC_NAMES],
+        "addresses": [osc_sender.metric_address(name) for name in METRIC_NAMES],
     }
     payload["source"]["video_path"] = None
     return payload
@@ -138,6 +139,33 @@ def get_directshow_camera_names() -> list[str]:
         return []
 
 
+def get_macos_camera_names() -> list[str]:
+    if sys.platform != "darwin":
+        return []
+    try:
+        completed = subprocess.run(
+            ["system_profiler", "SPCameraDataType"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+
+    names = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line.endswith(":"):
+            continue
+        name = line[:-1].strip()
+        if not name or name in {"Camera", "Cameras"}:
+            continue
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def list_cameras(max_index: int = 4) -> list[dict]:
     if time.time() - camera_cache["updated_at"] < 10 and camera_cache["cameras"]:
         return camera_cache["cameras"]
@@ -157,7 +185,7 @@ def list_cameras(max_index: int = 4) -> list[dict]:
         camera_cache["cameras"] = cameras
         return cameras
 
-    names = get_windows_camera_names()
+    names = get_macos_camera_names() or get_windows_camera_names()
     cameras = []
     for index in range(max_index):
         backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
@@ -948,6 +976,7 @@ VIEWER_HTML = """
   </main>
   <script>
     const metricNames = %METRICS%;
+    const oscAddressNames = %OSC_ADDRESS_NAMES%;
     const metricsEl = document.getElementById('metrics');
     const maxSeen = {};
     const metricHints = {
@@ -1169,7 +1198,7 @@ VIEWER_HTML = """
       for (const name of metricNames) {
         const row = document.createElement('div');
         const value = Number(metrics[name] ?? 0);
-        row.textContent = `${prefix}/${name}  ${formatMetric(value)}`;
+        row.textContent = `${prefix}/${oscAddressNames[name] || name}  ${formatMetric(value)}`;
         container.appendChild(row);
       }
     }
@@ -1285,7 +1314,9 @@ VIEWER_HTML = """
   </script>
 </body>
 </html>
-""".replace("%METRICS%", json.dumps(list(METRIC_NAMES)))
+""".replace("%METRICS%", json.dumps(list(METRIC_NAMES))).replace(
+    "%OSC_ADDRESS_NAMES%", json.dumps(OSC_ADDRESS_NAMES)
+)
 
 
 def main():

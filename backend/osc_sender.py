@@ -17,6 +17,11 @@ METRIC_NAMES = (
     "jerk",
 )
 
+OSC_ADDRESS_NAMES = {
+    "sync_velocity": "sync_vel",
+    "sync_correlation": "sync_corr",
+}
+
 BOUNDED_METRICS = {"sync_velocity", "height", "sway"}
 UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
 
@@ -112,7 +117,7 @@ class OSCSender:
                 continue
             if not self.enabled:
                 continue
-            address = f"{self.namespace}/{key}"
+            address = self.metric_address(key)
             self._send_message(address, value)
             sent.append({"address": address, "value": value})
 
@@ -166,6 +171,9 @@ class OSCSender:
             self.client.send_message(address, value)
         except Exception as exc:
             print(f"OSC send failed for {address}: {exc}")
+
+    def metric_address(self, key: str) -> str:
+        return f"{self.namespace}/{OSC_ADDRESS_NAMES.get(key, key)}"
 
     @staticmethod
     def _validate_mode(mode: str) -> str:
