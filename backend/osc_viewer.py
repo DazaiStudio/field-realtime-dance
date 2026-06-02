@@ -639,6 +639,13 @@ VIEWER_HTML = """
       min-height: 42px;
     }
     input[type="checkbox"] { width: 18px; min-height: 18px; accent-color: var(--teal); }
+    input[type="range"] {
+      min-height: 24px;
+      padding: 0;
+      border: 0;
+      accent-color: var(--teal);
+      background: transparent;
+    }
     button {
       cursor: pointer;
       background: var(--amber);
@@ -767,6 +774,8 @@ VIEWER_HTML = """
       text-transform: uppercase;
       letter-spacing: .06em;
     }
+    .range-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .range-value { color: var(--text); font: 12px ui-monospace, monospace; }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
@@ -883,8 +892,8 @@ VIEWER_HTML = """
               <option value="normalize">normalize</option>
             </select>
           </label>
-          <label>Alpha
-            <input id="oscAlpha" name="osc_alpha" type="number" min="0.01" max="1" step="0.01" value="1" />
+          <label><span class="range-label-row"><span>Alpha (smooth)</span><span id="oscAlphaValue" class="range-value">1.00</span></span>
+            <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="1" />
           </label>
         </div>
         <div id="metrics" class="metric-grid"></div>
@@ -1100,6 +1109,11 @@ VIEWER_HTML = """
       }
     }
 
+    function syncAlphaLabel() {
+      const alpha = Number(document.getElementById('oscAlpha').value || 1);
+      document.getElementById('oscAlphaValue').textContent = alpha.toFixed(2);
+    }
+
     function formatMetric(value) {
       if (!Number.isFinite(value)) return String(value);
       const abs = Math.abs(value);
@@ -1122,6 +1136,7 @@ VIEWER_HTML = """
         document.getElementById('oscPort').value = osc.port || 9000;
         document.getElementById('oscNamespace').value = osc.namespace || '/field';
         document.getElementById('oscAlpha').value = osc.alpha ?? 1;
+        syncAlphaLabel();
         document.getElementById('oscMode').value = osc.mode || 'raw';
         document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
       }
@@ -1167,7 +1182,10 @@ VIEWER_HTML = """
 
     ['oscHost', 'oscPort', 'oscAlpha', 'oscMode', 'oscEnabled'].forEach(id => {
       const input = document.getElementById(id);
-      input.addEventListener('input', () => scheduleOscApply());
+      input.addEventListener('input', () => {
+        if (id === 'oscAlpha') syncAlphaLabel();
+        scheduleOscApply();
+      });
       input.addEventListener('change', () => scheduleOscApply(0));
     });
     document.getElementById('oscNamespace').addEventListener('input', () => {

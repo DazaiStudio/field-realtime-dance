@@ -88,7 +88,7 @@ The viewer lets you change:
 - OSC port
 - address prefix
 - raw / normalize mode
-- smoothing alpha
+- Alpha (smooth) slider
 - whether OSC output is enabled
 
 `Enable OSC` turns metric output on or off for all 9 metrics.
@@ -140,7 +140,7 @@ python backend\osc_viewer.py `
 - `raw`: send metric values directly
 - `normalize`: map values into a more bounded range
 
-`--osc-alpha` controls smoothing. `1.0` means no smoothing.
+`--osc-alpha` controls smoothing. `1.0` means no smoothing; lower values are smoother.
 
 ## Project Structure
 
