@@ -1,14 +1,16 @@
-# 後端 API 與 Web 伺服器
+# Web server
 fastapi
 uvicorn[standard]
 python-multipart
 
-# 影像處理與 AI 模型
+# Pose / motion analysis
 mediapipe
 opencv-python
 numpy
-
-# 科學計算 (用於凸包體積計算等)
 scipy
+
+# OSC
 python-osc>=1.8.0
-pygrabber>=0.2
+
+# Windows-only camera device names through DirectShow.
+pygrabber>=0.2; platform_system == "Windows"

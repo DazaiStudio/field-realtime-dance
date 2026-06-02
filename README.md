@@ -22,16 +22,25 @@ Use it to:
 
 First clone the repo, or open your existing local copy:
 
-```powershell
+```bash
 git clone https://github.com/DazaiStudio/field-realtime-dance.git
 cd field-realtime-dance
 ```
 
 Install dependencies and start the viewer:
 
+Windows PowerShell:
+
 ```powershell
 pip install -r requirements.txt
 python backend\osc_viewer.py --osc-port 9000 --web-port 9100
+```
+
+macOS / Linux:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100
 ```
 
 Open:
@@ -101,13 +110,14 @@ Metric bars are neutral readouts, not good/bad scores. Each metric has its own s
 
 ## Camera Notes
 
-The camera dropdown uses the device names reported by the operating system. Choose the source you want to use, then press `Enter` in the viewer.
+The camera dropdown uses the device names reported by the operating system when available. On macOS, OpenCV may show generic names such as `Camera 0`; choose the source you want to use, then press `Enter` in the viewer.
 
 If the viewer does not show camera video:
 
 - close other apps that may be using the camera
-- check Windows Camera Privacy settings
-- test the camera in the Windows Camera app
+- check camera privacy settings
+- on Windows, test the camera in the Windows Camera app
+- on macOS, allow camera access for Terminal / iTerm / the Python app in System Settings
 - restart the viewer after changing camera or virtual-camera sources
 
 Only one app should own the same camera source at a time.
@@ -119,21 +129,21 @@ Only one app should own the same camera source at a time.
 You can test with any local `.mp4` file. Example:
 
 ```text
-path\to\test-video.mp4
+path/to/test-video.mp4
 ```
 
 Click the video chooser in the viewer, select the file, press `Enter`, then toggle `Detect On`.
 
 ## CLI Options
 
-```powershell
-python backend\osc_viewer.py `
-  --web-host 127.0.0.1 `
-  --web-port 9100 `
-  --osc-host 127.0.0.1 `
-  --osc-port 9000 `
-  --osc-mode raw `
-  --osc-alpha 1.0 `
+```bash
+python backend/osc_viewer.py \
+  --web-host 127.0.0.1 \
+  --web-port 9100 \
+  --osc-host 127.0.0.1 \
+  --osc-port 9000 \
+  --osc-mode raw \
+  --osc-alpha 1.0 \
   --osc-namespace /field
 ```
 
@@ -161,7 +171,7 @@ requirements.txt     # Python dependencies
 
 Useful commands before committing changes:
 
-```powershell
+```bash
 python -m compileall backend
 git diff --check
 git status --short
