@@ -15,7 +15,6 @@ Use it to:
 - preview the input
 - toggle pose detection on/off
 - switch performance presets for live/video processing
-- show or hide the skeleton overlay
 - display 9 realtime dance metrics
 - send the 9 metrics over OSC
 
@@ -42,14 +41,14 @@ Windows PowerShell:
 
 ```powershell
 pip install -r requirements.txt
-python backend\osc_viewer.py --osc-port 9000 --web-port 9100
+python backend\osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
 ```
 
 macOS / Linux:
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100
+python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
 ```
 
 Open:
@@ -72,7 +71,7 @@ Windows PowerShell:
 cd path\to\field-realtime-dance
 git pull
 pip install -r requirements.txt
-python backend\osc_viewer.py --osc-port 9000 --web-port 9100
+python backend\osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
 ```
 
 macOS / Linux:
@@ -81,7 +80,7 @@ macOS / Linux:
 cd /path/to/field-realtime-dance
 git pull
 python3 -m pip install -r requirements.txt
-python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100
+python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
 ```
 
 Open `http://127.0.0.1:9100` after the viewer starts.
@@ -142,12 +141,14 @@ The viewer lets you change:
 The viewer has runtime performance presets:
 
 ```text
-fast      640x360, 20fps target
-balanced  720x405, 24fps target
-quality   960x540, 24fps target
+fast      640x360, 24fps display, 10fps pose
+balanced  720x405, 24fps display, 12fps pose  (default)
+quality   960x540, 20fps display, 15fps pose
 ```
 
-Changing `Performance` while the viewer is running restarts the local stream with the new processing size. `Overlay` only shows or hides the skeleton drawing; detection, metrics, and OSC output continue either way.
+Changing `Performance` while the viewer is running restarts the local stream with the new processing size and pose-analysis rate. The page shows both `fps` (MJPEG display stream) and `pose` (actual MediaPipe analysis rate). The skeleton overlay stays enabled during detection.
+
+The viewer defaults to the MediaPipe `lite` pose model for smoother live use. Start with `--pose-model full` if you need the previous higher-accuracy model and can accept lower FPS.
 
 `Enable OSC` turns metric output on or off for all 9 metrics.
 
@@ -195,7 +196,8 @@ python backend/osc_viewer.py \
   --osc-port 9000 \
   --osc-mode raw \
   --osc-alpha 0.25 \
-  --osc-namespace /field
+  --osc-namespace /field \
+  --pose-model lite
 ```
 
 `--osc-mode` can be:
@@ -204,6 +206,8 @@ python backend/osc_viewer.py \
 - `normalize`: map values into a more bounded range
 
 `--osc-alpha` controls smoothing. The default is `0.25`; `1.0` means no smoothing, and lower values are smoother.
+
+`--pose-model` can be `lite`, `full`, or `heavy`. Use `lite` for live rehearsals and performances; use `full` or `heavy` only when pose accuracy matters more than FPS.
 
 Standalone video-to-OSC test, without the browser viewer:
 

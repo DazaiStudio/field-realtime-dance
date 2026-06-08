@@ -6,6 +6,12 @@ import os
 import urllib.request
 from dance_metrics import DanceMetricsEngine
 
+POSE_MODEL_URLS = {
+    "pose_landmarker_lite.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    "pose_landmarker_full.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+    "pose_landmarker_heavy.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+}
+
 # Initialize MediaPipe components
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
@@ -31,11 +37,26 @@ class PoseEngine:
             
         self.landmarker = PoseLandmarker.create_from_options(self.options)
         self.metrics_engine = DanceMetricsEngine(fps=30)
+        self.last_pose_landmarks = None
+
+    def set_metrics_fps(self, fps):
+        self.metrics_engine.set_fps(fps)
+
+    def draw_cached_overlay(self, frame):
+        if self.last_pose_landmarks:
+            for pose_landmarks in self.last_pose_landmarks:
+                self._draw_landmarks(frame, pose_landmarks)
+        return frame
         
     def _ensure_model(self):
         if not os.path.exists(self.model_path):
             print(f"Downloading {self.model_path}...")
-            url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
+            model_name = os.path.basename(self.model_path)
+            url = POSE_MODEL_URLS.get(model_name)
+            if url is None:
+                raise FileNotFoundError(
+                    f"Model file not found and no download URL is configured: {self.model_path}"
+                )
             urllib.request.urlretrieve(url, self.model_path)
             print("Download complete.")
 
@@ -99,9 +120,10 @@ class PoseEngine:
         
         metrics = self.metrics_engine.get_empty_metrics()
         
-        if draw_overlay and result.pose_landmarks:
-            for pose_landmarks in result.pose_landmarks:
-                self._draw_landmarks(frame, pose_landmarks)
+        if result.pose_landmarks:
+            self.last_pose_landmarks = result.pose_landmarks
+            if draw_overlay:
+                self.draw_cached_overlay(frame)
 
         if result.pose_world_landmarks:
             world_landmarks = result.pose_world_landmarks[0] 

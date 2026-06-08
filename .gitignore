@@ -36,3 +36,4 @@ qa_screenshots/
 query.txt
 test.py
 testmedia.py
+osc_viewer.*.log

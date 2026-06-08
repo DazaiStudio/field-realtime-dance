@@ -18,6 +18,17 @@ class DanceMetricsEngine:
         self.omega_l_history = []
         self.omega_r_history = []
 
+    def set_fps(self, fps):
+        fps = max(float(fps), 1.0)
+        self.fps = fps
+        self.dt = 1.0 / fps
+        self.history_size = max(2, int(round(fps)))
+        self.positions_history = self.positions_history[-self.history_size:]
+        self.velocities_history = self.velocities_history[-self.history_size:]
+        self.accelerations_history = self.accelerations_history[-self.history_size:]
+        self.omega_l_history = self.omega_l_history[-self.history_size:]
+        self.omega_r_history = self.omega_r_history[-self.history_size:]
+
     def update(self, positions):
         """
         Positions: (17, 3) numpy array of joint coordinates (H36M format).

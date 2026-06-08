@@ -26,6 +26,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 clients: Set[WebSocket] = set()
 pose_engine: Optional[PoseEngine] = None
+pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
 camera = None
 camera_cache = {"updated_at": 0.0, "cameras": []}
 camera_signal_cache = {"updated_at": 0.0, "signals": {}}
@@ -39,9 +40,9 @@ osc_sender = OSCSender(
 )
 
 PERFORMANCE_PRESETS = {
-    "fast": {"width": 640, "height": 360, "target_fps": 20.0, "jpeg_quality": 55},
-    "balanced": {"width": 720, "height": 405, "target_fps": 24.0, "jpeg_quality": 60},
-    "quality": {"width": 960, "height": 540, "target_fps": 24.0, "jpeg_quality": 65},
+    "fast": {"width": 640, "height": 360, "target_fps": 24.0, "analysis_fps": 10.0, "jpeg_quality": 55},
+    "balanced": {"width": 720, "height": 405, "target_fps": 24.0, "analysis_fps": 12.0, "jpeg_quality": 60},
+    "quality": {"width": 960, "height": 540, "target_fps": 20.0, "analysis_fps": 15.0, "jpeg_quality": 65},
 }
 DEFAULT_PERFORMANCE = "balanced"
 
@@ -55,6 +56,7 @@ source_state = {
     "performance": DEFAULT_PERFORMANCE,
     "overlay_enabled": True,
     "target_fps": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["target_fps"],
+    "analysis_fps": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["analysis_fps"],
     "jpeg_quality": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["jpeg_quality"],
     "width": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["width"],
     "height": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["height"],
@@ -70,6 +72,10 @@ processing_state = {
     "started_at": None,
     "elapsed_seconds": 0.0,
     "fps": 0.0,
+    "analysis_count": 0,
+    "analysis_fps": 0.0,
+    "pose_ms": 0.0,
+    "encode_ms": 0.0,
     "latest_metrics": {},
     "latest_raw_metrics": {},
     "latest_timestamp_ms": None,
@@ -93,7 +99,7 @@ app = FastAPI(lifespan=lifespan)
 def get_pose_engine() -> PoseEngine:
     global pose_engine
     if pose_engine is None:
-        pose_engine = PoseEngine(model_path=str(REPO_ROOT / "pose_landmarker_full.task"))
+        pose_engine = PoseEngine(model_path=str(pose_model_path))
     return pose_engine
 
 
@@ -269,13 +275,17 @@ def scan_camera_signals(max_cameras: int = 10) -> dict:
 
 
 def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
+    set_analysis_result(metrics, timestamp_ms)
+    set_stream_frame(frame)
+
+
+def set_stream_frame(frame=None, encode_ms: float = 0.0) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
-    processing_state["latest_raw_metrics"] = metrics
-    processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["last_frame_at"] = time.time()
     processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
     processing_state["frame_count"] += 1
+    processing_state["encode_ms"] = float(encode_ms)
     if frame is not None:
         processing_state["signal_mean"] = float(frame.mean())
     if processing_state["elapsed_seconds"] > 0.25:
@@ -288,24 +298,24 @@ def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
         processing_state["error"] = "Camera signal is very dark"
     else:
         processing_state["error"] = None
+
+
+def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) -> None:
+    if processing_state["started_at"] is None:
+        processing_state["started_at"] = time.time()
+    processing_state["latest_raw_metrics"] = metrics
+    processing_state["latest_timestamp_ms"] = timestamp_ms
+    processing_state["analysis_count"] += 1
+    processing_state["pose_ms"] = float(pose_ms)
+    elapsed = time.time() - processing_state["started_at"]
+    if elapsed > 0.25:
+        processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
     osc_sender.send_metrics(metrics)
     processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
 
 
 def set_preview_frame(frame=None) -> None:
-    if processing_state["started_at"] is None:
-        processing_state["started_at"] = time.time()
-    processing_state["last_frame_at"] = time.time()
-    processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
-    processing_state["frame_count"] += 1
-    if frame is not None:
-        processing_state["signal_mean"] = float(frame.mean())
-    if processing_state["elapsed_seconds"] > 0.25:
-        processing_state["fps"] = processing_state["frame_count"] / processing_state["elapsed_seconds"]
-    if processing_state["signal_mean"] is not None and processing_state["signal_mean"] < 3:
-        processing_state["error"] = "Camera signal is very dark"
-    else:
-        processing_state["error"] = None
+    set_stream_frame(frame)
 
 
 def encode_frame(frame):
@@ -338,6 +348,7 @@ def apply_performance_preset(performance: str) -> None:
     preset = PERFORMANCE_PRESETS[selected]
     source_state["performance"] = selected
     source_state["target_fps"] = preset["target_fps"]
+    source_state["analysis_fps"] = preset["analysis_fps"]
     source_state["jpeg_quality"] = preset["jpeg_quality"]
     source_state["width"] = preset["width"]
     source_state["height"] = preset["height"]
@@ -348,6 +359,7 @@ async def stream_live():
     session_id = source_state["session_id"]
     cap = open_camera(int(source_state["camera_index"]))
     engine = get_pose_engine()
+    next_analysis_at = 0.0
 
     while (
         source_state["source"] == "live"
@@ -364,13 +376,27 @@ async def stream_live():
         frame = resize_frame(frame)
 
         timestamp_ms = int(time.time() * 1000)
-        processed, metrics = engine.process_frame(
-            frame,
-            timestamp_ms,
-            draw_overlay=bool(source_state.get("overlay_enabled", True)),
-        )
-        set_latest(metrics, timestamp_ms, frame)
+        processed = frame
+        now = time.time()
+        analysis_interval = 1.0 / max(float(source_state["analysis_fps"]), 1.0)
+        if now >= next_analysis_at:
+            engine.set_metrics_fps(source_state["analysis_fps"])
+            pose_started = time.perf_counter()
+            processed, metrics = engine.process_frame(
+                frame,
+                timestamp_ms,
+                draw_overlay=bool(source_state.get("overlay_enabled", True)),
+            )
+            pose_ms = (time.perf_counter() - pose_started) * 1000.0
+            set_analysis_result(metrics, timestamp_ms, pose_ms)
+            next_analysis_at = now + analysis_interval
+        elif source_state.get("overlay_enabled", True):
+            processed = engine.draw_cached_overlay(frame)
+
+        encode_started = time.perf_counter()
         encoded = encode_frame(processed)
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        set_stream_frame(frame, encode_ms)
         if encoded:
             yield encoded
         frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
@@ -398,8 +424,10 @@ async def stream_live_preview():
         frame = apply_live_mirror(frame)
         frame = resize_frame(frame)
 
-        set_preview_frame(frame)
+        encode_started = time.perf_counter()
         encoded = encode_frame(frame)
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        set_stream_frame(frame, encode_ms)
         if encoded:
             yield encoded
 
@@ -431,6 +459,7 @@ async def stream_video():
         frame_skip = max(1, round(source_fps / target_fps))
         frame_interval = frame_skip / max(source_fps, 1.0)
         frame_index = 0
+        next_analysis_at = 0.0
 
         while (
             source_state["source"] == "video"
@@ -447,13 +476,27 @@ async def stream_video():
             frame = resize_frame(frame)
 
             timestamp_ms = int(time.time() * 1000)
-            processed, metrics = engine.process_frame(
-                frame,
-                timestamp_ms,
-                draw_overlay=bool(source_state.get("overlay_enabled", True)),
-            )
-            set_latest(metrics, timestamp_ms, frame)
+            processed = frame
+            now = time.time()
+            analysis_interval = 1.0 / max(float(source_state["analysis_fps"]), 1.0)
+            if now >= next_analysis_at:
+                engine.set_metrics_fps(source_state["analysis_fps"])
+                pose_started = time.perf_counter()
+                processed, metrics = engine.process_frame(
+                    frame,
+                    timestamp_ms,
+                    draw_overlay=bool(source_state.get("overlay_enabled", True)),
+                )
+                pose_ms = (time.perf_counter() - pose_started) * 1000.0
+                set_analysis_result(metrics, timestamp_ms, pose_ms)
+                next_analysis_at = now + analysis_interval
+            elif source_state.get("overlay_enabled", True):
+                processed = engine.draw_cached_overlay(frame)
+
+            encode_started = time.perf_counter()
             encoded = encode_frame(processed)
+            encode_ms = (time.perf_counter() - encode_started) * 1000.0
+            set_stream_frame(frame, encode_ms)
             if encoded:
                 yield encoded
 
@@ -531,7 +574,6 @@ async def apply_input(
     osc_alpha: float = Form(0.25),
     osc_namespace: str = Form("/field"),
     performance: str = Form(DEFAULT_PERFORMANCE),
-    overlay_enabled: bool = Form(True),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -549,7 +591,7 @@ async def apply_input(
     source_state["session_id"] += 1
     source_state["detect_enabled"] = bool(detect_enabled)
     apply_performance_preset(performance)
-    source_state["overlay_enabled"] = bool(overlay_enabled)
+    source_state["overlay_enabled"] = True
     source_state["osc_metrics"] = list(METRIC_NAMES)
 
     if source == "live":
@@ -591,6 +633,10 @@ async def apply_input(
     processing_state["started_at"] = None
     processing_state["elapsed_seconds"] = 0.0
     processing_state["fps"] = 0.0
+    processing_state["analysis_count"] = 0
+    processing_state["analysis_fps"] = 0.0
+    processing_state["pose_ms"] = 0.0
+    processing_state["encode_ms"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_raw_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
@@ -992,15 +1038,12 @@ VIEWER_HTML = """
 
       <aside class="panel">
         <div class="metric-osc-controls">
-          <label><span class="label-row">Performance <span class="info-dot" title="Fast lowers processing resolution for smoother live detection. Quality keeps a larger processing size.">?</span></span>
+          <label><span class="label-row">Performance <span class="info-dot" title="Controls display resolution, JPEG quality, and pose-analysis rate. Lower presets keep the stream smoother by running MediaPipe less often.">?</span></span>
             <select id="performance" name="performance">
               <option value="fast">fast</option>
               <option value="balanced" selected>balanced</option>
               <option value="quality">quality</option>
             </select>
-          </label>
-          <label class="metric-toggle-row" title="Show or hide the skeleton drawing. Detection, metrics, and OSC continue either way.">
-            <input id="overlayEnabled" name="overlay_enabled" type="checkbox" checked /> Overlay
           </label>
           <label><span class="label-row">Mode <span class="info-dot" title="raw: send original metric values. normalize: map output toward a bounded 0-1 range using adaptive peaks; sync_correlation maps -1..1 to 0..1.">?</span></span>
             <select id="oscMode" name="osc_mode" title="raw: original metric values. normalize: adaptive bounded output for OSC and display.">
@@ -1077,7 +1120,6 @@ VIEWER_HTML = """
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
       data.set('performance', document.getElementById('performance').value);
-      data.set('overlay_enabled', document.getElementById('overlayEnabled').checked ? 'true' : 'false');
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -1211,7 +1253,6 @@ VIEWER_HTML = """
       sourceInput.value = 'live';
     });
     document.getElementById('performance').addEventListener('change', scheduleRuntimeApply);
-    document.getElementById('overlayEnabled').addEventListener('change', scheduleRuntimeApply);
     dropZone.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
@@ -1320,7 +1361,6 @@ VIEWER_HTML = """
       }
       if (!runtimeDirty) {
         document.getElementById('performance').value = source.performance || 'balanced';
-        document.getElementById('overlayEnabled').checked = source.overlay_enabled !== false;
       }
       if (!oscDirty) {
         document.getElementById('oscHost').value = osc.host || '127.0.0.1';
@@ -1336,7 +1376,8 @@ VIEWER_HTML = """
       document.getElementById('status').textContent =
         processing.error || (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off');
       document.getElementById('metaA').textContent = `source: ${source.source || '-'}`;
-      document.getElementById('metaB').textContent = `fps: ${Number(processing.fps || 0).toFixed(1)}`;
+      document.getElementById('metaB').textContent =
+        `fps: ${Number(processing.fps || 0).toFixed(1)} / pose: ${Number(processing.analysis_fps || 0).toFixed(1)}`;
       if (source.source === 'video') {
         document.getElementById('metaC').textContent = `time: ${Number(processing.elapsed_seconds || 0).toFixed(1)}s`;
         document.getElementById('metaD').textContent = `file: ${source.video_name || '-'} / loop ${source.loop ? 'on' : 'off'}`;
@@ -1344,7 +1385,8 @@ VIEWER_HTML = """
         const cameraSelect = document.getElementById('camera');
         const cameraLabel = cameraSelect.options[cameraSelect.selectedIndex]?.textContent || source.camera_index || '-';
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
-        document.getElementById('metaD').textContent = `mirror: ${source.mirror_live ? 'on' : 'off'} / osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
+        document.getElementById('metaD').textContent =
+          `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
       }
       updateAddresses(payload);
 
@@ -1402,7 +1444,16 @@ def main():
     parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
     parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "0.25")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
+    parser.add_argument(
+        "--pose-model",
+        choices=["lite", "full", "heavy"],
+        default=os.getenv("FIELD_POSE_MODEL", "lite"),
+        help="MediaPipe pose model. lite is fastest; full/heavy are more accurate but slower.",
+    )
     args = parser.parse_args()
+
+    global pose_model_path
+    pose_model_path = REPO_ROOT / f"pose_landmarker_{args.pose_model}.task"
 
     osc_sender.configure(
         host=args.osc_host,
@@ -1416,6 +1467,7 @@ def main():
         f"OSC output: udp://{args.osc_host}:{args.osc_port} "
         f"prefix={args.osc_namespace} mode={args.osc_mode} alpha={args.osc_alpha}"
     )
+    print(f"Pose model: {args.pose_model} ({pose_model_path})")
     uvicorn.run(app, host=args.web_host, port=args.web_port)
 
 
