@@ -237,6 +237,7 @@ Useful commands before committing changes:
 
 ```bash
 python -m compileall backend
+python -m unittest discover -s backend/tests -t backend
 git diff --check
 git status --short
 ```

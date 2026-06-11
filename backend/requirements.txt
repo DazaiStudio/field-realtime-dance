@@ -6,4 +6,4 @@ mediapipe
 numpy
 scipy
 python-osc>=1.8.0
-pygrabber>=0.2
+pygrabber>=0.2; platform_system == "Windows"
