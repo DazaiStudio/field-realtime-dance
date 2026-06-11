@@ -372,6 +372,8 @@ async def stream_live():
     cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]))
     engine = get_pose_engine()
     next_analysis_at = 0.0
+    last_analysis_at = None
+    measured_fps = max(float(source_state["analysis_fps"]), 1.0)
 
     while (
         source_state["source"] == "live"
@@ -392,7 +394,13 @@ async def stream_live():
         now = time.time()
         analysis_interval = 1.0 / max(float(source_state["analysis_fps"]), 1.0)
         if now >= next_analysis_at:
-            engine.set_metrics_fps(source_state["analysis_fps"])
+            # The metrics engine divides by dt, so feed it the measured
+            # analysis rate (EMA-smoothed) instead of the scheduled one;
+            # otherwise energy/torque/jerk scale with machine load.
+            if last_analysis_at is not None and now > last_analysis_at:
+                measured_fps = 0.8 * measured_fps + 0.2 * (1.0 / (now - last_analysis_at))
+            last_analysis_at = now
+            engine.set_metrics_fps(measured_fps)
             pose_started = time.perf_counter()
             processed, metrics = await asyncio.to_thread(
                 engine.process_frame,
@@ -473,6 +481,8 @@ async def stream_video():
         frame_interval = frame_skip / max(source_fps, 1.0)
         frame_index = 0
         next_analysis_at = 0.0
+        last_analysis_at = None
+        measured_fps = max(float(source_state["analysis_fps"]), 1.0)
 
         while (
             source_state["source"] == "video"
@@ -493,7 +503,12 @@ async def stream_video():
             now = time.time()
             analysis_interval = 1.0 / max(float(source_state["analysis_fps"]), 1.0)
             if now >= next_analysis_at:
-                engine.set_metrics_fps(source_state["analysis_fps"])
+                # Same as stream_live: keep the metric time base honest by
+                # feeding the measured analysis rate, not the scheduled one.
+                if last_analysis_at is not None and now > last_analysis_at:
+                    measured_fps = 0.8 * measured_fps + 0.2 * (1.0 / (now - last_analysis_at))
+                last_analysis_at = now
+                engine.set_metrics_fps(measured_fps)
                 pose_started = time.perf_counter()
                 processed, metrics = await asyncio.to_thread(
                     engine.process_frame,
