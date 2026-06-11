@@ -48,6 +48,12 @@ Default target `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
 
 Host, port, prefix, mode, smoothing, and enable are all changeable at runtime in the viewer — no restart needed.
 
+If `backend/culture_map.json` is present (exported from the offline Morris/BaYe analysis), the viewer also sends a derived culture score:
+
+```text
+/field/morrisness    float 0-1   1 = Morris-like, 0 = BaYe-like (rolling ~2s window)
+```
+
 - **Mode** `raw`: original metric values. `normalize`: bounded 0–1 output (adaptive peaks/ranges; `sync_corr` maps −1..1 → 0..1).
 - **Alpha** smoothing: `1.0` = none, lower = smoother (default `0.25`).
 - The on-screen values always match what is sent over OSC.

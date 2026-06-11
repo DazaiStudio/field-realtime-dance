@@ -194,6 +194,12 @@ class OSCSender:
         except Exception as exc:
             print(f"OSC send failed for {address}: {exc}")
 
+    def send_named(self, name: str, value: float) -> None:
+        """Send one extra value under the namespace (derived metrics etc.)."""
+        if not self.enabled:
+            return
+        self._send_message(f"{self.namespace}/{name}", float(value))
+
     def metric_address(self, key: str) -> str:
         return f"{self.namespace}/{OSC_ADDRESS_NAMES.get(key, key)}"
 

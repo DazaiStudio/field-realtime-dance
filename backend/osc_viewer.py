@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
+from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
 from pose_engine import PoseEngine
 
@@ -38,6 +39,8 @@ osc_sender = OSCSender(
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "0.25")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
+# Optional: offline culture centroids enable the /field/morrisness output.
+culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 
 PERFORMANCE_PRESETS = {
     "fast": {"width": 640, "height": 360, "target_fps": 24.0, "analysis_fps": 10.0, "jpeg_quality": 55},
@@ -81,6 +84,7 @@ processing_state = {
     "latest_timestamp_ms": None,
     "last_frame_at": None,
     "signal_mean": None,
+    "morrisness": None,
     "error": None,
 }
 
@@ -324,6 +328,14 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
     osc_sender.send_metrics(metrics)
     processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
+    if culture_score is not None:
+        # All-zero metrics mean "no pose detected"; keep the previous score
+        # instead of letting zeros drag the rolling average around.
+        if metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0:
+            morrisness = culture_score.update(metrics)
+            if morrisness is not None:
+                processing_state["morrisness"] = morrisness
+                osc_sender.send_named("morrisness", morrisness)
 
 
 def set_preview_frame(frame=None) -> None:
@@ -673,8 +685,11 @@ async def apply_input(
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
+    processing_state["morrisness"] = None
     processing_state["error"] = None
     osc_sender.reset_state()
+    if culture_score is not None:
+        culture_score.reset()
     return {"status": "applied", **state_payload()}
 
 
@@ -1343,6 +1358,12 @@ VIEWER_HTML = """
         const row = document.createElement('div');
         const value = Number(metrics[name] ?? 0);
         row.textContent = `${prefix}/${oscAddressNames[name] || name}  ${formatMetric(value)}`;
+        container.appendChild(row);
+      }
+      const morrisness = payload?.processing?.morrisness;
+      if (morrisness !== null && morrisness !== undefined) {
+        const row = document.createElement('div');
+        row.textContent = `${prefix}/morrisness  ${formatMetric(Number(morrisness))}  (1=Morris 0=BaYe)`;
         container.appendChild(row);
       }
     }
