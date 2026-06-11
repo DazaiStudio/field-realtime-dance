@@ -1,243 +1,108 @@
 # FIELD Realtime Dance
 
-Local viewer for live camera / video dance analysis with skeleton overlay, realtime metrics, and OSC output.
+Browser viewer for live camera / video dance analysis: skeleton overlay, 9 realtime metrics, OSC output.
+Fork of [`YukiHataRin/realtime-dance-analysis`](https://github.com/YukiHataRin/realtime-dance-analysis) for FIELD rehearsals and performance.
 
-This repository is a field-use fork of [`YukiHataRin/realtime-dance-analysis`](https://github.com/YukiHataRin/realtime-dance-analysis). The original project provides the MediaPipe pose pipeline and dance metric engine; this fork focuses on making a simple local viewer that the team can run for testing, rehearsals, and OSC integration.
+## Requirements
 
-## What This Runs
+- Python 3.11 (plain install, venv, conda, or uv all fine)
+- A webcam, or video files to upload
 
-The main tool is a browser viewer at `http://127.0.0.1:9100`.
-
-Use it to:
-
-- choose a live camera or click to upload a video file
-- mirror live camera input when needed
-- preview the input
-- toggle pose detection on/off
-- switch performance presets for live/video processing
-- display 9 realtime dance metrics
-- send the 9 metrics over OSC
-
-## Quick Start
-
-Recommended Python:
-
-```text
-Python 3.11
-```
-
-The project does not require conda specifically. A normal Python install, conda env, venv, or uv-managed Python is fine as long as `python --version` / `python3 --version` reports Python 3.11.
-
-First clone the repo, or open your existing local copy:
+## Install & Run
 
 ```bash
 git clone https://github.com/DazaiStudio/field-realtime-dance.git
 cd field-realtime-dance
+pip install -r requirements.txt          # macOS/Linux: python3 -m pip
+python backend/osc_viewer.py             # macOS/Linux: python3
 ```
 
-Install dependencies and start the viewer:
+Open `http://127.0.0.1:9100` and leave the terminal running.
+The MediaPipe pose model downloads automatically on first run.
 
-Windows PowerShell:
-
-```powershell
-pip install -r requirements.txt
-python backend\osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
-```
-
-macOS / Linux:
+To update an existing clone:
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
-```
-
-Open:
-
-```text
-http://127.0.0.1:9100
-```
-
-Leave the terminal window running while using the viewer.
-
-Use `backend/osc_viewer.py` for the local browser viewer. Do not start the viewer with `backend/osc_video_test.py`; that script is only for sending OSC from one video file without the web UI.
-
-## Update Existing Clone
-
-If the repo is already cloned on this machine, do not clone it again. Stop the viewer if it is running, then update from GitHub:
-
-Windows PowerShell:
-
-```powershell
-cd path\to\field-realtime-dance
 git pull
 pip install -r requirements.txt
-python backend\osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
+python backend/osc_viewer.py
 ```
 
-macOS / Linux:
+## Usage
 
-```bash
-cd /path/to/field-realtime-dance
-git pull
-python3 -m pip install -r requirements.txt
-python3 backend/osc_viewer.py --osc-port 9000 --web-port 9100 --pose-model lite
-```
+1. Pick a camera (mirrored by default) **or** click to upload a video, then press `Enter`.
+2. Confirm the preview, then toggle `Detect On` for pose overlay + metrics + OSC.
+3. `Change Input` reopens the input card; `Detect Off` returns to plain preview.
 
-Open `http://127.0.0.1:9100` after the viewer starts.
-
-## Viewer Workflow
-
-1. Open `http://127.0.0.1:9100`.
-2. Choose a camera, or click to upload a video file.
-3. `Mirror camera` is enabled by default; turn it off if you want unmirrored live camera input.
-4. Press `Enter` in the viewer.
-5. Confirm the raw preview appears.
-6. Toggle `Detect On` to start pose overlay, metrics, and OSC output.
-7. Toggle `Detect Off` to return to preview without pose detection.
-
-For video files, playback loops by default. For live camera, the viewer shows the selected camera stream and reports FPS/status below the video.
+Video files loop by default. Only one app can own a camera at a time — close other camera apps if the feed is black.
 
 ## OSC
 
-Default OSC target:
+Default target `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
 
 ```text
-udp://127.0.0.1:9000
+/field/energy      /field/sync_vel    /field/sync_corr
+/field/expansion   /field/curvature   /field/height
+/field/sway        /field/torque      /field/jerk
 ```
 
-Default prefix:
+Host, port, prefix, mode, smoothing, and enable are all changeable at runtime in the viewer — no restart needed.
 
-```text
-/field
-```
+- **Mode** `raw`: original metric values. `normalize`: bounded 0–1 output (adaptive peaks/ranges; `sync_corr` maps −1..1 → 0..1).
+- **Alpha** smoothing: `1.0` = none, lower = smoother (default `0.25`).
+- The on-screen values always match what is sent over OSC.
 
-Metric addresses:
+## Performance presets
 
-```text
-/field/energy
-/field/sync_vel
-/field/sync_corr
-/field/expansion
-/field/curvature
-/field/height
-/field/sway
-/field/torque
-/field/jerk
-```
+| Preset   | Resolution | Display fps | Pose fps |
+|----------|-----------|-------------|----------|
+| fast     | 640×360   | 24          | 10       |
+| balanced | 720×405   | 24          | 12       |
+| quality  | 960×540   | 20          | 15       |
 
-All 9 metric messages send one float value. There are no integer metric messages.
+Switching presets restarts the stream with the new settings. The footer shows display `fps` and actual `pose` rate.
 
-The viewer lets you change:
-
-- OSC host
-- OSC port
-- address prefix
-- raw / normalize mode
-- Alpha (smooth) slider
-- whether OSC output is enabled
-
-## Performance
-
-The viewer has runtime performance presets:
-
-```text
-fast      640x360, 24fps display, 10fps pose
-balanced  720x405, 24fps display, 12fps pose  (default)
-quality   960x540, 20fps display, 15fps pose
-```
-
-Changing `Performance` while the viewer is running restarts the local stream with the new processing size and pose-analysis rate. The page shows both `fps` (MJPEG display stream) and `pose` (actual MediaPipe analysis rate). The skeleton overlay stays enabled during detection.
-
-The viewer defaults to the MediaPipe `lite` pose model for smoother live use. Start with `--pose-model full` if you need the previous higher-accuracy model and can accept lower FPS.
-
-`Enable OSC` turns metric output on or off for all 9 metrics.
-
-The viewer's metric values follow the selected OSC mode. In `raw` mode, the page shows raw output values. In `normalize` mode, the page shows the same normalized values that are sent over OSC.
-
-OSC settings apply at runtime. Changing mode, prefix, alpha, target, or enabled state does not require restarting detection.
-
-Metric bars are neutral readouts, not good/bad scores. Each metric has its own scale hint in the viewer. In `raw` mode, `sync_correlation` uses the center as neutral because its range is `-1..1`; in `normalize` mode, it displays left-to-right like the `0..1` OSC value.
-
-## Camera Notes
-
-The camera dropdown uses the device names reported by the operating system when available. On macOS, the viewer reads names from `system_profiler`; if macOS/OpenCV cannot map a device name to an index, it may still show a generic name such as `Camera 0`.
-
-If the viewer does not show camera video:
-
-- close other apps that may be using the camera
-- check camera privacy settings
-- on Windows, test the camera in the Windows Camera app
-- on macOS, allow camera access for Terminal / iTerm / the Python app in System Settings
-- restart the viewer after changing camera or virtual-camera sources
-
-Only one app should own the same camera source at a time.
-
-`Mirror camera` only affects live camera input. Video files are not mirrored.
-
-## Test Video
-
-You can test with any local `.mp4` file. Example:
-
-```text
-path/to/test-video.mp4
-```
-
-Click `Click to upload video` in the viewer, select the file, press `Enter`, then toggle `Detect On`.
-
-## CLI Options
-
-Local browser viewer:
+## CLI options
 
 ```bash
 python backend/osc_viewer.py \
-  --web-host 127.0.0.1 \
-  --web-port 9100 \
-  --osc-host 127.0.0.1 \
-  --osc-port 9000 \
-  --osc-mode raw \
-  --osc-alpha 0.25 \
-  --osc-namespace /field \
+  --web-port 9100 --osc-host 127.0.0.1 --osc-port 9000 \
+  --osc-mode raw --osc-alpha 0.25 --osc-namespace /field \
   --pose-model lite
 ```
 
-`--osc-mode` can be:
+`--pose-model lite` (default) is fastest — use it for rehearsals/shows; `full`/`heavy` trade fps for accuracy.
+Environment variables `FIELD_OSC_HOST/PORT/MODE/ALPHA/NAMESPACE/ENABLED` set the same defaults.
 
-- `raw`: send metric values directly
-- `normalize`: map values into a more bounded range
-
-`--osc-alpha` controls smoothing. The default is `0.25`; `1.0` means no smoothing, and lower values are smoother.
-
-`--pose-model` can be `lite`, `full`, or `heavy`. Use `lite` for live rehearsals and performances; use `full` or `heavy` only when pose accuracy matters more than FPS.
-
-Standalone video-to-OSC test, without the browser viewer:
+Standalone video → OSC without the web UI:
 
 ```bash
 python backend/osc_video_test.py path/to/video.mp4 --osc-port 9000 --loop
 ```
 
-`osc_video_test.py` needs a video path and does not accept `--web-port`.
-
-## Project Structure
+## Project structure
 
 ```text
 backend/
-  osc_viewer.py      # Local browser viewer
+  osc_viewer.py      # main: browser viewer + OSC (port 9100)
   osc_sender.py      # OSC output, normalization, smoothing
-  osc_video_test.py  # Standalone video-to-OSC test, no web UI
-  osc_monitor.py     # Standalone OSC monitor
-  pose_engine.py     # MediaPipe pose detection and overlay
-  dance_metrics.py   # 9 dance metric calculations
-frontend/            # Original React dashboard
-requirements.txt     # Python dependencies
+  osc_video_test.py  # video-to-OSC test, no web UI
+  osc_monitor.py     # standalone OSC monitor
+  pose_engine.py     # MediaPipe pose detection (upstream)
+  dance_metrics.py   # 9 dance metric calculations (upstream)
+frontend/            # upstream React dashboard (not used by osc_viewer)
 ```
 
-## Development Checks
-
-Useful commands before committing changes:
+## Development checks
 
 ```bash
 python -m compileall backend
 python -m unittest discover -s backend/tests -t backend
 git diff --check
-git status --short
 ```
+
+## Troubleshooting
+
+- No camera video: close other camera apps, check OS camera privacy settings, restart the viewer after plugging in devices.
+- macOS: allow camera access for Terminal/iTerm in System Settings.
+- `Mirror camera` affects live input only; uploaded videos are never mirrored.
