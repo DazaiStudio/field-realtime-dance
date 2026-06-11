@@ -834,7 +834,9 @@ VIEWER_HTML = """
       border-color: #f0a878;
       color: #17120e;
       font-weight: 700;
-      letter-spacing: .04em;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: .07em;
       align-self: end;
     }
     button:hover { background: #e29a6f; }
@@ -883,8 +885,8 @@ VIEWER_HTML = """
       min-height: 22px;
       color: var(--muted);
       font-size: 12px;
-      text-transform: none;
-      letter-spacing: 0;
+      text-transform: uppercase;
+      letter-spacing: .06em;
     }
     .mirror-row input { width: 15px; min-height: 15px; }
     .or { color: var(--muted); align-self: start; padding-top: 33px; font: 12px ui-monospace, monospace; }
@@ -900,6 +902,9 @@ VIEWER_HTML = """
       text-align: center;
       cursor: pointer;
       background: #211f1c;
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 13px;
       transition: border-color .15s ease, color .15s ease;
     }
     .drop-zone:hover { border-color: var(--amber); color: var(--text); }
@@ -953,24 +958,13 @@ VIEWER_HTML = """
       border-bottom: 1px solid var(--line);
       background: #171411;
     }
-    .metric-toggle-row {
-      display: flex;
-      align-items: end;
-      gap: 8px;
-      min-height: 42px;
-      padding-bottom: 2px;
-      color: var(--text);
-      font-size: 13px;
-      text-transform: uppercase;
-      letter-spacing: .06em;
-    }
     .osc-toggle-row {
       display: flex;
       align-items: center;
       gap: 8px;
       min-height: 42px;
-      color: var(--text);
-      font-size: 13px;
+      color: var(--muted);
+      font-size: 12px;
       text-transform: uppercase;
       letter-spacing: .06em;
     }
@@ -1166,34 +1160,34 @@ VIEWER_HTML = """
             <label class="osc-toggle-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enable OSC</label>
           </div>
         </div>
+        <div class="metric-address-panel">
+          <p class="section-title">Output values</p>
+          <div id="addresses" class="address-list"></div>
+        </div>
       </section>
 
       <aside class="panel">
         <div class="metric-osc-controls">
-          <label><span class="label-row">Mode <span class="info-dot" title="raw: send original metric values. normalize: map output toward a bounded 0-1 range using adaptive peaks; sync_correlation maps -1..1 to 0..1.">?</span></span>
-            <select id="oscMode" name="osc_mode" title="raw: original metric values. normalize: adaptive bounded output for OSC and display.">
+          <label><span class="label-row">Mode <span class="info-dot" title="raw: values in their original units. normalize: every metric mapped into 0-1 with an adaptive range (sync_corr -1..1 becomes 0..1, 0.5 neutral).">?</span></span>
+            <select id="oscMode" name="osc_mode">
               <option value="raw">raw</option>
               <option value="normalize">normalize</option>
             </select>
           </label>
-          <label><span class="range-label-row"><span>Alpha (smooth)</span><span id="oscAlphaValue" class="range-value">0.25</span></span>
+          <label><span class="range-label-row"><span class="label-row">Smoothing <span class="info-dot" title="Exponential smoothing applied to every OSC output. 1 = no smoothing; lower values respond more slowly but read steadier.">?</span></span><span id="oscAlphaValue" class="range-value">0.25</span></span>
             <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="0.25" />
-            <span class="range-hint">Lower = smoother</span>
+            <span class="range-hint">lower = smoother &middot; 1 = off</span>
           </label>
         </div>
         <div id="metrics" class="metric-grid"></div>
         <div id="culturePanel" class="culture-panel hidden">
-          <p class="section-title">Culture Axis</p>
+          <p class="section-title">Culture Axis <span class="info-dot" title="A rolling ~2s average of the 9 metrics, compared against the Morris and BaYe training clips. 1.0 = movement statistics match Morris, 0.0 = match BaYe, 0.5 = between the two.">?</span></p>
           <div class="culture-row">
             <span class="culture-end baye">BAYE</span>
             <div class="culture-track"><div id="cultureMarker" class="culture-marker"></div></div>
             <span class="culture-end morris">MORRIS</span>
           </div>
           <div id="cultureValue" class="culture-value">/field/morrisness –</div>
-        </div>
-        <div class="metric-address-panel">
-          <p class="section-title">OSC output values</p>
-          <div id="addresses" class="address-list"></div>
         </div>
       </aside>
     </section>
@@ -1208,26 +1202,26 @@ VIEWER_HTML = """
     const metricsEl = document.getElementById('metrics');
     const maxSeen = {};
     const metricHints = {
-      energy: 'more motion',
-      sync_velocity: '1 = balanced',
-      sync_correlation: 'neutral: 0 raw / .5 norm',
-      expansion: 'larger shape',
-      curvature: 'more curved',
-      height: 'body level',
-      sway: 'lower = stable',
-      torque: 'more force',
-      jerk: 'lower = smoother',
+      energy: 'high = more motion',
+      sync_velocity: '1 = both sides active',
+      sync_correlation: 'high = left/right in phase',
+      expansion: 'high = open posture',
+      curvature: 'high = rounder paths',
+      height: 'body centre level',
+      sway: 'low = steadier balance',
+      torque: 'high = forceful accents',
+      jerk: 'low = smoother motion',
     };
     const metricDescriptions = {
-      energy: 'Overall movement intensity from weighted limb angular velocity. Higher means more active motion.',
-      sync_velocity: 'Left/right movement magnitude balance. 1 means both sides move with similar velocity; 0 means strongly uneven.',
-      sync_correlation: 'Temporal correlation between left and right side movement. Raw range is -1 to 1, with 0 as neutral. Normalize maps it to 0 to 1, where 0.5 is neutral.',
-      expansion: 'Body volume / spatial reach from the convex hull of the tracked joints. Higher means a larger body shape.',
-      curvature: 'Curvature of wrist and ankle trajectories. Higher means more curved or circular movement paths.',
-      height: 'Estimated body center height from the center of mass. Higher/lower depends on body level in the frame.',
-      sway: 'Horizontal center-of-mass deviation from the base of support. Lower usually means more stable.',
-      torque: 'Movement transition effort from angular acceleration. Higher means sharper forceful transitions.',
-      jerk: 'Abruptness cost from changes in acceleration. Lower generally means smoother motion; raw values can be very large.',
+      energy: 'Overall movement intensity, from how fast all limbs rotate. Big, fast motion pushes it up; standing still reads near 0.',
+      sync_velocity: 'How evenly left and right move. 1 = both sides equally active, 0 = one side does all the work.',
+      sync_correlation: 'Whether left and right move at the same time. +1 = together, 0 = independent, -1 = alternating. Normalize shows it as 0-1 with 0.5 neutral.',
+      expansion: 'How much space the body occupies. High = open, spread-out postures; low = compact, closed shapes.',
+      curvature: 'How curved the hand and foot paths are. High = round, circular movement; low = straight lines.',
+      height: 'Body centre height relative to the hips. Drops when crouching or folding the torso.',
+      sway: 'Horizontal drift of the body centre away from the feet. High = leaning or off balance.',
+      torque: 'How hard the movement changes speed. High = sharp, forceful accents; low = even pacing.',
+      jerk: 'How abrupt those speed changes are. Low = flowing; high = jagged, twitchy. Raw values get very large - use normalize for a readable range.',
     };
     const centeredMetrics = new Set(['sync_correlation']);
 
