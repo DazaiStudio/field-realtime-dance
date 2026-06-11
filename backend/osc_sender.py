@@ -22,8 +22,15 @@ OSC_ADDRESS_NAMES = {
     "sync_correlation": "sync_corr",
 }
 
-BOUNDED_METRICS = {"sync_velocity", "height", "sway"}
+BOUNDED_METRICS = {"sync_velocity"}
+# height is -com_y in metres around the hip origin (often negative) and sway
+# is a small metre-scale offset; clamping them to 0..1 flattens both to ~0.
+# Track an adaptive min/max range instead so normalize mode stays expressive.
+ADAPTIVE_RANGE_METRICS = {"height", "sway"}
 UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
+
+# Per-message decay applied to the adaptive range so stale extremes fade.
+RANGE_DECAY = 0.001
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -51,6 +58,7 @@ class OSCSender:
         self.client = SimpleUDPClient(self.host, self.port)
         self._smoothed: Dict[str, float] = {}
         self._peaks: Dict[str, float] = {}
+        self._ranges: Dict[str, tuple] = {}
         self.last_prepared_metrics: Dict[str, float] = {}
         self.last_sent_at: Optional[float] = None
 
@@ -89,6 +97,7 @@ class OSCSender:
     def reset_state(self) -> None:
         self._smoothed.clear()
         self._peaks.clear()
+        self._ranges.clear()
         self.last_prepared_metrics.clear()
 
     def get_status(self) -> dict:
@@ -144,6 +153,8 @@ class OSCSender:
             return _clamp((value + 1.0) / 2.0)
         if key in BOUNDED_METRICS:
             return _clamp(value)
+        if key in ADAPTIVE_RANGE_METRICS:
+            return self._normalize_range(key, value)
         if key in UNBOUNDED_METRICS:
             current_peak = self._peaks.get(key, 1e-6)
             decayed_peak = current_peak * 0.995
@@ -151,6 +162,17 @@ class OSCSender:
             self._peaks[key] = peak
             return _clamp(value / peak)
         return value
+
+    def _normalize_range(self, key: str, value: float) -> float:
+        lo, hi = self._ranges.get(key, (value, value))
+        span = hi - lo
+        lo = min(lo + span * RANGE_DECAY, value)
+        hi = max(hi - span * RANGE_DECAY, value)
+        self._ranges[key] = (lo, hi)
+        span = hi - lo
+        if span < 1e-9:
+            return 0.5
+        return _clamp((value - lo) / span)
 
     def _smooth(self, key: str, value: float) -> float:
         if self.alpha >= 1.0:
