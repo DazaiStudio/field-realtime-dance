@@ -262,11 +262,23 @@ def scan_camera_signals(max_cameras: int = 10) -> dict:
     if time.time() - camera_signal_cache["updated_at"] < 20 and camera_signal_cache["signals"]:
         return camera_signal_cache["signals"]
 
-    release_camera()
+    # Never probe the camera a stream is currently using: opening it a second
+    # time fails on most backends and releasing it would kill the live feed.
+    active_index = int(source_state["camera_index"]) if camera is not None else None
     cameras = list_cameras()
     signals = {}
     for camera_info in cameras[:max_cameras]:
         index = int(camera_info["index"])
+        if index == active_index:
+            signals[str(index)] = {
+                "index": index,
+                "opened": True,
+                "read": True,
+                "mean": processing_state.get("signal_mean"),
+                "shape": None,
+                "status": "in use",
+            }
+            continue
         signals[str(index)] = test_camera_signal(index)
 
     camera_signal_cache["updated_at"] = time.time()
