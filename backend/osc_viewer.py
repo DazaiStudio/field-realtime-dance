@@ -566,6 +566,16 @@ async def api_state():
     return state_payload()
 
 
+@app.post("/api/camera/release")
+async def api_camera_release():
+    """Stop any running stream and release the camera (UI camera-off)."""
+    source_state["session_id"] += 1
+    source_state["detect_enabled"] = False
+    await asyncio.to_thread(release_camera)
+    processing_state["error"] = None
+    return {"status": "released", **state_payload()}
+
+
 @app.get("/api/cameras")
 async def api_cameras():
     return {"cameras": await asyncio.to_thread(list_cameras)}
@@ -777,7 +787,7 @@ VIEWER_HTML = """
       margin-left: 10px;
       vertical-align: 4px;
     }
-    .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font: 13px ui-monospace, monospace; }
+    .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font: 14px ui-monospace, monospace; }
     .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--red); }
     .dot.live { background: var(--teal); animation: pulse 2.2s ease-in-out infinite; }
     @keyframes pulse {
@@ -795,14 +805,14 @@ VIEWER_HTML = """
     .section-title {
       margin: 0 0 10px;
       color: var(--amber);
-      font-size: 12px;
+      font-size: 13px;
       text-transform: uppercase;
       letter-spacing: .08em;
     }
     .controls-grid { display: grid; grid-template-columns: 1fr 92px 1fr 110px 120px; gap: 10px; align-items: end; }
-    .hint { color: var(--muted); font: 12px ui-monospace, monospace; align-self: center; }
+    .hint { color: var(--muted); font: 13px ui-monospace, monospace; align-self: center; }
     .hidden { display: none !important; }
-    label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
     input, select, button {
       width: 100%;
       border: 1px solid var(--line);
@@ -884,12 +894,12 @@ VIEWER_HTML = """
       gap: 8px;
       min-height: 22px;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
       text-transform: uppercase;
       letter-spacing: .06em;
     }
     .mirror-row input { width: 15px; min-height: 15px; }
-    .or { color: var(--muted); align-self: start; padding-top: 33px; font: 12px ui-monospace, monospace; }
+    .or { color: var(--muted); align-self: start; padding-top: 33px; font: 13px ui-monospace, monospace; }
     .drop-zone {
       min-height: 42px;
       height: 42px;
@@ -909,20 +919,35 @@ VIEWER_HTML = """
     }
     .drop-zone:hover { border-color: var(--amber); color: var(--text); }
     .drop-zone.has-file { border: 1px solid var(--amber); color: var(--text); }
-    .detect-button {
+    .control-bar {
       position: absolute;
-      right: 14px;
-      top: 14px;
-      width: auto;
-      min-width: 112px;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 14px;
       z-index: 2;
-      box-shadow: 0 10px 30px rgba(0,0,0,.22);
     }
-    .detect-button.off {
-      background: rgba(29, 26, 23, .84);
-      color: var(--text);
-      border-color: var(--line);
+    .ctrl-btn {
+      width: 54px;
+      height: 54px;
+      min-height: 54px;
+      padding: 0;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: rgba(29, 26, 23, .88);
+      border: 1px solid #4a4036;
+      color: var(--teal);
+      box-shadow: 0 10px 30px rgba(0,0,0,.4);
     }
+    .ctrl-btn:hover { background: rgba(54, 47, 40, .92); }
+    .ctrl-btn:active { background: rgba(29, 26, 23, .88); }
+    .ctrl-btn svg { width: 26px; height: 26px; display: block; }
+    .ctrl-btn .slash { display: none; stroke: var(--red); }
+    .ctrl-btn.off { color: var(--muted); }
+    .ctrl-btn.off .slash { display: block; }
+    #detectButton:not(.off) { color: var(--amber); border-color: #6b543f; }
     .enter-button {
       width: auto;
       min-width: 96px;
@@ -946,7 +971,7 @@ VIEWER_HTML = """
       border-top: 1px solid var(--line);
       padding: 10px 14px;
       color: var(--muted);
-      font: 12px ui-monospace, monospace;
+      font: 13px ui-monospace, monospace;
     }
     .meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .metric-osc-controls {
@@ -964,7 +989,7 @@ VIEWER_HTML = """
       gap: 8px;
       min-height: 42px;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
       text-transform: uppercase;
       letter-spacing: .06em;
     }
@@ -972,23 +997,23 @@ VIEWER_HTML = """
     .info-dot {
       display: inline-grid;
       place-items: center;
-      width: 16px;
-      height: 16px;
+      width: 18px;
+      height: 18px;
       border-radius: 999px;
       border: 1px solid var(--line);
       color: var(--muted);
-      font: 11px ui-monospace, monospace;
+      font: 12px ui-monospace, monospace;
       text-transform: none;
       letter-spacing: 0;
       cursor: help;
     }
     .range-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .range-value { color: var(--text); font: 12px ui-monospace, monospace; }
-    .range-hint { color: var(--muted); font-size: 11px; text-transform: none; letter-spacing: 0; }
+    .range-hint { color: var(--muted); font-size: 12px; text-transform: none; letter-spacing: 0; }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 132px 102px 1fr;
+      grid-template-columns: 162px 96px 1fr;
       align-items: center;
       gap: 10px;
       min-height: 52px;
@@ -998,8 +1023,8 @@ VIEWER_HTML = """
       border-radius: 8px;
     }
     .metric-label { display: grid; gap: 3px; min-width: 0; }
-    .name { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
-    .metric-hint { color: #7f756b; font-size: 10px; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .name { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
+    .metric-hint { color: #93887c; font-size: 12px; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .value {
       font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
       font-variant-numeric: tabular-nums;
@@ -1084,7 +1109,7 @@ VIEWER_HTML = """
       align-items: end;
     }
     .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
-    .address-list { display: grid; gap: 6px; color: var(--muted); font: 12px ui-monospace, monospace; }
+    .address-list { display: grid; gap: 7px; color: var(--muted); font: 13px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
@@ -1136,8 +1161,26 @@ VIEWER_HTML = """
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
             </div>
           </div>
+          <div id="emptyState" class="empty hidden">camera off</div>
           <button id="changeInputButton" class="change-input" type="button">Change Input</button>
-          <button id="detectButton" class="detect-button off" type="button">Detect Off</button>
+          <div class="control-bar">
+            <button id="cameraButton" class="ctrl-btn off" type="button" title="Turn camera on">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2.5" y="6.5" width="13" height="11" rx="2.5"/>
+                <path d="M15.5 10.5 21 7.5v9l-5.5-3"/>
+                <line class="slash" x1="3.5" y1="20.5" x2="20.5" y2="3.5"/>
+              </svg>
+            </button>
+            <button id="detectButton" class="ctrl-btn off" type="button" title="Turn detection on">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="4.4" r="2.1"/>
+                <line x1="12" y1="6.8" x2="12" y2="13"/>
+                <path d="M6 10.2 12 8.2l6 2"/>
+                <path d="M8.2 20.5 12 13l3.8 7.5"/>
+                <line class="slash" x1="3.5" y1="20.5" x2="20.5" y2="3.5"/>
+              </svg>
+            </button>
+          </div>
         </div>
         <div class="meta">
           <div id="metaA">source: -</div>
@@ -1314,9 +1357,11 @@ VIEWER_HTML = """
     const streamImage = document.getElementById('stream');
     const previewVideo = document.getElementById('previewVideo');
     const detectButton = document.getElementById('detectButton');
+    const cameraButton = document.getElementById('cameraButton');
 
     let selectedVideoUrl = null;
     let isDetecting = false;
+    let cameraOn = false;
     let lastPayload = null;
     let inputDirty = false;
     let oscDirty = false;
@@ -1345,8 +1390,23 @@ VIEWER_HTML = """
     function setDetectButton(enabled) {
       isDetecting = enabled;
       detectInput.value = enabled ? 'true' : 'false';
-      detectButton.textContent = enabled ? 'Detect On' : 'Detect Off';
       detectButton.classList.toggle('off', !enabled);
+      detectButton.title = enabled ? 'Turn detection off' : 'Turn detection on';
+    }
+
+    function setCameraButton(on) {
+      cameraOn = on;
+      cameraButton.classList.toggle('off', !on);
+      cameraButton.title = on ? 'Turn camera off' : 'Turn camera on';
+      document.getElementById('emptyState').classList.toggle('hidden', on);
+    }
+
+    async function stopStream() {
+      streamImage.removeAttribute('src');
+      streamImage.classList.add('hidden');
+      previewVideo.pause();
+      previewVideo.classList.add('hidden');
+      try { await fetch('/api/camera/release', { method: 'POST' }); } catch (e) {}
     }
 
     document.getElementById('camera').addEventListener('change', () => {
@@ -1386,16 +1446,28 @@ VIEWER_HTML = """
       const payload = await applySettings(false);
       if (!payload || payload.status !== 'applied') return;
       document.getElementById('inputOverlay').classList.add('compact');
+      setCameraButton(true);
       showPreview();
+    });
+    cameraButton.addEventListener('click', async () => {
+      if (cameraOn) {
+        setDetectButton(false);
+        setCameraButton(false);
+        await stopStream();
+      } else {
+        const payload = await applySettings(false);
+        if (!payload || payload.status !== 'applied') return;
+        document.getElementById('inputOverlay').classList.add('compact');
+        setCameraButton(true);
+        showPreview();
+      }
     });
     detectButton.addEventListener('click', async () => {
       const nextState = !isDetecting;
-      setDetectButton(nextState);
       const payload = await applySettings(nextState);
-      if (!payload || payload.status !== 'applied') {
-        setDetectButton(!nextState);
-        return;
-      }
+      if (!payload || payload.status !== 'applied') return;
+      setDetectButton(nextState);
+      setCameraButton(true);
       document.getElementById('inputOverlay').classList.add('compact');
       if (nextState) {
         showDetectionStream();

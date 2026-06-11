@@ -73,8 +73,13 @@ class TestCultureScore(unittest.TestCase):
     def test_try_load_missing_file_returns_none(self):
         self.assertIsNone(CultureScore.try_load(Path("does_not_exist.json")))
 
-    def test_shipped_map_loads(self):
+    def test_shipped_map_loads_if_present(self):
+        # morrisness ships disabled until the centroids are validated against
+        # the live pipeline (lite model, live analysis rate) - not the 60fps
+        # full-model offline data they currently come from.
         path = Path(__file__).resolve().parents[1] / "culture_map.json"
+        if not path.exists():
+            self.skipTest("culture_map.json not shipped (morrisness disabled)")
         score = CultureScore.try_load(path)
         self.assertIsNotNone(score)
         self.assertEqual(len(score.features), 9)
