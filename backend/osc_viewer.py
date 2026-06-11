@@ -357,7 +357,7 @@ def apply_performance_preset(performance: str) -> None:
 async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
-    cap = open_camera(int(source_state["camera_index"]))
+    cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]))
     engine = get_pose_engine()
     next_analysis_at = 0.0
 
@@ -367,7 +367,7 @@ async def stream_live():
         and source_state["detect_enabled"]
     ):
         started = time.time()
-        ok, frame = cap.read()
+        ok, frame = await asyncio.to_thread(cap.read)
         if not ok:
             processing_state["error"] = "Camera frame not available"
             await asyncio.sleep(0.2)
@@ -382,7 +382,8 @@ async def stream_live():
         if now >= next_analysis_at:
             engine.set_metrics_fps(source_state["analysis_fps"])
             pose_started = time.perf_counter()
-            processed, metrics = engine.process_frame(
+            processed, metrics = await asyncio.to_thread(
+                engine.process_frame,
                 frame,
                 timestamp_ms,
                 draw_overlay=bool(source_state.get("overlay_enabled", True)),
@@ -394,7 +395,7 @@ async def stream_live():
             processed = engine.draw_cached_overlay(frame)
 
         encode_started = time.perf_counter()
-        encoded = encode_frame(processed)
+        encoded = await asyncio.to_thread(encode_frame, processed)
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
         set_stream_frame(frame, encode_ms)
         if encoded:
@@ -408,7 +409,7 @@ async def stream_live():
 
 async def stream_live_preview():
     session_id = source_state["session_id"]
-    cap = open_camera(int(source_state["camera_index"]))
+    cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]))
 
     while (
         source_state["source"] == "live"
@@ -416,7 +417,7 @@ async def stream_live_preview():
         and not source_state["detect_enabled"]
     ):
         started = time.time()
-        ok, frame = cap.read()
+        ok, frame = await asyncio.to_thread(cap.read)
         if not ok:
             processing_state["error"] = "Camera frame not available"
             await asyncio.sleep(0.2)
@@ -425,7 +426,7 @@ async def stream_live_preview():
         frame = resize_frame(frame)
 
         encode_started = time.perf_counter()
-        encoded = encode_frame(frame)
+        encoded = await asyncio.to_thread(encode_frame, frame)
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
         set_stream_frame(frame, encode_ms)
         if encoded:
@@ -453,7 +454,7 @@ async def stream_video():
             await asyncio.sleep(0.5)
             continue
 
-        cap = cv2.VideoCapture(str(video_path))
+        cap = await asyncio.to_thread(cv2.VideoCapture, str(video_path))
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         target_fps = max(float(source_state["target_fps"]), 1.0)
         frame_skip = max(1, round(source_fps / target_fps))
@@ -467,7 +468,7 @@ async def stream_video():
             and source_state["detect_enabled"]
         ):
             started = time.time()
-            ok, frame = cap.read()
+            ok, frame = await asyncio.to_thread(cap.read)
             if not ok:
                 break
             frame_index += 1
@@ -482,7 +483,8 @@ async def stream_video():
             if now >= next_analysis_at:
                 engine.set_metrics_fps(source_state["analysis_fps"])
                 pose_started = time.perf_counter()
-                processed, metrics = engine.process_frame(
+                processed, metrics = await asyncio.to_thread(
+                    engine.process_frame,
                     frame,
                     timestamp_ms,
                     draw_overlay=bool(source_state.get("overlay_enabled", True)),
@@ -494,7 +496,7 @@ async def stream_video():
                 processed = engine.draw_cached_overlay(frame)
 
             encode_started = time.perf_counter()
-            encoded = encode_frame(processed)
+            encoded = await asyncio.to_thread(encode_frame, processed)
             encode_ms = (time.perf_counter() - encode_started) * 1000.0
             set_stream_frame(frame, encode_ms)
             if encoded:
@@ -527,12 +529,14 @@ async def api_state():
 
 @app.get("/api/cameras")
 async def api_cameras():
-    return {"cameras": list_cameras()}
+    return {"cameras": await asyncio.to_thread(list_cameras)}
 
 
 @app.get("/api/cameras/scan")
 async def api_camera_scan():
-    return {"cameras": list_cameras(), "signals": scan_camera_signals()}
+    cameras = await asyncio.to_thread(list_cameras)
+    signals = await asyncio.to_thread(scan_camera_signals)
+    return {"cameras": cameras, "signals": signals}
 
 
 @app.post("/api/osc/config")
