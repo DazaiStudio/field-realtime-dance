@@ -10,6 +10,8 @@ Fork of [`YukiHataRin/realtime-dance-analysis`](https://github.com/YukiHataRin/r
 
 ## Install & Run
 
+Video walkthrough (macOS): https://www.youtube.com/watch?v=mqPr_ezzFXo
+
 Windows (PowerShell):
 
 ```powershell
