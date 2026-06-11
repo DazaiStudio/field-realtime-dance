@@ -731,7 +731,7 @@ VIEWER_HTML = """
   <style>
     :root {
       color-scheme: dark;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: "Bahnschrift", "Avenir Next", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
       background: #141210;
       color: #f4efe6;
       --bg: #141210;
@@ -745,7 +745,15 @@ VIEWER_HTML = """
       --red: #d45d5d;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(1100px 500px at 18% -10%, rgba(217,139,95,.07), transparent 60%),
+        radial-gradient(900px 480px at 100% 0%, rgba(84,179,168,.05), transparent 55%),
+        var(--bg);
+      min-height: 100vh;
+    }
     main { max-width: 1420px; margin: 0 auto; padding: 18px; }
     header {
       display: flex;
@@ -754,10 +762,28 @@ VIEWER_HTML = """
       gap: 14px;
       margin-bottom: 14px;
     }
-    h1 { margin: 0; font-size: 28px; font-weight: 720; letter-spacing: 0; }
+    h1 {
+      margin: 0;
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+    h1 .h1-sub {
+      font-size: 13px;
+      font-weight: 400;
+      letter-spacing: .22em;
+      color: var(--muted);
+      margin-left: 10px;
+      vertical-align: 4px;
+    }
     .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font: 13px ui-monospace, monospace; }
     .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--red); }
-    .dot.live { background: var(--teal); box-shadow: 0 0 0 5px rgba(84,179,168,.14); }
+    .dot.live { background: var(--teal); animation: pulse 2.2s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(84,179,168,.16); }
+      50% { box-shadow: 0 0 0 8px rgba(84,179,168,.05); }
+    }
     .layout { display: grid; grid-template-columns: minmax(360px, 1fr) 430px; gap: 14px; align-items: start; }
     .panel {
       background: var(--surface);
@@ -786,7 +812,14 @@ VIEWER_HTML = """
       padding: 10px 11px;
       font-size: 14px;
       min-height: 42px;
+      font-family: inherit;
+      transition: border-color .15s ease, background-color .15s ease;
     }
+    input:focus-visible, select:focus-visible, button:focus-visible {
+      outline: 2px solid var(--teal);
+      outline-offset: 1px;
+    }
+    input:hover, select:hover { border-color: #50453a; }
     input[type="checkbox"] { width: 18px; min-height: 18px; accent-color: var(--teal); }
     input[type="range"] {
       min-height: 24px;
@@ -800,9 +833,12 @@ VIEWER_HTML = """
       background: var(--amber);
       border-color: #f0a878;
       color: #17120e;
-      font-weight: 750;
+      font-weight: 700;
+      letter-spacing: .04em;
       align-self: end;
     }
+    button:hover { background: #e29a6f; }
+    button:active { background: #c97e54; }
     .video-wrap { position: relative; background: #090806; aspect-ratio: 16 / 9; }
     #stream, #previewVideo { width: 100%; height: 100%; object-fit: contain; display: block; }
     #previewVideo.hidden, #stream.hidden { display: none; }
@@ -857,15 +893,17 @@ VIEWER_HTML = """
       height: 42px;
       display: grid;
       place-items: center;
-      border: 1px solid var(--line);
+      border: 1px dashed var(--line);
       border-radius: 8px;
       color: var(--muted);
       padding: 10px 11px;
       text-align: center;
       cursor: pointer;
       background: #211f1c;
+      transition: border-color .15s ease, color .15s ease;
     }
-    .drop-zone.has-file { border-color: var(--amber); color: var(--text); }
+    .drop-zone:hover { border-color: var(--amber); color: var(--text); }
+    .drop-zone.has-file { border: 1px solid var(--amber); color: var(--text); }
     .detect-button {
       position: absolute;
       right: 14px;
@@ -970,11 +1008,12 @@ VIEWER_HTML = """
     .metric-hint { color: #7f756b; font-size: 10px; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .value {
       font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums;
       text-align: right;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .bar { position: relative; height: 7px; background: #3a3129; border-radius: 999px; overflow: hidden; }
+    .bar { position: relative; height: 8px; background: #2e2822; border-radius: 999px; overflow: hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,.35); }
     .bar.centered::before {
       content: "";
       position: absolute;
@@ -995,6 +1034,53 @@ VIEWER_HTML = """
       background: var(--teal);
       opacity: .78;
       transition: width .08s linear, left .08s linear;
+    }
+    .culture-panel { border-top: 1px solid var(--line); padding: 14px 12px 16px; background: #171411; }
+    .culture-row { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
+    .culture-end {
+      font: 11px ui-monospace, monospace;
+      letter-spacing: .12em;
+      flex-shrink: 0;
+    }
+    .culture-end.baye { color: var(--red); }
+    .culture-end.morris { color: var(--teal); }
+    .culture-track {
+      position: relative;
+      flex: 1;
+      height: 10px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(212,93,93,.55), rgba(58,49,41,.9) 50%, rgba(84,179,168,.55));
+      box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
+    }
+    .culture-track::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: -3px;
+      bottom: -3px;
+      width: 1px;
+      background: #7f756b;
+      opacity: .6;
+    }
+    .culture-marker {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      background: var(--text);
+      border: 3px solid var(--bg);
+      box-shadow: 0 0 10px rgba(244,239,230,.45);
+      transform: translate(-50%, -50%);
+      transition: left .25s ease;
+    }
+    .culture-value {
+      margin-top: 8px;
+      text-align: center;
+      color: var(--muted);
+      font: 12px ui-monospace, monospace;
+      font-variant-numeric: tabular-nums;
     }
     .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
     .osc-settings {
@@ -1024,7 +1110,7 @@ VIEWER_HTML = """
   <main>
     <header>
       <div>
-        <h1>FIELD Realtime Dance</h1>
+        <h1>FIELD<span class="h1-sub">Realtime Dance</span></h1>
         <div class="status"><span id="dot" class="dot"></span><span id="status">idle</span></div>
       </div>
     </header>
@@ -1084,13 +1170,6 @@ VIEWER_HTML = """
 
       <aside class="panel">
         <div class="metric-osc-controls">
-          <label><span class="label-row">Performance <span class="info-dot" title="Controls display resolution, JPEG quality, and pose-analysis rate. Lower presets keep the stream smoother by running MediaPipe less often.">?</span></span>
-            <select id="performance" name="performance">
-              <option value="fast">fast</option>
-              <option value="balanced" selected>balanced</option>
-              <option value="quality">quality</option>
-            </select>
-          </label>
           <label><span class="label-row">Mode <span class="info-dot" title="raw: send original metric values. normalize: map output toward a bounded 0-1 range using adaptive peaks; sync_correlation maps -1..1 to 0..1.">?</span></span>
             <select id="oscMode" name="osc_mode" title="raw: original metric values. normalize: adaptive bounded output for OSC and display.">
               <option value="raw">raw</option>
@@ -1103,6 +1182,15 @@ VIEWER_HTML = """
           </label>
         </div>
         <div id="metrics" class="metric-grid"></div>
+        <div id="culturePanel" class="culture-panel hidden">
+          <p class="section-title">Culture Axis</p>
+          <div class="culture-row">
+            <span class="culture-end baye">BAYE</span>
+            <div class="culture-track"><div id="cultureMarker" class="culture-marker"></div></div>
+            <span class="culture-end morris">MORRIS</span>
+          </div>
+          <div id="cultureValue" class="culture-value">/field/morrisness –</div>
+        </div>
         <div class="metric-address-panel">
           <p class="section-title">OSC output values</p>
           <div id="addresses" class="address-list"></div>
@@ -1165,7 +1253,6 @@ VIEWER_HTML = """
       data.set('loop', 'true');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
-      data.set('performance', document.getElementById('performance').value);
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -1178,23 +1265,8 @@ VIEWER_HTML = """
       }
       inputDirty = false;
       oscDirty = false;
-      runtimeDirty = false;
 
       return payload;
-    }
-
-    function scheduleRuntimeApply() {
-      runtimeDirty = true;
-      window.clearTimeout(runtimeApplyTimer);
-      runtimeApplyTimer = window.setTimeout(async () => {
-        const payload = await applySettings(isDetecting);
-        if (!payload || payload.status !== 'applied') return;
-        if (isDetecting) {
-          showDetectionStream();
-        } else {
-          showPreview();
-        }
-      }, 80);
     }
 
     function buildOscFormData() {
@@ -1254,9 +1326,7 @@ VIEWER_HTML = """
     let lastPayload = null;
     let inputDirty = false;
     let oscDirty = false;
-    let runtimeDirty = false;
     let oscApplyTimer = null;
-    let runtimeApplyTimer = null;
 
     function showPreview() {
       streamImage.classList.add('hidden');
@@ -1298,7 +1368,6 @@ VIEWER_HTML = """
       inputDirty = true;
       sourceInput.value = 'live';
     });
-    document.getElementById('performance').addEventListener('change', scheduleRuntimeApply);
     dropZone.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
@@ -1360,12 +1429,6 @@ VIEWER_HTML = """
         row.textContent = `${prefix}/${oscAddressNames[name] || name}  ${formatMetric(value)}`;
         container.appendChild(row);
       }
-      const morrisness = payload?.processing?.morrisness;
-      if (morrisness !== null && morrisness !== undefined) {
-        const row = document.createElement('div');
-        row.textContent = `${prefix}/morrisness  ${formatMetric(Number(morrisness))}  (1=Morris 0=BaYe)`;
-        container.appendChild(row);
-      }
     }
 
     function syncAlphaLabel() {
@@ -1411,9 +1474,6 @@ VIEWER_HTML = """
       if (!inputDirty) {
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
       }
-      if (!runtimeDirty) {
-        document.getElementById('performance').value = source.performance || 'balanced';
-      }
       if (!oscDirty) {
         document.getElementById('oscHost').value = osc.host || '127.0.0.1';
         document.getElementById('oscPort').value = osc.port || 9000;
@@ -1448,6 +1508,15 @@ VIEWER_HTML = """
         valueEl.textContent = formatMetric(value);
         valueEl.title = Number.isFinite(value) ? value.toFixed(2) : String(value);
         updateMetricBar(name, value, osc.mode || 'raw');
+      }
+
+      const morrisness = processing.morrisness;
+      if (morrisness !== null && morrisness !== undefined) {
+        document.getElementById('culturePanel').classList.remove('hidden');
+        const pct = Math.max(0, Math.min(100, Number(morrisness) * 100));
+        document.getElementById('cultureMarker').style.left = `${pct.toFixed(1)}%`;
+        document.getElementById('cultureValue').textContent =
+          `/field/morrisness  ${Number(morrisness).toFixed(2)}`;
       }
     }
 
