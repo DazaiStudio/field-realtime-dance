@@ -1,12 +1,3 @@
-# Node.js
-frontend/node_modules
-frontend/dist
-frontend/dist-ssr
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
 # Python
 **/__pycache__/
 *.py[cod]
@@ -33,7 +24,4 @@ qa_screenshots/
 *.swo
 
 # Project specific
-query.txt
-test.py
-testmedia.py
 osc_viewer.*.log
