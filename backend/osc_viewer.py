@@ -7,7 +7,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional
 from uuid import uuid4
 
 import cv2
@@ -25,7 +25,6 @@ REPO_ROOT = BASE_DIR.parent
 UPLOAD_DIR = BASE_DIR / "viewer_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-clients: Set[WebSocket] = set()
 pose_engine: Optional[PoseEngine] = None
 pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
 camera = None
@@ -290,11 +289,6 @@ def scan_camera_signals(max_cameras: int = 10) -> dict:
     return signals
 
 
-def set_latest(metrics: dict, timestamp_ms: int, frame=None) -> None:
-    set_analysis_result(metrics, timestamp_ms)
-    set_stream_frame(frame)
-
-
 def set_stream_frame(frame=None, encode_ms: float = 0.0) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
@@ -336,10 +330,6 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
             if morrisness is not None:
                 processing_state["morrisness"] = morrisness
                 osc_sender.send_named("morrisness", morrisness)
-
-
-def set_preview_frame(frame=None) -> None:
-    set_stream_frame(frame)
 
 
 def encode_frame(frame):
@@ -722,13 +712,12 @@ async def preview_stream():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    clients.add(websocket)
     try:
         while True:
             await websocket.send_text(json.dumps(state_payload()))
             await asyncio.sleep(1 / 15)
     except WebSocketDisconnect:
-        clients.discard(websocket)
+        pass
 
 
 VIEWER_HTML = """
