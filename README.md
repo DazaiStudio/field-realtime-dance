@@ -10,11 +10,22 @@ Fork of [`YukiHataRin/realtime-dance-analysis`](https://github.com/YukiHataRin/r
 
 ## Install & Run
 
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/DazaiStudio/field-realtime-dance.git
+cd field-realtime-dance
+pip install -r requirements.txt
+python backend\osc_viewer.py
+```
+
+macOS / Linux:
+
 ```bash
 git clone https://github.com/DazaiStudio/field-realtime-dance.git
 cd field-realtime-dance
-pip install -r requirements.txt          # macOS/Linux: python3 -m pip
-python backend/osc_viewer.py             # macOS/Linux: python3
+python3 -m pip install -r requirements.txt
+python3 backend/osc_viewer.py
 ```
 
 Open `http://127.0.0.1:9100` and leave the terminal running.
@@ -57,16 +68,6 @@ If `backend/culture_map.json` is present (exported from the offline Morris/BaYe 
 - **Mode** `raw`: original metric values. `normalize`: bounded 0–1 output (adaptive peaks/ranges; `sync_corr` maps −1..1 → 0..1).
 - **Alpha** smoothing: `1.0` = none, lower = smoother (default `0.25`).
 - The on-screen values always match what is sent over OSC.
-
-## Performance presets
-
-| Preset   | Resolution | Display fps | Pose fps |
-|----------|-----------|-------------|----------|
-| fast     | 640×360   | 24          | 10       |
-| balanced | 720×405   | 24          | 12       |
-| quality  | 960×540   | 20          | 15       |
-
-Switching presets restarts the stream with the new settings. The footer shows display `fps` and actual `pose` rate.
 
 ## CLI options
 
