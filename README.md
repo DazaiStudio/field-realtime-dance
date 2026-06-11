@@ -69,24 +69,6 @@ If `backend/culture_map.json` is present (exported from the offline Morris/BaYe 
 - **Alpha** smoothing: `1.0` = none, lower = smoother (default `0.25`).
 - The on-screen values always match what is sent over OSC.
 
-## CLI options
-
-```bash
-python backend/osc_viewer.py \
-  --web-port 9100 --osc-host 127.0.0.1 --osc-port 9000 \
-  --osc-mode raw --osc-alpha 0.25 --osc-namespace /field \
-  --pose-model lite
-```
-
-`--pose-model lite` (default) is fastest — use it for rehearsals/shows; `full`/`heavy` trade fps for accuracy.
-Environment variables `FIELD_OSC_HOST/PORT/MODE/ALPHA/NAMESPACE/ENABLED` set the same defaults.
-
-Standalone video → OSC without the web UI:
-
-```bash
-python backend/osc_video_test.py path/to/video.mp4 --osc-port 9000 --loop
-```
-
 ## Project structure
 
 ```text
@@ -99,17 +81,3 @@ backend/
   dance_metrics.py   # 9 dance metric calculations (upstream)
 frontend/            # upstream React dashboard (not used by osc_viewer)
 ```
-
-## Development checks
-
-```bash
-python -m compileall backend
-python -m unittest discover -s backend/tests -t backend
-git diff --check
-```
-
-## Troubleshooting
-
-- No camera video: close other camera apps, check OS camera privacy settings, restart the viewer after plugging in devices.
-- macOS: allow camera access for Terminal/iTerm in System Settings.
-- `Mirror camera` affects live input only; uploaded videos are never mirrored.
