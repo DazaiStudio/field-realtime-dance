@@ -983,6 +983,28 @@ VIEWER_HTML = """
       height: 100vh;
       background: #000;
     }
+    .metric-overlay {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      display: none;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 170px;
+      padding: 10px 12px;
+      background: rgba(9, 8, 6, .58);
+      border: 1px solid rgba(74, 64, 54, .6);
+      border-radius: 8px;
+      font: 12px ui-monospace, monospace;
+      backdrop-filter: blur(3px);
+      pointer-events: none;
+      z-index: 3;
+    }
+    .metric-overlay .ov-row { display: flex; justify-content: space-between; gap: 16px; }
+    .metric-overlay .ov-name { color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric-overlay .ov-val { color: var(--teal); font-variant-numeric: tabular-nums; }
+    .video-wrap:fullscreen .metric-overlay,
+    .video-wrap:-webkit-full-screen .metric-overlay { display: flex; }
     .meta {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1181,6 +1203,7 @@ VIEWER_HTML = """
             </div>
           </div>
           <div id="emptyState" class="empty hidden">camera off</div>
+          <div id="metricOverlay" class="metric-overlay"></div>
           <button id="changeInputButton" class="change-input" type="button">Change Input</button>
           <div class="control-bar">
             <button id="cameraButton" class="ctrl-btn off" type="button" title="Turn camera on">
@@ -1300,6 +1323,7 @@ VIEWER_HTML = """
       jerk: 'How abrupt those speed changes are. Low = flowing; high = jagged, twitchy. Raw values get very large - use normalize for a readable range.',
     };
     const centeredMetrics = new Set(['sync_correlation']);
+    const metricOverlayEl = document.getElementById('metricOverlay');
 
     for (const name of metricNames) {
       maxSeen[name] = 1;
@@ -1315,6 +1339,11 @@ VIEWER_HTML = """
         <div class="bar" id="bar-${name}"><div class="fill" id="b-${name}"></div></div>
       `;
       metricsEl.appendChild(row);
+
+      const ovRow = document.createElement('div');
+      ovRow.className = 'ov-row';
+      ovRow.innerHTML = `<span class="ov-name">${name}</span><span class="ov-val" id="ov-${name}">0.00</span>`;
+      metricOverlayEl.appendChild(ovRow);
     }
 
     async function applySettings(detectEnabled) {
@@ -1624,6 +1653,8 @@ VIEWER_HTML = """
         valueEl.textContent = formatMetric(value);
         valueEl.title = Number.isFinite(value) ? value.toFixed(2) : String(value);
         updateMetricBar(name, value, osc.mode || 'raw');
+        const ovEl = document.getElementById(`ov-${name}`);
+        if (ovEl) ovEl.textContent = formatMetric(value);
       }
 
       const morrisness = processing.morrisness;
