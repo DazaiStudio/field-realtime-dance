@@ -985,22 +985,22 @@ VIEWER_HTML = """
     }
     .metric-overlay {
       position: absolute;
-      top: 14px;
-      right: 14px;
+      top: 16px;
+      right: 16px;
       display: none;
       flex-direction: column;
-      gap: 3px;
-      min-width: 170px;
-      padding: 10px 12px;
+      gap: 5px;
+      min-width: 230px;
+      padding: 14px 18px;
       background: rgba(9, 8, 6, .58);
       border: 1px solid rgba(74, 64, 54, .6);
-      border-radius: 8px;
-      font: 12px ui-monospace, monospace;
+      border-radius: 9px;
+      font: 15px ui-monospace, monospace;
       backdrop-filter: blur(3px);
       pointer-events: none;
       z-index: 3;
     }
-    .metric-overlay .ov-row { display: flex; justify-content: space-between; gap: 16px; }
+    .metric-overlay .ov-row { display: flex; justify-content: space-between; gap: 22px; }
     .metric-overlay .ov-name { color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
     .metric-overlay .ov-val { color: var(--teal); font-variant-numeric: tabular-nums; }
     .video-wrap:fullscreen .metric-overlay,
