@@ -51,12 +51,12 @@ Video files loop by default. Only one app can own a camera at a time — close o
 
 ## OSC
 
-Default target `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
+Default target `udp://127.0.0.1:9000`, prefix `/field`. Each metric is emitted **per dancer slot** as `/field/{slot}/<metric>` (slots 1–4) — see [Multi-Person](#multi-person) below for the full address list and meta addresses. The nine metric names are:
 
 ```text
-/field/energy      /field/sync_vel    /field/sync_corr
-/field/expansion   /field/curvature   /field/height
-/field/sway        /field/torque      /field/jerk
+energy      sync_vel    sync_corr
+expansion   curvature   height
+sway        torque      jerk
 ```
 
 Host, port, prefix, mode, smoothing, and enable are all changeable at runtime in the viewer — no restart needed.
