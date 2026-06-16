@@ -355,21 +355,23 @@ def set_analysis_result(timestamp_ms: int, pose_ms: float = 0.0) -> None:
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
 
 
+# Canonical slot palette (cv2 BGR). MUST stay in sync with SLOT_COLORS (hex
+# RGB) in VIEWER_HTML so the video overlay and the web panels show the same
+# visible color per dancer: 1=cyan, 2=orange, 3=green, 4=magenta.
+SLOT_COLORS_BGR = {1: (255, 255, 0), 2: (0, 128, 255), 3: (0, 255, 0), 4: (255, 0, 255)}
+
+
 def draw_person(frame, person, slot):
-    """Minimal bbox + slot label + keypoint overlay. Task 9 enriches this."""
-    palette = [
-        (84, 179, 84),    # slot 1
-        (179, 139, 84),   # slot 2
-        (84, 139, 217),   # slot 3
-        (179, 84, 168),   # slot 4
-    ]
-    color = palette[(int(slot) - 1) % len(palette)]
+    """Per-slot bbox + slot label + keypoint overlay using the canonical
+    palette. Exception-safe: a malformed bbox/keypoint must not crash the
+    frame loop (matches the Task 8 stub's robustness)."""
+    color = SLOT_COLORS_BGR.get(int(slot), (200, 200, 200))
     try:
         x1, y1, x2, y2 = (int(round(v)) for v in person.bbox)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
-            frame, f"#{slot}", (x1, max(0, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
+            frame, f"#{slot}", (x1, max(0, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA,
         )
         kpts = person.kpts_2d
         if kpts is not None:
@@ -1318,6 +1320,51 @@ VIEWER_HTML = """
     .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
     .address-list { display: grid; gap: 7px; color: var(--muted); font: 13px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
+    .slots-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
+    .slot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .slot-panel {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: 8px;
+      padding: 9px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .slot-panel.empty { opacity: .42; }
+    .slot-panel header {
+      display: block;
+      margin: 0 0 4px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .slot-panel .m-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font: 12px ui-monospace, monospace;
+      line-height: 1.5;
+    }
+    .slot-panel .m-row span { text-transform: uppercase; letter-spacing: .03em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .slot-panel .m-row b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .slot-actions { margin-top: 7px; }
+    .slot-actions button {
+      width: 100%;
+      min-height: 0;
+      padding: 6px 8px;
+      font-size: 11px;
+      letter-spacing: .06em;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .slot-actions button:hover { background: rgba(54, 47, 40, .92); color: var(--text); }
+    .slot-actions button.swap-armed { border-color: var(--amber); color: var(--amber); background: rgba(60, 40, 20, .4); }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
       .controls-grid, .osc-settings, .metric-osc-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1467,6 +1514,10 @@ VIEWER_HTML = """
           </div>
           <div id="cultureValue" class="culture-value">/field/morrisness –</div>
         </div>
+        <div class="slots-panel">
+          <p class="section-title">Dancers <span class="info-dot" title="Up to 4 tracked dancers, one per OSC slot (/field/1../field/4). Greyed panels are empty. Use swap to manually reassign two slots: click swap on the first dancer, then swap on the second.">?</span></p>
+          <div id="slotPanels" class="slot-grid"></div>
+        </div>
       </aside>
     </section>
     <input id="source" name="source" type="hidden" value="live" />
@@ -1477,6 +1528,9 @@ VIEWER_HTML = """
   <script>
     const metricNames = %METRICS%;
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
+    // Canonical per-slot palette, mirrors SLOT_COLORS_BGR in osc_viewer.py.
+    const SLOT_COLORS = { 1: '#00ffff', 2: '#ff8000', 3: '#00ff00', 4: '#ff00ff' };
+    const METRIC_KEYS = metricNames;
     const metricsEl = document.getElementById('metrics');
     const maxSeen = {};
     const metricHints = {
@@ -1811,6 +1865,57 @@ VIEWER_HTML = """
       fill.style.width = `${width}%`;
     }
 
+    let swapFrom = null;
+    function swapSlot(s) {
+      const grid = document.getElementById('slotPanels');
+      if (swapFrom === null) {
+        swapFrom = s;
+        if (grid) {
+          const btn = grid.querySelector(`button[data-slot="${s}"]`);
+          if (btn) btn.classList.add('swap-armed');
+        }
+        return;
+      }
+      if (swapFrom === s) {
+        // Clicking the armed slot again cancels the pending swap.
+        swapFrom = null;
+        renderSlots(lastPayload || {});
+        return;
+      }
+      const body = new FormData();
+      body.append('slot_a', swapFrom);
+      body.append('slot_b', s);
+      fetch('/api/slots/swap', { method: 'POST', body }).catch(error => console.warn('swap failed', error));
+      swapFrom = null;
+      renderSlots(lastPayload || {});
+    }
+
+    function renderSlots(state) {
+      const slots = state.slots || {};
+      const active = state.active_slots || [];
+      const grid = document.getElementById('slotPanels');
+      if (!grid) return;
+      grid.innerHTML = '';
+      for (let s = 1; s <= 4; s++) {
+        const isActive = active.includes(s) || active.includes(String(s));
+        const panel = document.createElement('div');
+        panel.className = 'slot-panel' + (isActive ? '' : ' empty');
+        panel.style.borderLeftColor = SLOT_COLORS[s];
+        // slots keys may arrive as numbers or JSON strings ("1").
+        const metrics = slots[s] || slots[String(s)] || {};
+        const rows = METRIC_KEYS.map(k => {
+          const v = Number(metrics[k] ?? 0);
+          return `<div class="m-row"><span>${k}</span><b>${formatMetric(v)}</b></div>`;
+        }).join('');
+        const armed = swapFrom === s ? ' swap-armed' : '';
+        const label = swapFrom === s ? 'swap: pick target…' : 'swap…';
+        panel.innerHTML =
+          `<header style="color:${SLOT_COLORS[s]}">Dancer ${s}</header>${rows}` +
+          `<div class="slot-actions"><button type="button" class="swap-btn${armed}" data-slot="${s}" onclick="swapSlot(${s})">${label}</button></div>`;
+        grid.appendChild(panel);
+      }
+    }
+
     function update(payload) {
       lastPayload = payload;
       const source = payload.source || {};
@@ -1867,6 +1972,8 @@ VIEWER_HTML = """
         document.getElementById('cultureValue').textContent =
           `/field/morrisness  ${Number(morrisness).toFixed(2)}`;
       }
+
+      renderSlots(payload);
     }
 
     function markOscDirty() {
