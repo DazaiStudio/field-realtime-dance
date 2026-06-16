@@ -953,6 +953,36 @@ VIEWER_HTML = """
       color: var(--text);
       border-color: var(--line);
     }
+    .fs-btn {
+      position: absolute;
+      right: 14px;
+      bottom: 16px;
+      width: 40px;
+      height: 40px;
+      min-height: 40px;
+      padding: 0;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: rgba(29, 26, 23, .78);
+      border: 1px solid #4a4036;
+      color: var(--text);
+      box-shadow: 0 8px 24px rgba(0,0,0,.4);
+      opacity: .85;
+      z-index: 3;
+    }
+    .fs-btn:hover { background: rgba(54, 47, 40, .92); opacity: 1; }
+    .fs-btn svg { width: 22px; height: 22px; display: block; }
+    .fs-btn .fs-exit { display: none; }
+    .fs-btn.fs-active .fs-enter { display: none; }
+    .fs-btn.fs-active .fs-exit { display: block; }
+    .video-wrap:fullscreen,
+    .video-wrap:-webkit-full-screen {
+      aspect-ratio: auto;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+    }
     .meta {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1170,6 +1200,20 @@ VIEWER_HTML = """
               </svg>
             </button>
           </div>
+          <button id="fullscreenButton" class="fs-btn" type="button" title="Fullscreen">
+            <svg class="fs-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 4H5a1 1 0 0 0-1 1v3"/>
+              <path d="M16 4h3a1 1 0 0 1 1 1v3"/>
+              <path d="M16 20h3a1 1 0 0 0 1-1v-3"/>
+              <path d="M8 20H5a1 1 0 0 1-1-1v-3"/>
+            </svg>
+            <svg class="fs-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 4v3a1 1 0 0 1-1 1H4"/>
+              <path d="M16 4v3a1 1 0 0 0 1 1h3"/>
+              <path d="M16 20v-3a1 1 0 0 1 1-1h3"/>
+              <path d="M8 20v-3a1 1 0 0 0-1-1H4"/>
+            </svg>
+          </button>
         </div>
         <div class="meta">
           <div id="metaA">source: -</div>
@@ -1430,6 +1474,23 @@ VIEWER_HTML = """
     document.getElementById('changeInputButton').addEventListener('click', () => {
       document.getElementById('inputOverlay').classList.remove('compact');
     });
+    const videoWrap = document.querySelector('.video-wrap');
+    const fullscreenButton = document.getElementById('fullscreenButton');
+    fullscreenButton.addEventListener('click', () => {
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      if (fsEl) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else {
+        (videoWrap.requestFullscreen || videoWrap.webkitRequestFullscreen).call(videoWrap);
+      }
+    });
+    function syncFullscreenButton() {
+      const active = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      fullscreenButton.classList.toggle('fs-active', active);
+      fullscreenButton.title = active ? 'Exit fullscreen' : 'Fullscreen';
+    }
+    document.addEventListener('fullscreenchange', syncFullscreenButton);
+    document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
     document.getElementById('enterInputButton').addEventListener('click', async () => {
       setDetectButton(false);
       const payload = await applySettings(false);
