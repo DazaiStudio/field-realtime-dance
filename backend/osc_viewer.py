@@ -21,7 +21,6 @@ from dance_metrics import DanceMetricsEngine
 from osc_manager import MultiSlotOSC
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES
 from pose_backends.factory import make_backend
-from pose_engine import PoseEngine
 from slot_binder import SlotBinder
 
 
@@ -30,8 +29,6 @@ REPO_ROOT = BASE_DIR.parent
 UPLOAD_DIR = BASE_DIR / "viewer_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-pose_engine: Optional[PoseEngine] = None
-pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
 camera = None
 camera_cache = {"updated_at": 0.0, "cameras": []}
 camera_signal_cache = {"updated_at": 0.0, "signals": {}}
@@ -54,8 +51,27 @@ def get_backend():
     return _backend
 
 
-# Optional: offline culture centroids enable the /field/morrisness output.
-culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
+# Optional: offline culture centroids enable the /field/{slot}/morrisness
+# output. culture_score is a probe of whether the map exists/loads (None ->
+# morrisness disabled, same as before); per-slot scorers are built lazily from
+# CULTURE_MAP_PATH so each dancer keeps an independent rolling average.
+CULTURE_MAP_PATH = BASE_DIR / "culture_map.json"
+culture_score = CultureScore.try_load(CULTURE_MAP_PATH)
+slot_culture: dict = {}
+
+
+def get_slot_culture(slot: int):
+    """Lazily build a per-slot CultureScore, mirroring slot_engines. Returns
+    None when the culture map is unavailable (morrisness disabled)."""
+    if culture_score is None:
+        return None
+    scorer = slot_culture.get(slot)
+    if scorer is None:
+        scorer = CultureScore.try_load(CULTURE_MAP_PATH)
+        if scorer is None:
+            return None
+        slot_culture[slot] = scorer
+    return scorer
 
 PERFORMANCE_PRESETS = {
     "fast": {"width": 640, "height": 360, "target_fps": 24.0, "analysis_fps": 10.0, "jpeg_quality": 55},
@@ -95,7 +111,6 @@ processing_state = {
     "pose_ms": 0.0,
     "encode_ms": 0.0,
     "latest_metrics": {},
-    "latest_raw_metrics": {},
     "slots": {},
     "latest_timestamp_ms": None,
     "last_frame_at": None,
@@ -109,8 +124,6 @@ processing_state = {
 async def lifespan(_app: FastAPI):
     yield
     release_camera()
-    if pose_engine is not None:
-        pose_engine.close()
     if _backend is not None:
         try:
             _backend.close()
@@ -119,13 +132,6 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-def get_pose_engine() -> PoseEngine:
-    global pose_engine
-    if pose_engine is None:
-        pose_engine = PoseEngine(model_path=str(pose_model_path))
-    return pose_engine
 
 
 def release_camera() -> None:
@@ -378,45 +384,61 @@ def draw_person(frame, person, slot):
 
 def process_multi(frame, timestamp_ms, measured_fps, draw=True):
     backend = get_backend()
-    people = backend.estimate(frame, timestamp_ms)
+    try:
+        people = backend.estimate(frame, timestamp_ms)
+    except Exception as exc:
+        # A backend failure must not kill the stream loop; drop this frame.
+        print(f"process_multi: backend.estimate failed: {exc}")
+        people = []
     mapping = binder.update([p.track_id for p in people])  # track_id -> slot
     by_track = {p.track_id: p for p in people}
 
     latest = {}
-    morrisness_seen = None
+    slot1_morrisness = None
     for track_id, slot in mapping.items():
-        person = by_track[track_id]
-        eng = slot_engines.get(slot)
-        if eng is None or eng.is_3d != person.is_3d:
-            eng = DanceMetricsEngine(fps=max(measured_fps, 1), is_3d=person.is_3d)
-            slot_engines[slot] = eng
-        eng.set_fps(max(measured_fps, 1))
-        metrics = eng.update(person.h36m17)
-        osc.send_slot(slot, metrics)
-        latest[slot] = dict(osc.prepared_for(slot))
-        # Per-slot culture axis (morrisness). Skip all-zero ("no pose") frames
-        # so resting zeros don't drag the rolling score.
-        if culture_score is not None and (
-            metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0
-        ):
-            morrisness = culture_score.update(metrics)
-            if morrisness is not None:
-                osc.send_named_slot(slot, "morrisness", morrisness)
-                morrisness_seen = morrisness
-        if draw:
-            draw_person(frame, person, slot)
+        # Isolate per-track failures (NaN/short keypoints from a live
+        # detector) so one bad detection only drops that slot this frame.
+        try:
+            person = by_track[track_id]
+            eng = slot_engines.get(slot)
+            if eng is None or eng.is_3d != person.is_3d:
+                eng = DanceMetricsEngine(fps=max(measured_fps, 1), is_3d=person.is_3d)
+                slot_engines[slot] = eng
+                # Fresh occupant: drop the previous dancer's smoothing/peaks.
+                osc.sender(slot).reset_state()
+            eng.set_fps(max(measured_fps, 1))
+            metrics = eng.update(person.h36m17)
+            osc.send_slot(slot, metrics)
+            latest[slot] = dict(osc.prepared_for(slot))
+            # Per-slot culture axis (morrisness). Skip all-zero ("no pose")
+            # frames so resting zeros don't drag the rolling score.
+            scorer = get_slot_culture(slot)
+            if scorer is not None and (
+                metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0
+            ):
+                morrisness = scorer.update(metrics)
+                if morrisness is not None:
+                    osc.send_named_slot(slot, "morrisness", morrisness)
+                    if slot == 1:
+                        slot1_morrisness = morrisness
+            if draw:
+                draw_person(frame, person, slot)
+        except Exception as exc:
+            print(f"process_multi: slot {slot} (track {track_id}) failed: {exc}")
+            continue
 
     for slot in list(slot_engines.keys()):
         if slot not in binder.active_slots():
             slot_engines.pop(slot, None)
+            slot_culture.pop(slot, None)
 
     osc.send_meta(binder.active_slots())
 
     # Mirror slot 1 into the legacy single-person UI fields so the existing
     # metric panel / culture marker keep working without a UI rewrite.
     processing_state["latest_metrics"] = dict(latest.get(1, {}))
-    if morrisness_seen is not None:
-        processing_state["morrisness"] = morrisness_seen
+    if slot1_morrisness is not None:
+        processing_state["morrisness"] = slot1_morrisness
 
     return frame, latest
 
@@ -791,7 +813,6 @@ async def apply_input(
     processing_state["pose_ms"] = 0.0
     processing_state["encode_ms"] = 0.0
     processing_state["latest_metrics"] = {}
-    processing_state["latest_raw_metrics"] = {}
     processing_state["slots"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
@@ -801,8 +822,7 @@ async def apply_input(
     for s in range(1, osc.num_slots + 1):
         osc.sender(s).reset_state()
     slot_engines.clear()
-    if culture_score is not None:
-        culture_score.reset()
+    slot_culture.clear()
     return {"status": "applied", **state_payload()}
 
 
@@ -1894,16 +1914,7 @@ def main():
     parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
     parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "0.25")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
-    parser.add_argument(
-        "--pose-model",
-        choices=["lite", "full", "heavy"],
-        default=os.getenv("FIELD_POSE_MODEL", "lite"),
-        help="MediaPipe pose model. lite is fastest; full/heavy are more accurate but slower.",
-    )
     args = parser.parse_args()
-
-    global pose_model_path
-    pose_model_path = REPO_ROOT / f"pose_landmarker_{args.pose_model}.task"
 
     # MultiSlotOSC uses a fixed /field/{slot} layout; --osc-namespace is kept
     # as a CLI flag for compatibility but does not change the slot addresses.
@@ -1918,7 +1929,7 @@ def main():
         f"OSC output: udp://{args.osc_host}:{args.osc_port} "
         f"prefix={args.osc_namespace} mode={args.osc_mode} alpha={args.osc_alpha}"
     )
-    print(f"Pose model: {args.pose_model} ({pose_model_path})")
+    print(f"Pose backend: {os.getenv('FIELD_POSE_BACKEND', 'yolo')}")
     uvicorn.run(app, host=args.web_host, port=args.web_port)
 
 
