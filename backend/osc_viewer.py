@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -566,6 +567,20 @@ async def api_camera_release():
     return {"status": "released", **state_payload()}
 
 
+@app.post("/api/shutdown")
+async def api_shutdown():
+    """Stop streams, release the camera, then exit the process (UI Quit button)."""
+    source_state["session_id"] += 1
+    source_state["detect_enabled"] = False
+    try:
+        await asyncio.to_thread(release_camera)
+    except Exception:
+        pass
+    # Delay the hard exit so the HTTP response reaches the browser first.
+    threading.Timer(0.5, lambda: os._exit(0)).start()
+    return {"status": "stopping"}
+
+
 @app.get("/api/cameras")
 async def api_cameras():
     return {"cameras": await asyncio.to_thread(list_cameras)}
@@ -761,6 +776,36 @@ VIEWER_HTML = """
       gap: 14px;
       margin-bottom: 14px;
     }
+    .quit-btn {
+      align-self: center;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 14px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      background: rgba(29, 26, 23, .84);
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+    .quit-btn:hover { background: rgba(54, 47, 40, .92); color: var(--text); }
+    .quit-btn svg { width: 16px; height: 16px; display: block; }
+    .quit-btn.confirm { color: var(--red); border-color: var(--red); background: rgba(60, 20, 16, .5); }
+    .quit-btn.confirm:hover { background: rgba(80, 26, 20, .65); }
+    .stopped-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: grid;
+      place-items: center;
+      background: rgba(9, 8, 6, .92);
+      backdrop-filter: blur(6px);
+    }
+    .stopped-overlay.hidden { display: none; }
+    .stopped-title { font-size: 22px; color: var(--text); margin: 0 0 8px; letter-spacing: .04em; text-align: center; }
+    .stopped-sub { color: var(--muted); margin: 0; font: 14px ui-monospace, monospace; text-align: center; }
     h1 {
       margin: 0;
       font-size: 30px;
@@ -1173,7 +1218,20 @@ VIEWER_HTML = """
         <h1>FIELD<span class="h1-sub">Realtime Dance</span></h1>
         <div class="status"><span id="dot" class="dot"></span><span id="status">idle</span></div>
       </div>
+      <button id="quitButton" class="quit-btn" type="button" title="Stop the viewer and shut down the server">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3.5v8"/>
+          <path d="M6.8 6.8a8 8 0 1 0 10.4 0"/>
+        </svg>
+        <span id="quitLabel">Quit</span>
+      </button>
     </header>
+    <div id="stoppedOverlay" class="stopped-overlay hidden">
+      <div>
+        <p class="stopped-title">Viewer stopped</p>
+        <p class="stopped-sub">You can close this tab.</p>
+      </div>
+    </div>
 
     <form id="form">
     <section class="layout">
@@ -1520,6 +1578,29 @@ VIEWER_HTML = """
     }
     document.addEventListener('fullscreenchange', syncFullscreenButton);
     document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
+
+    const quitButton = document.getElementById('quitButton');
+    const quitLabel = document.getElementById('quitLabel');
+    let quitArmed = false;
+    let quitTimer = null;
+    quitButton.addEventListener('click', async () => {
+      if (!quitArmed) {
+        quitArmed = true;
+        quitButton.classList.add('confirm');
+        quitLabel.textContent = 'Confirm quit';
+        quitTimer = window.setTimeout(() => {
+          quitArmed = false;
+          quitButton.classList.remove('confirm');
+          quitLabel.textContent = 'Quit';
+        }, 3000);
+        return;
+      }
+      window.clearTimeout(quitTimer);
+      quitArmed = false;
+      quitLabel.textContent = 'Stopping...';
+      try { await fetch('/api/shutdown', { method: 'POST' }); } catch (e) {}
+      document.getElementById('stoppedOverlay').classList.remove('hidden');
+    });
     document.getElementById('enterInputButton').addEventListener('click', async () => {
       setDetectButton(false);
       const payload = await applySettings(false);
