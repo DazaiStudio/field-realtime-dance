@@ -64,3 +64,29 @@ Host, port, prefix, mode, smoothing, and enable are all changeable at runtime in
 - **Mode** `raw`: original metric values. `normalize`: bounded 0–1 output (adaptive peaks/ranges; `sync_corr` maps −1..1 → 0..1).
 - **Alpha** smoothing: `1.0` = none, lower = smoother (default `0.25`).
 - The on-screen values always match what is sent over OSC.
+
+## Multi-Person
+
+Up to 4 dancers are tracked at once, each pinned to a fixed slot (1–4) so downstream OSC
+receivers always know which address is which dancer, even as people enter/leave frame.
+
+**Pose backend** — set via env var `FIELD_POSE_BACKEND=yolo|mediapipe` (default `yolo`).
+YOLO26 (BoT-SORT tracking, 2D) is the default and runs on CUDA/MPS/CPU; `mediapipe` is the
+alternative (pseudo-3D). `ultralytics` is now a dependency.
+
+**Per-slot OSC** — each of the 9 metrics plus `morrisness` is sent per slot:
+
+```text
+/field/{slot}/energy      /field/{slot}/sync_vel    /field/{slot}/sync_corr
+/field/{slot}/expansion   /field/{slot}/curvature   /field/{slot}/height
+/field/{slot}/sway        /field/{slot}/torque      /field/{slot}/jerk
+/field/{slot}/morrisness
+```
+
+Meta addresses report which slots are currently occupied: `/field/active_slots` (list of
+slot numbers) and `/field/count` (int).
+
+**Manual reassignment** — the viewer shows 4 per-dancer metric panels. If the tracker
+misassigns a dancer to the wrong slot, use a panel's **swap…** button (two clicks: pick the
+panel to swap with) to exchange which dancer occupies which slot.
+(Endpoints: `POST /api/slots/swap`, `POST /api/slots/bind`.)
