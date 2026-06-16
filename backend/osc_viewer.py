@@ -17,8 +17,12 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
 from culture_score import CultureScore
-from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
+from dance_metrics import DanceMetricsEngine
+from osc_manager import MultiSlotOSC
+from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES
+from pose_backends.factory import make_backend
 from pose_engine import PoseEngine
+from slot_binder import SlotBinder
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,14 +35,25 @@ pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
 camera = None
 camera_cache = {"updated_at": 0.0, "cameras": []}
 camera_signal_cache = {"updated_at": 0.0, "signals": {}}
-osc_sender = OSCSender(
+osc = MultiSlotOSC(
     host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
     mode=os.getenv("FIELD_OSC_MODE", "raw"),
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "0.25")),
-    namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
+binder = SlotBinder(num_slots=4)
+slot_engines: dict = {}
+_backend = None
+
+
+def get_backend():
+    global _backend
+    if _backend is None:
+        _backend = make_backend()
+    return _backend
+
+
 # Optional: offline culture centroids enable the /field/morrisness output.
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 
@@ -81,6 +96,7 @@ processing_state = {
     "encode_ms": 0.0,
     "latest_metrics": {},
     "latest_raw_metrics": {},
+    "slots": {},
     "latest_timestamp_ms": None,
     "last_frame_at": None,
     "signal_mean": None,
@@ -95,6 +111,11 @@ async def lifespan(_app: FastAPI):
     release_camera()
     if pose_engine is not None:
         pose_engine.close()
+    if _backend is not None:
+        try:
+            _backend.close()
+        except Exception:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -125,11 +146,15 @@ def open_camera(index: int):
 
 
 def state_payload() -> dict:
+    # The single-metric UI panel reads addresses from slot 1; multi-person
+    # per-slot data lives in processing_state["slots"] / active_slots.
     payload = {
         "source": dict(source_state),
         "processing": dict(processing_state),
-        "osc": osc_sender.get_status(),
-        "addresses": [osc_sender.metric_address(name) for name in METRIC_NAMES],
+        "osc": osc.get_status(),
+        "addresses": [osc.sender(1).metric_address(name) for name in METRIC_NAMES],
+        "slots": processing_state.get("slots", {}),
+        "active_slots": binder.active_slots(),
     }
     payload["source"]["video_path"] = None
     return payload
@@ -311,26 +336,89 @@ def set_stream_frame(frame=None, encode_ms: float = 0.0) -> None:
         processing_state["error"] = None
 
 
-def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) -> None:
+def set_analysis_result(timestamp_ms: int, pose_ms: float = 0.0) -> None:
+    """Per-analysis-tick bookkeeping (rate counters, timings). OSC sending and
+    per-slot prepared metrics now happen inside process_multi."""
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
-    processing_state["latest_raw_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
     if elapsed > 0.25:
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
-    osc_sender.send_metrics(metrics)
-    processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
-    if culture_score is not None:
-        # All-zero metrics mean "no pose detected"; keep the previous score
-        # instead of letting zeros drag the rolling average around.
-        if metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0:
+
+
+def draw_person(frame, person, slot):
+    """Minimal bbox + slot label + keypoint overlay. Task 9 enriches this."""
+    palette = [
+        (84, 179, 84),    # slot 1
+        (179, 139, 84),   # slot 2
+        (84, 139, 217),   # slot 3
+        (179, 84, 168),   # slot 4
+    ]
+    color = palette[(int(slot) - 1) % len(palette)]
+    try:
+        x1, y1, x2, y2 = (int(round(v)) for v in person.bbox)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame, f"#{slot}", (x1, max(0, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
+        )
+        kpts = person.kpts_2d
+        if kpts is not None:
+            for kx, ky in kpts:
+                if kx <= 0 and ky <= 0:
+                    continue
+                cv2.circle(frame, (int(round(kx)), int(round(ky))), 3, color, -1)
+    except Exception:
+        pass
+    return frame
+
+
+def process_multi(frame, timestamp_ms, measured_fps, draw=True):
+    backend = get_backend()
+    people = backend.estimate(frame, timestamp_ms)
+    mapping = binder.update([p.track_id for p in people])  # track_id -> slot
+    by_track = {p.track_id: p for p in people}
+
+    latest = {}
+    morrisness_seen = None
+    for track_id, slot in mapping.items():
+        person = by_track[track_id]
+        eng = slot_engines.get(slot)
+        if eng is None or eng.is_3d != person.is_3d:
+            eng = DanceMetricsEngine(fps=max(measured_fps, 1), is_3d=person.is_3d)
+            slot_engines[slot] = eng
+        eng.set_fps(max(measured_fps, 1))
+        metrics = eng.update(person.h36m17)
+        osc.send_slot(slot, metrics)
+        latest[slot] = dict(osc.prepared_for(slot))
+        # Per-slot culture axis (morrisness). Skip all-zero ("no pose") frames
+        # so resting zeros don't drag the rolling score.
+        if culture_score is not None and (
+            metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0
+        ):
             morrisness = culture_score.update(metrics)
             if morrisness is not None:
-                processing_state["morrisness"] = morrisness
-                osc_sender.send_named("morrisness", morrisness)
+                osc.send_named_slot(slot, "morrisness", morrisness)
+                morrisness_seen = morrisness
+        if draw:
+            draw_person(frame, person, slot)
+
+    for slot in list(slot_engines.keys()):
+        if slot not in binder.active_slots():
+            slot_engines.pop(slot, None)
+
+    osc.send_meta(binder.active_slots())
+
+    # Mirror slot 1 into the legacy single-person UI fields so the existing
+    # metric panel / culture marker keep working without a UI rewrite.
+    processing_state["latest_metrics"] = dict(latest.get(1, {}))
+    if morrisness_seen is not None:
+        processing_state["morrisness"] = morrisness_seen
+
+    return frame, latest
 
 
 def encode_frame(frame):
@@ -373,7 +461,6 @@ async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
     cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]))
-    engine = get_pose_engine()
     next_analysis_at = 0.0
     last_analysis_at = None
     measured_fps = max(float(source_state["analysis_fps"]), 1.0)
@@ -403,19 +490,19 @@ async def stream_live():
             if last_analysis_at is not None and now > last_analysis_at:
                 measured_fps = 0.8 * measured_fps + 0.2 * (1.0 / (now - last_analysis_at))
             last_analysis_at = now
-            engine.set_metrics_fps(measured_fps)
             pose_started = time.perf_counter()
-            processed, metrics = await asyncio.to_thread(
-                engine.process_frame,
+            # Single in-flight backend call keeps the stateful tracker (persist=True) safe.
+            processed, latest = await asyncio.to_thread(
+                process_multi,
                 frame,
                 timestamp_ms,
-                draw_overlay=bool(source_state.get("overlay_enabled", True)),
+                measured_fps,
+                bool(source_state.get("overlay_enabled", True)),
             )
             pose_ms = (time.perf_counter() - pose_started) * 1000.0
-            set_analysis_result(metrics, timestamp_ms, pose_ms)
+            processing_state["slots"] = latest
+            set_analysis_result(timestamp_ms, pose_ms)
             next_analysis_at = now + analysis_interval
-        elif source_state.get("overlay_enabled", True):
-            processed = engine.draw_cached_overlay(frame)
 
         encode_started = time.perf_counter()
         encoded = await asyncio.to_thread(encode_frame, processed)
@@ -464,7 +551,6 @@ async def stream_video():
     processing_state["running"] = True
     session_id = source_state["session_id"]
     release_camera()
-    engine = get_pose_engine()
 
     while (
         source_state["source"] == "video"
@@ -511,19 +597,19 @@ async def stream_video():
                 if last_analysis_at is not None and now > last_analysis_at:
                     measured_fps = 0.8 * measured_fps + 0.2 * (1.0 / (now - last_analysis_at))
                 last_analysis_at = now
-                engine.set_metrics_fps(measured_fps)
                 pose_started = time.perf_counter()
-                processed, metrics = await asyncio.to_thread(
-                    engine.process_frame,
+                # Single in-flight backend call keeps the stateful tracker (persist=True) safe.
+                processed, latest = await asyncio.to_thread(
+                    process_multi,
                     frame,
                     timestamp_ms,
-                    draw_overlay=bool(source_state.get("overlay_enabled", True)),
+                    measured_fps,
+                    bool(source_state.get("overlay_enabled", True)),
                 )
                 pose_ms = (time.perf_counter() - pose_started) * 1000.0
-                set_analysis_result(metrics, timestamp_ms, pose_ms)
+                processing_state["slots"] = latest
+                set_analysis_result(timestamp_ms, pose_ms)
                 next_analysis_at = now + analysis_interval
-            elif source_state.get("overlay_enabled", True):
-                processed = engine.draw_cached_overlay(frame)
 
             encode_started = time.perf_counter()
             encoded = await asyncio.to_thread(encode_frame, processed)
@@ -602,20 +688,28 @@ async def apply_osc_config(
     osc_alpha: float = Form(0.25),
     osc_namespace: str = Form("/field"),
 ):
-    osc_sender.configure(
+    # MultiSlotOSC owns a fixed /field/{slot} layout; namespace is not
+    # reconfigurable at runtime, so osc_namespace is accepted but ignored.
+    osc.configure(
         host=osc_host,
         port=osc_port,
         enabled=osc_enabled,
         mode=osc_mode,
         alpha=osc_alpha,
-        namespace=osc_namespace,
     )
-    raw_metrics = processing_state.get("latest_raw_metrics") or {}
-    if raw_metrics:
-        osc_sender.send_metrics(raw_metrics, send_keys=set())
-        processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
-
     return {"status": "applied", **state_payload()}
+
+
+@app.post("/api/slots/bind")
+async def api_slot_bind(track_id: int = Form(...), slot: int = Form(...)):
+    binder.manual_bind(track_id, slot)
+    return {"status": "ok", "active_slots": binder.active_slots()}
+
+
+@app.post("/api/slots/swap")
+async def api_slot_swap(slot_a: int = Form(...), slot_b: int = Form(...)):
+    binder.swap(slot_a, slot_b)
+    return {"status": "ok", "active_slots": binder.active_slots()}
 
 
 @app.post("/api/apply")
@@ -637,13 +731,14 @@ async def apply_input(
     if source not in {"live", "video"}:
         return {"status": "error", "error": "source must be live or video"}
 
-    osc_sender.configure(
+    # osc_namespace accepted for form compatibility; MultiSlotOSC uses a fixed
+    # /field/{slot} layout and ignores it.
+    osc.configure(
         host=osc_host,
         port=osc_port,
         enabled=osc_enabled,
         mode=osc_mode,
         alpha=osc_alpha,
-        namespace=osc_namespace,
     )
 
     source_state["session_id"] += 1
@@ -697,12 +792,15 @@ async def apply_input(
     processing_state["encode_ms"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_raw_metrics"] = {}
+    processing_state["slots"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
     processing_state["morrisness"] = None
     processing_state["error"] = None
-    osc_sender.reset_state()
+    for s in range(1, osc.num_slots + 1):
+        osc.sender(s).reset_state()
+    slot_engines.clear()
     if culture_score is not None:
         culture_score.reset()
     return {"status": "applied", **state_payload()}
@@ -1807,12 +1905,13 @@ def main():
     global pose_model_path
     pose_model_path = REPO_ROOT / f"pose_landmarker_{args.pose_model}.task"
 
-    osc_sender.configure(
+    # MultiSlotOSC uses a fixed /field/{slot} layout; --osc-namespace is kept
+    # as a CLI flag for compatibility but does not change the slot addresses.
+    osc.configure(
         host=args.osc_host,
         port=args.osc_port,
         mode=args.osc_mode,
         alpha=args.osc_alpha,
-        namespace=args.osc_namespace,
     )
     print(f"FIELD input viewer: http://{args.web_host}:{args.web_port}")
     print(

@@ -58,3 +58,16 @@ class MultiSlotOSC:
 
     def prepared_for(self, slot: int) -> Dict[str, float]:
         return dict(self._senders[slot].last_prepared_metrics)
+
+    def get_status(self) -> dict:
+        # mode/alpha live on the per-slot senders (all kept in lock-step by
+        # configure); read them off slot 1 for the UI/state payload.
+        ref = self._senders[1]
+        return {
+            "host": self.host,
+            "port": self.port,
+            "enabled": self.enabled,
+            "namespace": self.base_namespace,
+            "mode": ref.mode,
+            "alpha": ref.alpha,
+        }
