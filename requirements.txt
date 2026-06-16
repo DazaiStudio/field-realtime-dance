@@ -14,3 +14,6 @@ python-osc>=1.8.0
 
 # Windows-only camera device names through DirectShow.
 pygrabber>=0.2; platform_system == "Windows"
+
+# Multi-person detection + tracking (YOLO26 pose, BoT-SORT)
+ultralytics
