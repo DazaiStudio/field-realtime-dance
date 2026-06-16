@@ -5,7 +5,7 @@ class SlotBinder:
     """Maps volatile tracker ids onto a fixed set of slots (1..num_slots).
 
     - Auto-assigns a new track to the lowest free slot.
-    - Frees a slot whose bound track has been absent for > evict_after updates.
+    - Frees a slot whose bound track has been absent for evict_after or more consecutive updates.
     - manual_bind / swap let an operator override the mapping.
     """
 
