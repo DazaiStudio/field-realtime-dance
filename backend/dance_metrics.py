@@ -3,11 +3,12 @@ from scipy.spatial import ConvexHull
 from constants import *
 
 class DanceMetricsEngine:
-    def __init__(self, fps=30, history_size=30):
+    def __init__(self, fps=30, history_size=30, is_3d=True):
         self.fps = fps
         self.dt = 1.0 / fps
         self.history_size = history_size
-        
+        self.is_3d = is_3d
+
         # Historical buffers
         self.positions_history = [] # List of (17, 3) arrays
         # Used for derivations
@@ -152,14 +153,15 @@ class DanceMetricsEngine:
         return sync_velocity, correlation
 
     def _calculate_expansion(self, positions):
-        """4. Body Geometry - Expansion (Volume)"""
+        """4. Body Geometry - Expansion (3D volume, or 2D area for 2D backends)."""
         try:
-            # Add small noise to prevent Coplanar errors in ConvexHull
-            noise = np.random.normal(0, 1e-4, positions.shape)
-            hull = ConvexHull(positions + noise)
-            # Scale down volume for visualization ease (mm^3 is huge)
-            return hull.volume / 100000000.0  
-        except:
+            pts = positions if self.is_3d else positions[:, :2]
+            noise = np.random.normal(0, 1e-4, pts.shape)
+            hull = ConvexHull(pts + noise)
+            if self.is_3d:
+                return hull.volume / 100000000.0   # mm^3 -> readable
+            return hull.volume / 10000.0           # 2D: .volume == area (px^2)
+        except Exception:
             return 0.0
 
     def _calculate_curvature(self):
