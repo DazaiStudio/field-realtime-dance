@@ -778,6 +778,9 @@ VIEWER_HTML = """
     }
     .quit-btn {
       align-self: center;
+      width: auto;
+      flex: none;
+      min-height: 0;
       display: inline-flex;
       align-items: center;
       gap: 7px;
