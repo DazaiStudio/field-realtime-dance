@@ -17,3 +17,11 @@ pygrabber>=0.2; platform_system == "Windows"
 
 # Multi-person detection + tracking (YOLO26 pose, BoT-SORT)
 ultralytics
+
+# 3D whole-body pose (RTMW3D-x via onnxruntime-gpu CUDA EP).
+# onnxruntime-gpu is already pulled in by the ai-motion environment on this
+# machine (1.23.2); list it here so a fresh install gets the GPU build.
+# The CUDA runtime DLLs are reused from PyTorch (ultralytics dependency) —
+# no separate CUDA Toolkit / nvcc install required.
+rtmlib
+onnxruntime-gpu
