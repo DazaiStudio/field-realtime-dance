@@ -12,22 +12,28 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 
 
 def _mp33_to_h36m17(lms) -> np.ndarray:
+    """Map MediaPipe 33 world landmarks to the standard H36M-17 layout
+    expected by DanceMetricsEngine/constants.py.
+
+    H36M-17: 0 pelvis, 1-3 right leg, 4-6 left leg, 7 spine, 8 thorax,
+    9 neck, 10 head, 11-13 left arm (shoulder/elbow/wrist),
+    14-16 right arm (shoulder/elbow/wrist)."""
     def g(i):
         return np.array([lms[i].x, lms[i].y, lms[i].z]) * 1000.0
     l_hip, r_hip = g(23), g(24)
     pelvis = (l_hip + r_hip) / 2
     l_sh, r_sh = g(11), g(12)
-    neck = (l_sh + r_sh) / 2
-    spine = (pelvis + neck) / 2
+    thorax = (l_sh + r_sh) / 2
     head = g(0)
+    spine = (pelvis + thorax) / 2
+    neck = (thorax + head) / 2
     j = np.zeros((17, 3))
     j[0] = pelvis
     j[1] = r_hip;  j[2] = g(26); j[3] = g(28)
     j[4] = l_hip;  j[5] = g(25); j[6] = g(27)
-    j[7] = spine;  j[8] = neck;  j[9] = head
-    j[10] = l_sh;  j[11] = g(13); j[12] = g(15)
-    j[13] = r_sh;  j[14] = g(14); j[15] = g(16)
-    j[16] = neck
+    j[7] = spine;  j[8] = thorax; j[9] = neck; j[10] = head
+    j[11] = l_sh;  j[12] = g(13); j[13] = g(15)
+    j[14] = r_sh;  j[15] = g(14); j[16] = g(16)
     return j
 
 
