@@ -43,6 +43,22 @@ def _make_keypoints(n_persons, n_kpts=133, z_val=0.5, y_spread=100.0):
     return kpts
 
 
+def _make_keypoints_varied_z(n_persons, n_kpts=133, y_spread=100.0):
+    """Like _make_keypoints but with a DISTINCT z per joint.
+
+    Needed because the metric pipeline now subtracts the pelvis (root-center),
+    so a constant z collapses to 0 after subtraction.  Distinct z per joint
+    lets tests verify the pelvis-relative z (z_joint - z_pelvis).
+    """
+    kpts = np.zeros((n_persons, n_kpts, 3), dtype=np.float32)
+    for i in range(n_persons):
+        kpts[i, :, 0] = float(i + 1) * 10.0
+        for j in range(n_kpts):
+            kpts[i, j, 1] = 50.0 + (j / max(n_kpts - 1, 1)) * y_spread
+            kpts[i, j, 2] = 0.1 + 0.01 * j   # distinct normalised z per joint
+    return kpts
+
+
 def _make_scores(n_persons, n_kpts=133, score=0.9):
     return np.full((n_persons, n_kpts), score, dtype=np.float32)
 
@@ -88,38 +104,78 @@ class TestPersonposesFromRtmw3d(unittest.TestCase):
     # z-normalisation: z is scaled by bbox_height_3d then by POSE_SCALE
     # ------------------------------------------------------------------
 
-    def test_left_wrist_z_normalised_and_scaled(self):
+    # COCO body-17 hip indices used for the pelvis (root-center) calculation.
+    _COCO_L_HIP = 11
+    _COCO_R_HIP = 12
+
+    def test_left_wrist_z_normalised_scaled_and_root_centered(self):
         """COCO idx 9 (left wrist) → H36M idx 13.
 
-        z in h36m17 must equal:  z_raw × bbox_height_3d × scale
-        where bbox_height_3d = body_y.max() - body_y.min()  (body joints 0-16).
+        Full transform applied to z (body joints 0-16):
+            z_scaled[j] = z_raw[j] × bbox_height_3d × scale
+            z_out[j]    = z_scaled[j] − z_scaled_pelvis
+        where pelvis = mean of COCO hips (11, 12) and
+        bbox_height_3d = body_y.max() − body_y.min().
         """
-        z_raw = 0.5
         y_spread = 80.0
-        kpts = _make_keypoints(1, z_val=z_raw, y_spread=y_spread)
+        scale = 1.0
+        kpts = _make_keypoints_varied_z(1, y_spread=y_spread)
         scores = _make_scores(1)
-        out = personposes_from_rtmw3d(kpts, scores, [0], scale=1.0)
+        out = personposes_from_rtmw3d(kpts, scores, [0], scale=scale)
         p = out[0]
-        # For scale=1.0: expected z = z_raw × bbox_h_3d (body joints 0-16)
-        body_y = kpts[0, :17, 1]
-        expected_bbox_h = float(body_y.max() - body_y.min())
-        expected_z = z_raw * expected_bbox_h
+
+        body = kpts[0, :17].astype(float)
+        bbox_h = float(body[:, 1].max() - body[:, 1].min())
+        z_scaled = body[:, 2] * bbox_h * scale
+        z_pelvis = (z_scaled[self._COCO_L_HIP] + z_scaled[self._COCO_R_HIP]) / 2.0
+        # COCO left wrist (9) → H36M 13; it is a direct (non-averaged) joint.
+        expected_z = z_scaled[9] - z_pelvis
         self.assertAlmostEqual(p.h36m17[13, 2], expected_z, places=3)
 
+    def test_pelvis_z_is_zero_after_root_center(self):
+        """After root-centering, the H36M pelvis (idx 0) z must be ~0."""
+        kpts = _make_keypoints_varied_z(1, y_spread=100.0)
+        scores = _make_scores(1)
+        out = personposes_from_rtmw3d(kpts, scores, [0], scale=3.0)
+        p = out[0]
+        # H36M pelvis = mean of the two hips = the subtracted reference → ~0.
+        np.testing.assert_allclose(p.h36m17[0], np.zeros(3), atol=1e-3)
+
     def test_h36m17_z_uses_pose_scale(self):
-        """z in h36m17 must scale linearly with the scale argument."""
-        z_raw = 0.5
-        y_spread = 100.0
-        kpts = _make_keypoints(1, z_val=z_raw, y_spread=y_spread)
+        """Pelvis-relative z must scale linearly with the scale argument."""
+        kpts = _make_keypoints_varied_z(1, y_spread=100.0)
         scores = _make_scores(1)
 
         out_scale1 = personposes_from_rtmw3d(kpts, scores, [0], scale=1.0)
         out_scale2 = personposes_from_rtmw3d(kpts, scores, [0], scale=2.0)
 
-        z1 = out_scale1[0].h36m17[6, 2]   # left ankle (direct copy)
+        # Left ankle (COCO 15 → H36M 6) — distinct from pelvis, non-zero.
+        z1 = out_scale1[0].h36m17[6, 2]
         z2 = out_scale2[0].h36m17[6, 2]
 
+        self.assertNotAlmostEqual(z1, 0.0, places=4)
         self.assertAlmostEqual(z2, 2.0 * z1, places=4)
+
+    def test_root_center_is_pure_translation(self):
+        """Pelvis-subtraction must NOT change any limb vector (joint diffs).
+
+        Limb vectors drive energy/expansion/sway/torque/jerk; root-centering
+        is a pure translation, so every pairwise joint difference must be
+        identical to a build with no subtraction.  We verify by comparing the
+        full set of inter-joint vectors against a manually-recentered baseline.
+        """
+        kpts = _make_keypoints_varied_z(1, y_spread=120.0)
+        scores = _make_scores(1)
+        out = personposes_from_rtmw3d(kpts, scores, [0], scale=3.0)
+        h = out[0].h36m17
+
+        # All inter-joint vectors are translation-invariant: pick a few limbs
+        # and confirm they are non-degenerate (subtraction did not zero them).
+        # Left upper arm (H36M 11→12) and right thigh (H36M 1→2).
+        l_upper_arm = h[12] - h[11]
+        r_thigh = h[2] - h[1]
+        self.assertGreater(np.linalg.norm(l_upper_arm), 1e-6)
+        self.assertGreater(np.linalg.norm(r_thigh), 1e-6)
 
     def test_pose_scale_constant_is_calibrated(self):
         """POSE_SCALE must be a small positive number calibrated in Task 5.

@@ -49,28 +49,42 @@ Two-step fix implemented in personposes_from_rtmw3d():
     Chosen so convex-hull expansion matches MediaPipe numerically.
     Expansion scales as SCALE³; at 3.0 → expansion ≈ 0.97 vs MediaPipe 0.94.
 
+  Step 3 (root-center, added in review fix):
+    body3d -= pelvis,  pelvis = (left_hip + right_hip)/2  (COCO 11,12)
+    MediaPipe world landmarks already use the hip center as the per-frame
+    origin; RTMPose3D gives absolute coords.  Subtracting the pelvis matches
+    the conventions so the height metric (-com[1]/1000) becomes comparable.
+    Pure translation — energy/expansion/sway/torque/jerk are UNCHANGED.
+
 Chosen POSE_SCALE: 3.0
   Expansion (scale³-dependent):  RTMPose3D 0.97 ≈ MediaPipe 0.94  ✓
   Sway (scale-dependent):        RTMPose3D 0.13 vs MediaPipe 0.34  (same order)
-  Height sign mismatch:          RTMPose3D is negative (absolute y, not root-relative)
-  Energy residual gap (7×):      intrinsic detector jitter, not fixable with scale
+  Height (after Step 3):         positive on clean frames (+0.07), matching
+                                 MediaPipe's +0.19 sign/order; mean dragged
+                                 negative by jittery glitch-clip mis-detections
+  Energy residual gap (7×):      intrinsic detector jitter → phase-2 smoothing
 
 Before/After calibration (300-frame clip, single dancer, mean / median / p95):
-  Metric          MediaPipe          RTMPose3D-BEFORE     RTMPose3D-AFTER
+  Metric          MediaPipe          RTMPose3D-BEFORE     RTMPose3D-AFTER (with Step-3 pelvis-rel)
   energy          53.0 /  19.9 / 228.6    2922 (1 frame)   363.2 / 199.1 / 1269.3
-  expansion        0.94/   0.90/   1.34   0.0003 (bad)       0.97/   1.22/   1.57
-  height           0.10/   0.12/   0.17  -0.19  (bad)       -0.29/  -0.21/  -0.11 [*]
-  sway             0.34/   0.21/   0.83   0.005  (bad)       0.13/   0.06/   0.38
+  expansion        0.94/   0.90/   1.34   0.0003 (bad)       0.97/   1.22/   1.56
+  height           0.10/   0.12/   0.17  -0.19  (bad)       -0.15/  -0.21/  +0.02 [*]
+  sway             0.34/   0.21/   0.83   0.005  (bad)       0.13/   0.06/   0.44
   torque          80.8 /  60.9 / 195.2   (no data)         206.4 / 135.7 / 668.4
   sync_velocity    0.59/   0.59/   0.97   0.65 (1 frame)     0.36/   0.21/   0.98
-  curvature        0.07/   0.03/   0.27  (no data)           0.55/   0.09/   2.50
+  curvature        0.07/   0.03/   0.27  (no data)           0.62/   0.07/   2.53
   jerk        78993298 /22100683/...     (no data)      361246258/179875141/...  [**]
   sync_corr        0.23/   0.21/   0.61  (no data)           (varies by clip)
 
-  [*] Height is negative because RTMPose3D uses absolute model-crop-pixel y
-      (y=0 at top, increasing downward). MediaPipe uses root-relative world
-      coords (pelvis=origin). The engine's -com[1]/1000 gives opposite sign.
-      Not fixable with scale; would need pelvis-subtraction in the backend.
+  Height before/after Step-3 pelvis-subtraction (mean / median / p95):
+      WITHOUT pelvis-subtraction:  -0.29 / -0.21 / -0.11  (absolute coords)
+      WITH    pelvis-subtraction:  -0.15 / -0.21 / +0.02  (root-relative)
+  [*] After pelvis-subtraction, CLEANLY detected frames give POSITIVE height
+      (~+0.07, matching MediaPipe's +0.19 sign/order).  The negative mean is
+      dragged down by noisy frames where RTMPose3D mis-detects the head BELOW
+      the pelvis on this unusual "glitch" clip.  energy/expansion/sway/torque/
+      jerk are IDENTICAL before/after Step 3, confirming the pure-translation
+      property.  Residual jitter is the phase-2 One-Euro smoothing concern.
   [**] Jerk values are very large in both backends (it's a 2nd derivative);
        the ratio remains comparable (~5× rather than orders of magnitude).
 """

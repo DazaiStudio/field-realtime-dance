@@ -17,8 +17,11 @@ PoseTracker return signature (rtmlib 0.0.15, tracking=True, Wholebody3d):
     - keypoints:      (N, 133, 3) float32 — 3D coords in model-input pixel space
                       The first 17 joints are COCO-17 body order WITH z.
                       x, y: pixel coords in the resized model-input crop (~288×384).
-                      z:    root-relative normalised depth, scaled by bbox-height
-                            in model-input space, range approximately [-2.17, 2.17].
+                      z:    root-relative normalised depth, normalised by bbox-height
+                            in model-input space.  In principle the range is roughly
+                            [-2.17, 2.17] (RTMPose3D's z_range constant 2.1744869),
+                            but on the test clip the dancer occupies only a narrow
+                            depth band so the MEASURED z was ~[-0.7, -0.3].
     - scores:         (N, 133)    float32 — confidence per keypoint
     - keypoints_simcc:(N, 133, 3) float32 — SimCC intermediate (not used here)
     - keypoints_2d:   (N, 133, 2) float32 — pixel coords in the original video frame
@@ -29,7 +32,8 @@ PoseTracker return signature (rtmlib 0.0.15, tracking=True, Wholebody3d):
 Coordinate system (empirically measured, Task 5 calibration):
     3D x range (body 0-16): ~[100, 190]  — model-input crop pixel columns
     3D y range (body 0-16): ~[ 90, 280]  — model-input crop pixel rows
-    3D z range (body 0-16): ~[-0.7, -0.3]  — normalised depth (this clip)
+    3D z range (body 0-16): in principle ~[-2.17, 2.17] (z_range constant);
+                            MEASURED ~[-0.7, -0.3] on this clip (narrow depth band)
     2D x range:             ~[830, 1060] — full video frame pixels (1920-wide)
     2D y range:             ~[335, 880]  — full video frame pixels (1080-tall)
 
@@ -39,7 +43,7 @@ Units transform (Task 5 calibration):
     means the z axis is ~200× smaller in scale than x,y, skewing all 3D limb
     directions and corrupting angular metrics (energy, torque, jerk).
 
-    Two-step fix applied inside personposes_from_rtmw3d():
+    Three-step fix applied inside personposes_from_rtmw3d():
       Step 1 — Make z share the same unit as x,y:
           z_consistent = z_normalised × bbox_height_3d
           where bbox_height_3d = y_max − y_min of the 17 body keypoints
@@ -52,6 +56,15 @@ Units transform (Task 5 calibration):
           POSE_SCALE = 3.0  (calibrated against MediaPipe on a 300-frame
           dance clip — see Rationale below)
 
+      Step 3 — Root-center (pelvis-relative) to match MediaPipe's convention:
+          body3d = body3d − pelvis,  pelvis = (left_hip + right_hip)/2
+          MediaPipe world landmarks already use the hip center as the per-frame
+          origin; RTMPose3D gives absolute coords. Subtracting the pelvis makes
+          both backends use the same reference frame, which fixes the height
+          metric (engine's -com[1]/1000) so it is positive and comparable.
+          This is a pure translation: energy/expansion/sway/torque/jerk are
+          unchanged; only height (and curvature's reference) shift.
+
     Rationale for POSE_SCALE = 3.0:
         Expansion (convex hull volume of 17 joints) scales as SCALE³.
         At scale=3.0, RTMPose3D expansion mean≈0.97 ≈ MediaPipe 0.94.
@@ -59,22 +72,28 @@ Units transform (Task 5 calibration):
         order of magnitude (within 3×).
         Energy is angular/scale-invariant; its residual gap (363 vs 53)
         reflects intrinsic jitter in the RTMPose3D tracker vs MediaPipe's
-        temporally-smoothed world landmarks — not fixable with scale.
-        Height has a sign/origin mismatch: RTMPose3D uses absolute model-
-        input pixel y (top→bottom), while MediaPipe world landmarks are
-        root-relative (pelvis=origin). The engine's -com[1]/1000 formula
-        yields negative height for RTMPose3D. Scale cannot fix this.
+        temporally-smoothed world landmarks — not fixable with scale
+        (deferred to phase-2 One-Euro smoothing).
 
     Before/After calibration table (300-frame clip, single dancer):
         Metric          MediaPipe (mean/med/p95)  RTMPose3D-before   RTMPose3D-after (mean/med/p95)
         energy          53.0 / 19.9 / 228.6       2922 (1 frame)     363.2 / 199.1 / 1269.3
-        expansion        0.94/  0.90/   1.34        0.0003 (bad)       0.97/  1.22/   1.57
-        height           0.10/  0.12/   0.17       -0.19 (bad)        -0.29/ -0.21/  -0.11
-        sway             0.34/  0.21/   0.83        0.005 (bad)        0.13/  0.06/   0.38
+        expansion        0.94/  0.90/   1.34        0.0003 (bad)       0.97/  1.22/   1.56
+        height           0.10/  0.12/   0.17       -0.19 (bad)       -0.15/ -0.21/  +0.02  [pelvis-rel]
+        sway             0.34/  0.21/   0.83        0.005 (bad)        0.13/  0.06/   0.44
         torque          80.8 / 60.9 / 195.2        (no data)         206.4 /135.7 / 668.4
         sync_velocity    0.59/  0.59/   0.97        0.65 (1 frame)     0.36/  0.21/   0.98
-        curvature        0.07/  0.03/   0.27        (no data)          0.55/  0.09/   2.50
-        (Note: "before" had only 1 frame of data due to 4-tuple vs 2-tuple bug)
+        curvature        0.07/  0.03/   0.27        (no data)          0.62/  0.07/   2.53
+
+      Height: pelvis-subtraction (Step 3) brought height from absolute coords
+      (no_pelvis-rel mean ≈ -0.29) to pelvis-relative (mean ≈ -0.15). On CLEANLY
+      detected frames height is correctly POSITIVE (+0.07 typical, matching
+      MediaPipe's +0.19 sign/order); the negative mean/median is dragged down
+      by noisy frames where RTMPose3D mis-detects the head BELOW the pelvis
+      (this "glitch" clip has unusual movement). After phase-2 One-Euro
+      smoothing these jitter frames should resolve. energy/expansion/sway/
+      torque/jerk are IDENTICAL before/after Step 3 — confirming pure translation.
+        (Note: "before" had only 1 frame of data due to 4-tuple vs 2-tuple bug.)
 
 bbox and kpts_2d:
     The visual overlay (bbox, kpts_2d) must use PIXEL coords from
@@ -124,7 +143,7 @@ def personposes_from_rtmw3d(
         are used as a fallback for bbox/kpts_2d.
     scale:
         Uniform multiplier applied to all three axes after z-normalisation.
-        Defaults to POSE_SCALE (module-level constant, 5.5).
+        Defaults to POSE_SCALE (module-level constant, 3.0).
 
     Returns
     -------
@@ -132,7 +151,9 @@ def personposes_from_rtmw3d(
 
     Units transform applied here (see module docstring):
         z_consistent = z_raw × bbox_height_3d    (makes z same unit as x,y)
-        h36m17 = coco17_to_h36m17_3d(body3d × scale)
+        body3d      = body3d × scale             (overall magnitude)
+        body3d      = body3d − pelvis            (root-center, matches MediaPipe)
+        h36m17      = coco17_to_h36m17_3d(body3d)
     """
     if len(track_ids) == 0:
         return []
@@ -153,6 +174,10 @@ def personposes_from_rtmw3d(
         # --- Extract COCO-17 body keypoints (first 17) with z -----------------
         body_3d = kpts[i, :17, :].copy()    # (17, 3): x_px, y_px, z_norm
 
+        # Preserve the original crop-pixel x,y for the overlay fallback below
+        # (the metric pipeline mutates body_3d in-place: scale + pelvis-shift).
+        body_xy_crop = kpts[i, :17, :2].copy()   # (17, 2) model-input crop px
+
         # Step 1: Convert z from normalised depth → model-input-pixel units.
         #   z_norm is scaled by the body's bbox height in model-input space,
         #   so multiplying by that height restores z to the same px unit as x,y.
@@ -166,6 +191,20 @@ def personposes_from_rtmw3d(
         # Step 2: Uniform scale → mm-equivalent range (matches MediaPipe ×1000).
         body_3d *= scale
 
+        # Step 3: Root-center (pelvis-relative) to match the MediaPipe convention.
+        #   MediaPipe world landmarks have their origin at the hip center
+        #   (pelvis) every frame.  RTMPose3D gives ABSOLUTE coords, so the
+        #   engine's height = -com[1] metric came out negative/incomparable.
+        #   Subtracting the pelvis makes both backends use the same reference:
+        #   pelvis sits at the origin, joints above it have negative image-y,
+        #   so the mass-weighted CoM (spine-heavy) sits slightly above the
+        #   pelvis → height = -com[1] becomes slightly positive, matching
+        #   MediaPipe's ~+0.10.  Pure translation: energy/expansion/sway/
+        #   torque/jerk are unchanged; only height/curvature reference shifts.
+        #   COCO body-17 indices 11 (left hip) and 12 (right hip).
+        pelvis = (body_3d[11] + body_3d[12]) / 2.0
+        body_3d = body_3d - pelvis   # all 17 joints now pelvis-relative
+
         h36m = coco17_to_h36m17_3d(body_3d)   # (17, 3)
 
         # --- bbox and kpts_2d from pixel-space 2D keypoints ------------------
@@ -173,8 +212,9 @@ def personposes_from_rtmw3d(
         if kpts2d is not None and i < kpts2d.shape[0]:
             body_2d = kpts2d[i, :17, :]    # (17, 2) — full-frame pixels
         else:
-            # Fallback: use 3D x,y (model-input px, less accurate for overlay)
-            body_2d = body_3d[:, :2] / scale   # undo scale to get crop px
+            # Fallback: original crop-pixel x,y (model-input px, less accurate
+            # for overlay than the back-projected keypoints_2d, but valid).
+            body_2d = body_xy_crop
 
         x1 = float(body_2d[:, 0].min())
         y1 = float(body_2d[:, 1].min())
