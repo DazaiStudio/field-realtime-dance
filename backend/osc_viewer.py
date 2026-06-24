@@ -647,6 +647,22 @@ async def apply_osc_config(
     return {"status": "applied", **state_payload()}
 
 
+@app.post("/api/smoothing")
+async def apply_smoothing(
+    smooth_enabled: bool = Form(True),
+    smooth_min_cutoff: float = Form(1.5),
+):
+    """Live-tune the One-Euro joint smoothing WITHOUT restarting the stream.
+    Unlike /api/apply this does NOT bump session_id or reset state, so dragging
+    the slider does not kill the video feed."""
+    source_state["smooth_enabled"] = bool(smooth_enabled)
+    source_state["smooth_min_cutoff"] = float(smooth_min_cutoff)
+    if pose_engine is not None:
+        pose_engine.configure_smoothing(enabled=source_state["smooth_enabled"],
+                                        min_cutoff=source_state["smooth_min_cutoff"])
+    return {"status": "applied"}
+
+
 @app.post("/api/apply")
 async def apply_input(
     source: str = Form("live"),
@@ -1704,13 +1720,18 @@ VIEWER_HTML = """
     });
     const smoothCutoffEl = document.getElementById('smoothCutoff');
     const smoothCutoffValueEl = document.getElementById('smoothCutoffValue');
+    async function applySmoothing() {
+      // Lightweight live-tune: does NOT restart the stream (no session bump).
+      const data = new FormData();
+      data.set('smooth_enabled', document.getElementById('smoothEnabled').checked ? 'true' : 'false');
+      data.set('smooth_min_cutoff', smoothCutoffEl.value);
+      try { await fetch('/api/smoothing', { method: 'POST', body: data }); } catch (e) {}
+    }
     smoothCutoffEl.addEventListener('input', () => {
       smoothCutoffValueEl.textContent = smoothCutoffEl.value;
     });
-    smoothCutoffEl.addEventListener('change', () => { if (isDetecting) applySettings(true); });
-    document.getElementById('smoothEnabled').addEventListener('change', () => {
-      if (isDetecting) applySettings(true);
-    });
+    smoothCutoffEl.addEventListener('change', applySmoothing);
+    document.getElementById('smoothEnabled').addEventListener('change', applySmoothing);
 
     function normalizePrefix(prefix) {
       let value = (prefix || '/field').trim().replace(/\\/+$/, '');
