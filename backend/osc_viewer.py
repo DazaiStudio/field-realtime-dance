@@ -18,7 +18,7 @@ import uvicorn
 
 from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
-from pose_engine import PoseEngine
+from pose_engine import PoseEngine, VALID_BACKENDS
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -66,6 +66,9 @@ source_state = {
     "session_id": 0,
     "osc_metrics": list(METRIC_NAMES),
     "detect_enabled": False,
+    "pose_backend": os.getenv("FIELD_POSE_BACKEND", "mediapipe"),
+    "smooth_enabled": True,
+    "smooth_min_cutoff": 1.5,
     "applied_at": time.time(),
 }
 
@@ -101,9 +104,32 @@ app = FastAPI(lifespan=lifespan)
 
 
 def get_pose_engine() -> PoseEngine:
+    """Return the singleton PoseEngine, (re)building it when the selected
+    backend changes. Backend swaps happen here (on stream (re)start) rather
+    than inside /api/apply, so the previous stream loop has already exited and
+    there is no mid-frame race. Smoothing config is cheap and applied live."""
     global pose_engine
+    desired = source_state.get("pose_backend", "mediapipe")
+    if desired not in VALID_BACKENDS:
+        desired = "mediapipe"
+    smooth_enabled = bool(source_state.get("smooth_enabled", True))
+    min_cutoff = float(source_state.get("smooth_min_cutoff", 1.5))
+
     if pose_engine is None:
-        pose_engine = PoseEngine(model_path=str(pose_model_path))
+        pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
+                                 smoothing_enabled=smooth_enabled,
+                                 smooth_min_cutoff=min_cutoff)
+    elif pose_engine.backend_name != desired:
+        old = pose_engine
+        pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
+                                 smoothing_enabled=smooth_enabled,
+                                 smooth_min_cutoff=min_cutoff)
+        try:
+            old.close()
+        except Exception:
+            pass
+    else:
+        pose_engine.configure_smoothing(enabled=smooth_enabled, min_cutoff=min_cutoff)
     return pose_engine
 
 
@@ -632,6 +658,9 @@ async def apply_input(
     osc_alpha: float = Form(0.25),
     osc_namespace: str = Form("/field"),
     performance: str = Form(DEFAULT_PERFORMANCE),
+    pose_backend: str = Form("mediapipe"),
+    smooth_enabled: bool = Form(True),
+    smooth_min_cutoff: float = Form(1.5),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -645,6 +674,16 @@ async def apply_input(
         alpha=osc_alpha,
         namespace=osc_namespace,
     )
+
+    source_state["pose_backend"] = pose_backend if pose_backend in VALID_BACKENDS else "mediapipe"
+    source_state["smooth_enabled"] = bool(smooth_enabled)
+    source_state["smooth_min_cutoff"] = float(smooth_min_cutoff)
+    # Live-apply smoothing to the running engine (cheap). A backend SWAP is
+    # deferred to get_pose_engine() on the next stream start, so it never races
+    # the still-running stream loop.
+    if pose_engine is not None and pose_engine.backend_name == source_state["pose_backend"]:
+        pose_engine.configure_smoothing(enabled=source_state["smooth_enabled"],
+                                        min_cutoff=source_state["smooth_min_cutoff"])
 
     source_state["session_id"] += 1
     source_state["detect_enabled"] = bool(detect_enabled)
@@ -1260,6 +1299,12 @@ VIEWER_HTML = """
                   <div id="dropZone" class="drop-zone">Click to upload video</div>
                 </label>
               </div>
+              <label class="model-row">Detection model
+                <select id="poseBackend" name="pose_backend">
+                  <option value="mediapipe">MediaPipe (default &middot; any GPU)</option>
+                  <option value="rtmpose3d">RTMPose3D (NVIDIA GPU)</option>
+                </select>
+              </label>
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
             </div>
           </div>
@@ -1338,6 +1383,11 @@ VIEWER_HTML = """
             <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="0.25" />
             <span class="range-hint">lower = smoother &middot; 1 = off</span>
           </label>
+          <label class="osc-toggle-row"><input id="smoothEnabled" name="smooth_enabled" type="checkbox" checked /> Smooth joints (One-Euro)</label>
+          <label><span class="range-label-row"><span class="label-row">Joint smoothing <span class="info-dot" title="One-Euro filter on the skeleton before metrics. Lower = smoother (more lag); higher = more responsive. Cuts jitter in torque/jerk at the source.">?</span></span><span id="smoothCutoffValue" class="range-value">1.5</span></span>
+            <input id="smoothCutoff" name="smooth_min_cutoff" type="range" min="0.3" max="6" step="0.1" value="1.5" />
+            <span class="range-hint">lower = smoother</span>
+          </label>
         </div>
         <div id="metrics" class="metric-grid"></div>
         <div id="culturePanel" class="culture-panel hidden">
@@ -1413,6 +1463,7 @@ VIEWER_HTML = """
       data.set('loop', 'true');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('smooth_enabled', document.getElementById('smoothEnabled').checked ? 'true' : 'false');
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -1638,6 +1689,24 @@ VIEWER_HTML = """
         streamImage.removeAttribute('src');
         showPreview();
       }
+    });
+
+    document.getElementById('poseBackend').addEventListener('change', async () => {
+      inputDirty = true;
+      // Backend swap rebuilds the engine on stream restart; re-apply + restart.
+      if (isDetecting) {
+        const payload = await applySettings(true);
+        if (payload && payload.status === 'applied') showDetectionStream();
+      }
+    });
+    const smoothCutoffEl = document.getElementById('smoothCutoff');
+    const smoothCutoffValueEl = document.getElementById('smoothCutoffValue');
+    smoothCutoffEl.addEventListener('input', () => {
+      smoothCutoffValueEl.textContent = smoothCutoffEl.value;
+    });
+    smoothCutoffEl.addEventListener('change', () => { if (isDetecting) applySettings(true); });
+    document.getElementById('smoothEnabled').addEventListener('change', () => {
+      if (isDetecting) applySettings(true);
     });
 
     function normalizePrefix(prefix) {
