@@ -27,7 +27,10 @@ PoseTracker return signature (rtmlib 0.0.15, tracking=True, Wholebody3d):
     - keypoints_2d:   (N, 133, 2) float32 — pixel coords in the original video frame
                       (back-projected from model-input space to full resolution).
 
-  Track IDs: `tracker.track_ids_last_frame` after each call holds integer IDs.
+  Track IDs: rtmlib's `tracker.track_ids_last_frame` are unreliable (they
+  increment almost every frame), so this backend ignores them and assigns its
+  own stable ids with CentroidTracker (hip-centroid re-id), like the MediaPipe
+  backend. Otherwise SlotBinder would thrash and wipe per-slot metric history.
 
 Coordinate system (empirically measured, Task 5 calibration):
     3D x range (body 0-16): ~[100, 190]  — model-input crop pixel columns
@@ -102,15 +105,37 @@ bbox and kpts_2d:
     On tracking frames (2-tuple), the class caches the last keypoints_2d.
 """
 
+import os
+
 import numpy as np
 
 from pose_backend import PersonPose
 from keypoint_mapping import coco17_to_h36m17_3d
+from centroid_tracker import CentroidTracker
 
 # Uniform scale applied to all 3 axes AFTER the z-normalisation step.
 # See module docstring for full rationale and calibration table.
 # TASK 5 result: calibrated to 3.0 (down from placeholder 1000.0).
 POSE_SCALE: float = 3.0
+
+
+def _register_torch_cuda_dlls() -> None:
+    """Make PyTorch's bundled CUDA/cuDNN DLLs discoverable so onnxruntime's
+    CUDAExecutionProvider can load (it needs cudnn64_9.dll, cublas, cudart, …).
+
+    PyTorch is pulled in by ultralytics and ships these DLLs under torch/lib;
+    without this, a plain launch fails with "cudnn64_9.dll is missing" and
+    onnxruntime silently falls back to CPU. Best-effort and a no-op off Windows
+    or when torch is unavailable (CPU-only machines still work)."""
+    if not hasattr(os, "add_dll_directory"):
+        return  # not Windows
+    try:
+        import torch
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(torch_lib):
+            os.add_dll_directory(torch_lib)
+    except Exception:
+        pass  # best-effort; CPU fallback still works
 
 
 def personposes_from_rtmw3d(
@@ -261,6 +286,11 @@ class RTMPose3DBackend:
         det_frequency: int = 10,
         mode: str = "balanced",
     ):
+        # Put PyTorch's bundled CUDA/cuDNN DLLs on the search path BEFORE rtmlib
+        # creates the onnxruntime session, else the CUDA EP can't load and it
+        # silently falls back to CPU.
+        _register_torch_cuda_dlls()
+
         # Lazy import keeps the module importable without rtmlib / GPU.
         from rtmlib import PoseTracker, Wholebody3d  # noqa: PLC0415
 
@@ -275,6 +305,8 @@ class RTMPose3DBackend:
         )
         # Cache keypoints_2d from detection frames to reuse on tracking frames.
         self._last_kpts2d: "np.ndarray | None" = None
+        # Stable ids: rtmlib's own ids churn, so re-id from hip centroids.
+        self._id_tracker = CentroidTracker()
 
     def estimate(self, frame, timestamp_ms: float) -> "list[PersonPose]":
         """Run pose estimation on one frame and return PersonPose list.
@@ -294,13 +326,28 @@ class RTMPose3DBackend:
         if len(result) >= 4:
             self._last_kpts2d = result[3]   # (N, 133, 2) full-frame pixels
 
-        # Track IDs are stored on the tracker after each call.
-        track_ids: list[int] = list(self._tracker.track_ids_last_frame)
+        kp = np.asarray(keypoints, dtype=float)
+        if kp.ndim != 3 or kp.shape[0] == 0:
+            return []
+        n = kp.shape[0]
+
+        # Stable per-person ids via CentroidTracker. rtmlib's track ids are
+        # unreliable (increment almost every frame); we re-id from the hip
+        # centroid so a stationary dancer keeps one id -> one SlotBinder slot,
+        # preserving the per-slot metric history that torque/jerk/curvature
+        # depend on. COCO body hips are indices 11 (left) and 12 (right).
+        if self._last_kpts2d is not None and np.asarray(self._last_kpts2d).shape[0] == n:
+            hips = np.asarray(self._last_kpts2d, dtype=float)[:, (11, 12), :]
+        else:
+            hips = kp[:, (11, 12), :2]   # first-frame fallback: crop-space px
+        mid = hips.mean(axis=1)          # (n, 2) hip-centroid per person
+        centroids = [(float(p[0]), float(p[1])) for p in mid]
+        ids = self._id_tracker.update(centroids)
 
         return personposes_from_rtmw3d(
             keypoints,
             scores,
-            track_ids,
+            ids,
             keypoints_2d=self._last_kpts2d,
         )
 
