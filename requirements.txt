@@ -14,3 +14,14 @@ python-osc>=1.8.0
 
 # Windows-only camera device names through DirectShow.
 pygrabber>=0.2; platform_system == "Windows"
+
+# --- Optional: RTMPose3D backend (the "RTMPose3D" dropdown option) ----------
+# Monocular 3D via rtmlib's RTMW3D-x. The default MediaPipe backend needs none
+# of this and runs everywhere (incl. Apple Silicon). RTMPose3D is real-time
+# only on an NVIDIA GPU; on machines without CUDA the viewer auto-falls back to
+# MediaPipe. To enable it:
+#   pip install rtmlib onnxruntime          # CPU / Apple Silicon (not real-time)
+#   pip install rtmlib onnxruntime-gpu      # NVIDIA GPU (real-time)
+# For onnxruntime-gpu the CUDA 12 + cuDNN 9 runtime DLLs must be importable;
+# installing PyTorch (which bundles them) satisfies this and the backend adds
+# torch/lib to the DLL search path automatically. See HANDOFF.md.

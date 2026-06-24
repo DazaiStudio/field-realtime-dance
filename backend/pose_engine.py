@@ -26,8 +26,14 @@ class PoseEngine:
     # --- source / backend management ---------------------------------------
     def _make_source(self, backend: str):
         if backend == "rtmpose3d":
-            from pose_sources import RTMPose3DPoseSource
-            return RTMPose3DPoseSource()
+            try:
+                from pose_sources import RTMPose3DPoseSource
+                return RTMPose3DPoseSource()
+            except Exception as exc:
+                # rtmlib/onnxruntime missing or no CUDA (e.g. on a Mac) -> degrade
+                # to MediaPipe instead of crashing the stream.
+                print(f"[PoseEngine] RTMPose3D unavailable ({exc}); falling back to MediaPipe.")
+                self.backend_name = "mediapipe"
         from pose_sources import MediaPipePoseSource
         return MediaPipePoseSource(self.model_path)
 

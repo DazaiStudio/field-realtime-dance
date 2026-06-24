@@ -130,6 +130,9 @@ def get_pose_engine() -> PoseEngine:
             pass
     else:
         pose_engine.configure_smoothing(enabled=smooth_enabled, min_cutoff=min_cutoff)
+    # Reflect the backend that actually loaded (it may have fallen back, e.g. to
+    # MediaPipe on a machine without CUDA), so we don't retry-build every frame.
+    source_state["pose_backend"] = pose_engine.backend_name
     return pose_engine
 
 
