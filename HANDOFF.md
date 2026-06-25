@@ -76,9 +76,15 @@ RTMPose3D is the Windows/NVIDIA path and is fully optional (lazy-imported).
   (× bbox height), apply a uniform `RTM_POSE_SCALE = 3.0`, then root-center on
   the pelvis to match MediaPipe's per-frame hip origin. Tuned so the 9 metrics
   land in MediaPipe's magnitude band.
-- **One-Euro vs the old OSC EMA.** The OSC-output EMA (alpha slider) still
-  exists and is orthogonal; One-Euro at the joint layer is the primary
-  jitter reducer (cleans positions before the derivative-heavy torque/jerk).
+- **Two smoothing stages (different jobs).** (1) **Joint layer** — One-Euro on
+  the skeleton before metrics (`one_euro.py`, global min_cutoff/beta, the
+  "Smooth joints" slider). This is the primary jitter reducer; cleans positions
+  before the derivative-heavy torque/jerk. (2) **Output layer** — per-metric EMA
+  on each of the 9 OSC channels (`osc_sender.py` `metric_alphas`, a "smooth"
+  slider on every metric card + the global alpha as fallback; live via
+  `/api/metric_smoothing`). Stage 1 = clean source; stage 2 = per-channel feel
+  for the OSC consumers (visuals/sound) since metrics differ wildly (jerk noisy
+  vs height slow).
 
 ## Pending / TODO
 

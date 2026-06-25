@@ -57,6 +57,9 @@ class OSCSender:
         self.alpha = self._validate_alpha(alpha)
         self.client = SimpleUDPClient(self.host, self.port)
         self._smoothed: Dict[str, float] = {}
+        # Per-metric output smoothing override; falls back to self.alpha (the
+        # global slider) for any metric without its own value. 1.0 = off.
+        self.metric_alphas: Dict[str, float] = {}
         self._peaks: Dict[str, float] = {}
         self._ranges: Dict[str, tuple] = {}
         self.last_prepared_metrics: Dict[str, float] = {}
@@ -108,6 +111,7 @@ class OSCSender:
             "namespace": self.namespace,
             "mode": self.mode,
             "alpha": self.alpha,
+            "metric_alphas": dict(self.metric_alphas),
             "last_sent_at": self.last_sent_at,
         }
 
@@ -175,7 +179,8 @@ class OSCSender:
         return _clamp((value - lo) / span)
 
     def _smooth(self, key: str, value: float) -> float:
-        if self.alpha >= 1.0:
+        alpha = self.metric_alphas.get(key, self.alpha)
+        if alpha >= 1.0:
             self._smoothed[key] = value
             return value
 
@@ -183,10 +188,17 @@ class OSCSender:
         if previous is None:
             smoothed = value
         else:
-            smoothed = (self.alpha * value) + ((1.0 - self.alpha) * previous)
+            smoothed = (alpha * value) + ((1.0 - alpha) * previous)
 
         self._smoothed[key] = smoothed
         return smoothed
+
+    def set_metric_alpha(self, name: str, alpha: float) -> None:
+        """Override the output smoothing for a single metric (per-channel).
+        Ignores unknown metric names; raises ValueError on an out-of-range alpha."""
+        if name not in METRIC_NAMES:
+            return
+        self.metric_alphas[name] = self._validate_alpha(alpha)
 
     def _send_message(self, address: str, value: object) -> None:
         try:

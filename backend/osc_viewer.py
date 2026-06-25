@@ -663,6 +663,17 @@ async def apply_smoothing(
     return {"status": "applied"}
 
 
+@app.post("/api/metric_smoothing")
+async def apply_metric_smoothing(metric: str = Form(...), alpha: float = Form(...)):
+    """Live per-metric OSC output smoothing (no stream restart). alpha in (0,1],
+    1 = off; falls back to the global smoothing for metrics left untouched."""
+    try:
+        osc_sender.set_metric_alpha(metric, alpha)
+    except ValueError:
+        return {"status": "error", "error": "alpha must be > 0 and <= 1"}
+    return {"status": "applied", "metric": metric, "alpha": float(alpha)}
+
+
 @app.post("/api/apply")
 async def apply_input(
     source: str = Form("live"),
@@ -1172,6 +1183,10 @@ VIEWER_HTML = """
     .metric-label { display: grid; gap: 3px; min-width: 0; }
     .name { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
     .metric-hint { color: #93887c; font-size: 12px; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .metric-smooth-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+    .metric-smooth-row .ms-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+    .metric-smooth-row input[type=range] { flex: 1; min-width: 0; }
+    .metric-smooth-row .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 32px; text-align: right; }
     .value {
       font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
       font-variant-numeric: tabular-nums;
@@ -1467,8 +1482,22 @@ VIEWER_HTML = """
         </div>
         <div class="value" id="v-${name}">0.00</div>
         <div class="bar" id="bar-${name}"><div class="fill" id="b-${name}"></div></div>
+        <div class="metric-smooth-row">
+          <span class="ms-label">smooth</span>
+          <input class="metric-smooth" type="range" min="0.02" max="1" step="0.01" value="0.25" title="Output smoothing for this metric (lower = smoother, 1 = off)" />
+          <span class="ms-val">0.25</span>
+        </div>
       `;
       metricsEl.appendChild(row);
+      const msInput = row.querySelector('.metric-smooth');
+      const msVal = row.querySelector('.ms-val');
+      msInput.addEventListener('input', () => { msVal.textContent = msInput.value; });
+      msInput.addEventListener('change', async () => {
+        const data = new FormData();
+        data.set('metric', name);
+        data.set('alpha', msInput.value);
+        try { await fetch('/api/metric_smoothing', { method: 'POST', body: data }); } catch (e) {}
+      });
 
       const ovRow = document.createElement('div');
       ovRow.className = 'ov-row';
