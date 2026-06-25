@@ -1553,7 +1553,7 @@ VIEWER_HTML = """
         </div>
         <div class="calib-panel" style="padding:6px 14px;">
           <button id="calibBtn" type="button" class="calib-btn">Calibrate (&#35430;&#38899;)</button>
-          <div id="calibInfo" class="calib-info hidden">Recording &mdash; do each ~3-5s while detecting: <b>freeze</b> &middot; <b>fast big moves</b> &middot; <b>extend &harr; curl up</b> &middot; <b>big circles (hands/feet)</b> &middot; <b>jump up &harr; crouch low</b> &middot; <b>lean far each way</b>. Then press stop.</div>
+          <div id="calibInfo" class="calib-info hidden">Recording &mdash; hold each ~4s while detecting: <b>1) small &amp; still</b> (curl up, crouch low, freeze) &middot; <b>2) big &amp; round</b> (reach/hop up tall, spread wide, big circles with hands &amp; feet, lean far each way) &middot; <b>3) fast &amp; sharp</b> (explosive bursts, sudden stops). Then press stop.</div>
           <div class="preset-row" style="display:flex; gap:6px; margin-top:6px; align-items:center;">
             <select id="presetSelect" style="flex:1; min-width:0;"><option value="">&mdash; preset &mdash;</option></select>
             <button id="presetSaveBtn" type="button" class="calib-btn" style="width:auto; padding:6px 10px;">Save as&hellip;</button>

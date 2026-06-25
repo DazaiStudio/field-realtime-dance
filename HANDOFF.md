@@ -94,7 +94,7 @@ RTMPose3D is the Windows/NVIDIA path and is fully optional (lazy-imported).
   dancer but NOT comparable across time, the reference peak drifts), `fixed`
   (0..1 from calibrated per-metric ranges — bounded AND comparable AND
   personalised). The **Calibrate ("試音")** button records a short routine
-  (rest / fast-big / extend↔curl / big circles / jump↔crouch / lean) and stores
+  (3 moves: 1 small&still / 2 big&round / 3 fast&sharp) and stores
   2nd/98th-percentile ranges per metric to `calibration_profile.json`
   (`calibration.py`), then switches to `fixed`. Endpoints
   `/api/calibrate/start` and `/api/calibrate/stop`. 7 unbounded metrics get
