@@ -98,7 +98,12 @@ RTMPose3D is the Windows/NVIDIA path and is fully optional (lazy-imported).
   2nd/98th-percentile ranges per metric to `calibration_profile.json`
   (`calibration.py`), then switches to `fixed`. Endpoints
   `/api/calibrate/start` and `/api/calibrate/stop`. 7 unbounded metrics get
-  ranges; sync_velocity/sync_correlation are already bounded.
+  ranges; sync_velocity/sync_correlation are already bounded. **Named presets**
+  (per dancer/venue) live in `calibration_presets.json` via
+  `/api/calibrate/{presets,save_preset,load_preset,delete_preset}` + a preset
+  dropdown in the viewer — calibrate once, recall later (no re-calibration). The
+  last unnamed calibration also auto-saves to `calibration_profile.json` and
+  auto-loads on startup.
 
 ## Pending / TODO
 

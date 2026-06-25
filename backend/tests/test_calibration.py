@@ -2,7 +2,9 @@ import sys, os, tempfile, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from calibration import CalibrationCollector, save_profile, load_profile
+from calibration import (
+    CalibrationCollector, save_profile, load_profile, save_presets, load_presets,
+)
 from osc_sender import OSCSender
 
 
@@ -40,6 +42,17 @@ class TestCalibrationCollector(unittest.TestCase):
 
     def test_load_missing_returns_empty(self):
         self.assertEqual(load_profile("/nope/does/not/exist.json"), {})
+
+    def test_presets_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "presets.json")
+            presets = {"Dancer A": {"energy": (1.0, 9.0)},
+                       "Dancer B": {"sway": (0.0, 0.5)}}
+            save_presets(p, presets)
+            loaded = load_presets(p)
+            self.assertEqual(loaded["Dancer A"]["energy"], (1.0, 9.0))
+            self.assertEqual(loaded["Dancer B"]["sway"], (0.0, 0.5))
+        self.assertEqual(load_presets("/no/such.json"), {})
 
 
 class TestFixedNormalize(unittest.TestCase):

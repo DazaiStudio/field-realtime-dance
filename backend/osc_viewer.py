@@ -18,7 +18,10 @@ import uvicorn
 
 from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
-from calibration import CalibrationCollector, RANGE_METRICS, load_profile, save_profile
+from calibration import (
+    CalibrationCollector, RANGE_METRICS, load_profile, save_profile,
+    load_presets, save_presets,
+)
 from pose_engine import PoseEngine, VALID_BACKENDS
 
 
@@ -49,6 +52,11 @@ _calib_profile = load_profile(CALIB_PROFILE_PATH)
 if _calib_profile:
     osc_sender.set_metric_ranges(_calib_profile)
     print(f"Loaded calibration profile: {sorted(_calib_profile)}")
+
+# Named calibration presets (multiple saved calibrations, e.g. per dancer/venue).
+PRESETS_PATH = REPO_ROOT / "calibration_presets.json"
+calib_presets = load_presets(PRESETS_PATH)
+active_preset = None
 # Optional: offline culture centroids enable the /field/morrisness output.
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 
@@ -732,6 +740,55 @@ async def calibrate_stop():
         "ranges": {k: list(v) for k, v in osc_sender.metric_ranges.items()},
         "counts": {m: calibration.count(m) for m in RANGE_METRICS},
     }
+
+
+@app.get("/api/calibrate/presets")
+async def calibrate_presets():
+    return {"presets": sorted(calib_presets.keys()), "active": active_preset}
+
+
+@app.post("/api/calibrate/save_preset")
+async def calibrate_save_preset(name: str = Form(...)):
+    global active_preset
+    name = name.strip()
+    if not name:
+        return {"status": "error", "error": "name required"}
+    if not osc_sender.metric_ranges:
+        return {"status": "error", "error": "calibrate first (no ranges yet)"}
+    calib_presets[name] = dict(osc_sender.metric_ranges)
+    try:
+        save_presets(PRESETS_PATH, calib_presets)
+    except Exception as exc:
+        print(f"preset save failed: {exc}")
+    active_preset = name
+    return {"status": "saved", "name": name, "presets": sorted(calib_presets.keys())}
+
+
+@app.post("/api/calibrate/load_preset")
+async def calibrate_load_preset(name: str = Form(...)):
+    global active_preset
+    rng = calib_presets.get(name)
+    if not rng:
+        return {"status": "error", "error": "unknown preset"}
+    osc_sender.clear_metric_ranges()
+    osc_sender.set_metric_ranges(rng)
+    osc_sender.configure(mode="fixed")
+    active_preset = name
+    return {"status": "applied", "name": name, "mode": osc_sender.mode,
+            "ranges": {k: list(v) for k, v in osc_sender.metric_ranges.items()}}
+
+
+@app.post("/api/calibrate/delete_preset")
+async def calibrate_delete_preset(name: str = Form(...)):
+    global active_preset
+    calib_presets.pop(name, None)
+    if active_preset == name:
+        active_preset = None
+    try:
+        save_presets(PRESETS_PATH, calib_presets)
+    except Exception as exc:
+        print(f"preset delete-save failed: {exc}")
+    return {"status": "deleted", "presets": sorted(calib_presets.keys())}
 
 
 @app.post("/api/apply")
@@ -1497,6 +1554,11 @@ VIEWER_HTML = """
         <div class="calib-panel" style="padding:6px 14px;">
           <button id="calibBtn" type="button" class="calib-btn">Calibrate (&#35430;&#38899;)</button>
           <div id="calibInfo" class="calib-info hidden">Recording &mdash; do each ~3-5s while detecting: <b>freeze</b> &middot; <b>fast big moves</b> &middot; <b>extend &harr; curl up</b> &middot; <b>big circles (hands/feet)</b> &middot; <b>jump up &harr; crouch low</b> &middot; <b>lean far each way</b>. Then press stop.</div>
+          <div class="preset-row" style="display:flex; gap:6px; margin-top:6px; align-items:center;">
+            <select id="presetSelect" style="flex:1; min-width:0;"><option value="">&mdash; preset &mdash;</option></select>
+            <button id="presetSaveBtn" type="button" class="calib-btn" style="width:auto; padding:6px 10px;">Save as&hellip;</button>
+            <button id="presetDelBtn" type="button" class="calib-btn" style="width:auto; padding:6px 10px;">Del</button>
+          </div>
         </div>
         <div class="charts-link" style="padding:2px 14px 8px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">&#128200; Open live charts &#8599;</a></div>
         <div id="metrics" class="metric-grid"></div>
@@ -1873,6 +1935,49 @@ VIEWER_HTML = """
         }
       }
     });
+
+    const presetSelect = document.getElementById('presetSelect');
+    async function refreshPresets(active) {
+      try {
+        const r = await fetch('/api/calibrate/presets');
+        const d = await r.json();
+        const sel = (active !== undefined) ? active : d.active;
+        presetSelect.innerHTML = '<option value="">— preset —</option>';
+        for (const n of (d.presets || [])) {
+          const o = document.createElement('option');
+          o.value = n; o.textContent = n;
+          if (n === sel) o.selected = true;
+          presetSelect.appendChild(o);
+        }
+      } catch (e) {}
+    }
+    presetSelect.addEventListener('change', async () => {
+      const name = presetSelect.value;
+      if (!name) return;
+      const data = new FormData(); data.set('name', name);
+      const r = await fetch('/api/calibrate/load_preset', { method: 'POST', body: data });
+      const d = await r.json();
+      if (d.status === 'applied') document.getElementById('oscMode').value = 'fixed';
+      else alert(d.error || 'load failed');
+    });
+    document.getElementById('presetSaveBtn').addEventListener('click', async () => {
+      const name = prompt('Save current calibration as preset:');
+      if (!name) return;
+      const data = new FormData(); data.set('name', name);
+      const r = await fetch('/api/calibrate/save_preset', { method: 'POST', body: data });
+      const d = await r.json();
+      if (d.status === 'saved') refreshPresets(name);
+      else alert(d.error || 'save failed - calibrate first');
+    });
+    document.getElementById('presetDelBtn').addEventListener('click', async () => {
+      const name = presetSelect.value;
+      if (!name) { alert('Pick a preset to delete first.'); return; }
+      if (!confirm('Delete preset "' + name + '"?')) return;
+      const data = new FormData(); data.set('name', name);
+      await fetch('/api/calibrate/delete_preset', { method: 'POST', body: data });
+      refreshPresets('');
+    });
+    refreshPresets();
 
     function normalizePrefix(prefix) {
       let value = (prefix || '/field').trim().replace(/\\/+$/, '');

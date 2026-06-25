@@ -79,3 +79,29 @@ def load_profile(path) -> dict:
                 if v and float(v[1]) > float(v[0])}
     except Exception:
         return {}
+
+
+# --- Named preset library (multiple saved calibrations) --------------------
+
+def load_presets(path) -> dict:
+    """Return {name: {metric: (lo, hi)}} from the presets file, or {}."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out = {}
+        for name, rng in data.items():
+            out[name] = {k: (float(v[0]), float(v[1]))
+                         for k, v in rng.items()
+                         if v and float(v[1]) > float(v[0])}
+        return out
+    except Exception:
+        return {}
+
+
+def save_presets(path, presets: dict) -> None:
+    data = {name: {k: [float(v[0]), float(v[1])] for k, v in rng.items()}
+            for name, rng in presets.items()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
