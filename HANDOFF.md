@@ -89,6 +89,16 @@ RTMPose3D is the Windows/NVIDIA path and is fully optional (lazy-imported).
 - **Live charts page** `GET /charts` (link on the viewer): canvas waveforms of
   all 9 metrics, polling `/api/metrics` (~10 Hz). Bold = OSC value, faint =
   pre-output. Use it to watch the smoothing while tuning the sliders.
+- **OSC modes & calibration.** Output modes: `raw` (physical units, comparable
+  across time, unbounded), `normalize` (adaptive 0..1 — auto-ranges to the
+  dancer but NOT comparable across time, the reference peak drifts), `fixed`
+  (0..1 from calibrated per-metric ranges — bounded AND comparable AND
+  personalised). The **Calibrate ("試音")** button records a short routine
+  (rest / fast-big / extend↔curl / big circles / jump↔crouch / lean) and stores
+  2nd/98th-percentile ranges per metric to `calibration_profile.json`
+  (`calibration.py`), then switches to `fixed`. Endpoints
+  `/api/calibrate/start` and `/api/calibrate/stop`. 7 unbounded metrics get
+  ranges; sync_velocity/sync_correlation are already bounded.
 
 ## Pending / TODO
 

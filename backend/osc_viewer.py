@@ -18,6 +18,7 @@ import uvicorn
 
 from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
+from calibration import CalibrationCollector, RANGE_METRICS, load_profile, save_profile
 from pose_engine import PoseEngine, VALID_BACKENDS
 
 
@@ -39,6 +40,15 @@ osc_sender = OSCSender(
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
+
+# Calibration ("sound-check") -> fixed-range normalize.
+CALIB_PROFILE_PATH = REPO_ROOT / "calibration_profile.json"
+calibration = CalibrationCollector()
+calibrating = False
+_calib_profile = load_profile(CALIB_PROFILE_PATH)
+if _calib_profile:
+    osc_sender.set_metric_ranges(_calib_profile)
+    print(f"Loaded calibration profile: {sorted(_calib_profile)}")
 # Optional: offline culture centroids enable the /field/morrisness output.
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 
@@ -344,6 +354,8 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
+    if calibrating:
+        calibration.add(metrics)
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
@@ -688,6 +700,38 @@ async def apply_metric_smoothing(metric: str = Form(...), alpha: float = Form(..
     except ValueError:
         return {"status": "error", "error": "alpha must be > 0 and <= 1"}
     return {"status": "applied", "metric": metric, "alpha": float(alpha)}
+
+
+@app.post("/api/calibrate/start")
+async def calibrate_start():
+    """Begin a calibration ('sound-check') recording. Requires detection running
+    so metrics flow into the collector."""
+    global calibrating
+    calibration.reset()
+    calibrating = True
+    return {"status": "calibrating"}
+
+
+@app.post("/api/calibrate/stop")
+async def calibrate_stop():
+    """Finish calibration: derive per-metric ranges (percentiles), install them,
+    save the profile, and switch OSC to 'fixed' mode."""
+    global calibrating
+    calibrating = False
+    ranges = calibration.ranges()
+    if ranges:
+        osc_sender.set_metric_ranges(ranges)
+        try:
+            save_profile(CALIB_PROFILE_PATH, osc_sender.metric_ranges)
+        except Exception as exc:
+            print(f"calibration profile save failed: {exc}")
+        osc_sender.configure(mode="fixed")
+    return {
+        "status": "applied",
+        "mode": osc_sender.mode,
+        "ranges": {k: list(v) for k, v in osc_sender.metric_ranges.items()},
+        "counts": {m: calibration.count(m) for m in RANGE_METRICS},
+    }
 
 
 @app.post("/api/apply")
@@ -1203,6 +1247,9 @@ VIEWER_HTML = """
     .metric-smooth-row .ms-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
     .metric-smooth-row input[type=range] { flex: 1; min-width: 0; }
     .metric-smooth-row .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 32px; text-align: right; }
+    .calib-btn { width: 100%; padding: 9px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-soft); color: inherit; cursor: pointer; font-size: 13px; }
+    .calib-btn.recording { border-color: #c0392b; color: #f1948a; }
+    .calib-info { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.4; }
     .value {
       font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
       font-variant-numeric: tabular-nums;
@@ -1433,7 +1480,8 @@ VIEWER_HTML = """
           <label><span class="label-row">Mode <span class="info-dot" title="raw: values in their original units. normalize: every metric mapped into 0-1 with an adaptive range (sync_corr -1..1 becomes 0..1, 0.5 neutral).">?</span></span>
             <select id="oscMode" name="osc_mode">
               <option value="raw">raw</option>
-              <option value="normalize">normalize</option>
+              <option value="normalize">normalize (adaptive)</option>
+              <option value="fixed">fixed (calibrated)</option>
             </select>
           </label>
           <label><span class="range-label-row"><span class="label-row">Smoothing <span class="info-dot" title="Global EMA on the OSC output (fallback for metrics without their own slider). 1 = off; lower = steadier but slower. Default off -- One-Euro on the joints is the primary smoother.">?</span></span><span id="oscAlphaValue" class="range-value">1.00</span></span>
@@ -1445,6 +1493,10 @@ VIEWER_HTML = """
             <input id="smoothCutoff" name="smooth_min_cutoff" type="range" min="0.3" max="6" step="0.1" value="1.5" />
             <span class="range-hint">lower = smoother</span>
           </label>
+        </div>
+        <div class="calib-panel" style="padding:6px 14px;">
+          <button id="calibBtn" type="button" class="calib-btn">Calibrate (&#35430;&#38899;)</button>
+          <div id="calibInfo" class="calib-info hidden">Recording &mdash; do each ~3-5s while detecting: <b>freeze</b> &middot; <b>fast big moves</b> &middot; <b>extend &harr; curl up</b> &middot; <b>big circles (hands/feet)</b> &middot; <b>jump up &harr; crouch low</b> &middot; <b>lean far each way</b>. Then press stop.</div>
         </div>
         <div class="charts-link" style="padding:2px 14px 8px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">&#128200; Open live charts &#8599;</a></div>
         <div id="metrics" class="metric-grid"></div>
@@ -1793,6 +1845,34 @@ VIEWER_HTML = """
     });
     smoothCutoffEl.addEventListener('change', applySmoothing);
     document.getElementById('smoothEnabled').addEventListener('change', applySmoothing);
+
+    let calibrating = false;
+    const calibBtn = document.getElementById('calibBtn');
+    const calibInfo = document.getElementById('calibInfo');
+    calibBtn.addEventListener('click', async () => {
+      if (!calibrating) {
+        if (!isDetecting) { alert('Start detection first, then Calibrate.'); return; }
+        try { await fetch('/api/calibrate/start', { method: 'POST' }); } catch (e) { return; }
+        calibrating = true;
+        calibBtn.textContent = 'Stop & save (recording...)';
+        calibBtn.classList.add('recording');
+        calibInfo.classList.remove('hidden');
+      } else {
+        let d = {};
+        try { const r = await fetch('/api/calibrate/stop', { method: 'POST' }); d = await r.json(); } catch (e) {}
+        calibrating = false;
+        calibBtn.textContent = 'Calibrate (試音)';
+        calibBtn.classList.remove('recording');
+        calibInfo.classList.add('hidden');
+        const n = Object.keys(d.ranges || {}).length;
+        if (n > 0) {
+          document.getElementById('oscMode').value = 'fixed';
+          alert('Calibrated ' + n + ' metrics. OSC mode set to fixed (calibrated ranges).');
+        } else {
+          alert('Not enough data - keep detection running and keep moving for a few seconds, then Calibrate again.');
+        }
+      }
+    });
 
     function normalizePrefix(prefix) {
       let value = (prefix || '/field').trim().replace(/\\/+$/, '');
