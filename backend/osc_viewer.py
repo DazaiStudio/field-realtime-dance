@@ -43,9 +43,9 @@ osc_sender = OSCSender(
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 
 PERFORMANCE_PRESETS = {
-    "fast": {"width": 640, "height": 360, "target_fps": 24.0, "analysis_fps": 10.0, "jpeg_quality": 55},
-    "balanced": {"width": 720, "height": 405, "target_fps": 24.0, "analysis_fps": 12.0, "jpeg_quality": 60},
-    "quality": {"width": 960, "height": 540, "target_fps": 20.0, "analysis_fps": 15.0, "jpeg_quality": 65},
+    "fast": {"width": 854, "height": 480, "target_fps": 24.0, "analysis_fps": 12.0, "jpeg_quality": 60},
+    "balanced": {"width": 1280, "height": 720, "target_fps": 24.0, "analysis_fps": 12.0, "jpeg_quality": 65},
+    "quality": {"width": 1920, "height": 1080, "target_fps": 20.0, "analysis_fps": 10.0, "jpeg_quality": 72},
 }
 DEFAULT_PERFORMANCE = "balanced"
 
@@ -1355,6 +1355,13 @@ VIEWER_HTML = """
                   <option value="rtmpose3d">RTMPose3D (NVIDIA GPU)</option>
                 </select>
               </label>
+              <label class="model-row">Quality
+                <select id="quality" name="performance">
+                  <option value="fast">Fast (854x480)</option>
+                  <option value="balanced" selected>Balanced (1280x720)</option>
+                  <option value="quality">Quality (1920x1080)</option>
+                </select>
+              </label>
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
             </div>
           </div>
@@ -1763,6 +1770,14 @@ VIEWER_HTML = """
         const payload = await applySettings(true);
         if (payload && payload.status === 'applied') showDetectionStream();
       }
+    });
+    document.getElementById('quality').addEventListener('change', async () => {
+      inputDirty = true;
+      // Resolution change reopens the camera (apply releases it), so re-apply.
+      if (!cameraOn && !isDetecting) return;
+      const payload = await applySettings(isDetecting);
+      if (!payload || payload.status !== 'applied') return;
+      if (isDetecting) showDetectionStream(); else showPreview();
     });
     const smoothCutoffEl = document.getElementById('smoothCutoff');
     const smoothCutoffValueEl = document.getElementById('smoothCutoffValue');

@@ -75,6 +75,28 @@ def _largest_person(kp: np.ndarray, kp2d) -> int:
     return best_i
 
 
+def _fit_affine_xy(crop, full):
+    """Per-axis (scale, offset) mapping crop-space x,y -> full-frame x,y,
+    fit from the two point sets' bbox extents (robust to a few bad joints)."""
+    out = []
+    for ax in range(2):
+        c0, c1 = float(crop[:, ax].min()), float(crop[:, ax].max())
+        f0, f1 = float(full[:, ax].min()), float(full[:, ax].max())
+        cs = (c1 - c0) or 1.0
+        s = (f1 - f0) / cs
+        out.append((s, f0 - s * c0))
+    return out
+
+
+def _apply_affine_xy(crop, xform):
+    import numpy as _np
+    pts = _np.empty((crop.shape[0], 2), dtype=float)
+    for ax in range(2):
+        s, o = xform[ax]
+        pts[:, ax] = crop[:, ax] * s + o
+    return pts
+
+
 def rtmw3d_primary_h36m(keypoints, keypoints_2d=None, scale: float = RTM_POSE_SCALE):
     """Pure helper: from RTMW3D output pick the primary (largest) person and
     return (h36m17 (17,3) | None, overlay_pts2d (17,2) | None).
@@ -182,6 +204,7 @@ class RTMPose3DPoseSource:
         )
         self._last_kpts2d = None
         self._last_overlay_pts = None
+        self._xform = None  # cached crop->full-frame transform for the overlay
 
     def _draw(self, frame, pts2d):
         pts = {i: (int(pts2d[i][0]), int(pts2d[i][1])) for i in range(len(pts2d))}
@@ -200,14 +223,30 @@ class RTMPose3DPoseSource:
         result = self.tracker(frame)
         if result is None or len(result) < 2:
             return frame, None
-        keypoints = result[0]
-        if len(result) >= 4:
-            self._last_kpts2d = result[3]
-        h36m, pts2d = rtmw3d_primary_h36m(keypoints, self._last_kpts2d, RTM_POSE_SCALE)
-        if pts2d is not None:
-            self._last_overlay_pts = pts2d
-            if draw:
-                self._draw(frame, pts2d)
+        keypoints = np.asarray(result[0], dtype=float)
+        kpts2d_full = np.asarray(result[3], dtype=float) if len(result) >= 4 else None
+
+        # Metrics: tested helper (picks the largest person, builds H36M-17).
+        h36m, _ = rtmw3d_primary_h36m(keypoints, kpts2d_full, RTM_POSE_SCALE)
+
+        # Overlay in full-frame pixels that tracks EVERY frame. Detection frames
+        # give full-frame keypoints_2d directly and refresh the crop->full
+        # transform; on tracking frames (no 2D) the fresh 3D crop x,y are mapped
+        # through the cached transform, so the skeleton follows the dancer
+        # instead of freezing until the next detection (~det_frequency frames).
+        if keypoints.ndim == 3 and keypoints.shape[0] > 0:
+            i = _largest_person(keypoints, kpts2d_full)
+            crop17 = keypoints[i, :17, :2]
+            overlay = None
+            if kpts2d_full is not None and i < kpts2d_full.shape[0]:
+                overlay = kpts2d_full[i, :17, :]
+                self._xform = _fit_affine_xy(crop17, overlay)
+            elif self._xform is not None:
+                overlay = _apply_affine_xy(crop17, self._xform)
+            if overlay is not None:
+                self._last_overlay_pts = overlay
+                if draw:
+                    self._draw(frame, overlay)
         return frame, h36m
 
     def close(self):

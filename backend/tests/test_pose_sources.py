@@ -3,7 +3,9 @@ from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pose_sources import rtmw3d_primary_h36m, _largest_person
+from pose_sources import (
+    rtmw3d_primary_h36m, _largest_person, _fit_affine_xy, _apply_affine_xy,
+)
 
 
 def _two_people():
@@ -49,6 +51,14 @@ class TestRtmw3dPrimary(unittest.TestCase):
         kp = np.zeros((1, 133, 3))  # all joints collapsed -> bbox height 0
         h36m, pts2d = rtmw3d_primary_h36m(kp, None)
         self.assertIsNone(h36m)
+
+    def test_affine_fits_and_applies(self):
+        # crop->full overlay transform: x = crop*10+5, y = crop*11+7
+        crop = np.array([[0.0, 0.0], [100.0, 50.0]])
+        full = np.array([[5.0, 7.0], [1005.0, 557.0]])
+        xf = _fit_affine_xy(crop, full)
+        out = _apply_affine_xy(crop, xf)
+        np.testing.assert_allclose(out, full, atol=1e-6)
 
 
 if __name__ == "__main__":
