@@ -84,7 +84,11 @@ RTMPose3D is the Windows/NVIDIA path and is fully optional (lazy-imported).
   slider on every metric card + the global alpha as fallback; live via
   `/api/metric_smoothing`). Stage 1 = clean source; stage 2 = per-channel feel
   for the OSC consumers (visuals/sound) since metrics differ wildly (jerk noisy
-  vs height slow).
+  vs height slow). **Output EMA defaults OFF (alpha=1)** so One-Euro is the sole
+  default smoother (no double-smoothing); pull a slider down only where wanted.
+- **Live charts page** `GET /charts` (link on the viewer): canvas waveforms of
+  all 9 metrics, polling `/api/metrics` (~10 Hz). Bold = OSC value, faint =
+  pre-output. Use it to watch the smoothing while tuning the sliders.
 
 ## Pending / TODO
 

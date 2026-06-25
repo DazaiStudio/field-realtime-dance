@@ -36,7 +36,7 @@ osc_sender = OSCSender(
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
     mode=os.getenv("FIELD_OSC_MODE", "raw"),
-    alpha=float(os.getenv("FIELD_OSC_ALPHA", "0.25")),
+    alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 # Optional: offline culture centroids enable the /field/morrisness output.
@@ -576,6 +576,22 @@ async def index():
     return HTMLResponse(VIEWER_HTML)
 
 
+@app.get("/charts")
+async def charts():
+    return HTMLResponse(CHARTS_HTML)
+
+
+@app.get("/api/metrics")
+async def api_metrics():
+    """Lightweight metrics snapshot for the live charts page."""
+    return {
+        "raw": processing_state.get("latest_raw_metrics", {}),
+        "smoothed": processing_state.get("latest_metrics", {}),
+        "running": bool(processing_state.get("running", False)),
+        "t": processing_state.get("latest_timestamp_ms"),
+    }
+
+
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
@@ -628,7 +644,7 @@ async def apply_osc_config(
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("raw"),
-    osc_alpha: float = Form(0.25),
+    osc_alpha: float = Form(1.0),
     osc_namespace: str = Form("/field"),
 ):
     osc_sender.configure(
@@ -685,7 +701,7 @@ async def apply_input(
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("raw"),
-    osc_alpha: float = Form(0.25),
+    osc_alpha: float = Form(1.0),
     osc_namespace: str = Form("/field"),
     performance: str = Form(DEFAULT_PERFORMANCE),
     pose_backend: str = Form("mediapipe"),
@@ -1413,8 +1429,8 @@ VIEWER_HTML = """
               <option value="normalize">normalize</option>
             </select>
           </label>
-          <label><span class="range-label-row"><span class="label-row">Smoothing <span class="info-dot" title="Exponential smoothing applied to every OSC output. 1 = no smoothing; lower values respond more slowly but read steadier.">?</span></span><span id="oscAlphaValue" class="range-value">0.25</span></span>
-            <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="0.25" />
+          <label><span class="range-label-row"><span class="label-row">Smoothing <span class="info-dot" title="Global EMA on the OSC output (fallback for metrics without their own slider). 1 = off; lower = steadier but slower. Default off -- One-Euro on the joints is the primary smoother.">?</span></span><span id="oscAlphaValue" class="range-value">1.00</span></span>
+            <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="1" />
             <span class="range-hint">lower = smoother &middot; 1 = off</span>
           </label>
           <label class="osc-toggle-row"><input id="smoothEnabled" name="smooth_enabled" type="checkbox" checked /> Smooth joints (One-Euro)</label>
@@ -1423,6 +1439,7 @@ VIEWER_HTML = """
             <span class="range-hint">lower = smoother</span>
           </label>
         </div>
+        <div class="charts-link" style="padding:2px 14px 8px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">&#128200; Open live charts &#8599;</a></div>
         <div id="metrics" class="metric-grid"></div>
         <div id="culturePanel" class="culture-panel hidden">
           <p class="section-title">Culture Axis <span class="info-dot" title="A rolling ~2s average of the 9 metrics, compared against the Morris and BaYe training clips. 1.0 = movement statistics match Morris, 0.0 = match BaYe, 0.5 = between the two.">?</span></p>
@@ -1484,8 +1501,8 @@ VIEWER_HTML = """
         <div class="bar" id="bar-${name}"><div class="fill" id="b-${name}"></div></div>
         <div class="metric-smooth-row">
           <span class="ms-label">smooth</span>
-          <input class="metric-smooth" type="range" min="0.02" max="1" step="0.01" value="0.25" title="Output smoothing for this metric (lower = smoother, 1 = off)" />
-          <span class="ms-val">0.25</span>
+          <input class="metric-smooth" type="range" min="0.02" max="1" step="0.01" value="1" title="Per-metric output smoothing (lower = smoother, 1 = off). On top of One-Euro." />
+          <span class="ms-val">1.00</span>
         </div>
       `;
       metricsEl.appendChild(row);
@@ -1909,6 +1926,127 @@ VIEWER_HTML = """
 )
 
 
+CHARTS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FIELD - Live Charts</title>
+<style>
+  :root { --bg:#0c0b09; --panel:#141210; --line:#2a251f; --muted:#8a7f72; --teal:#34d3c0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:#e8e1d6; font:14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 18px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0; letter-spacing:.04em; }
+  header .status { color:var(--muted); }
+  header .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#a33; margin-right:6px; }
+  header .dot.on { background:#3a3; }
+  header a { color:var(--teal); text-decoration:none; margin-left:auto; }
+  .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; padding:16px; }
+  @media (max-width:900px){ .grid{ grid-template-columns:repeat(2,1fr);} }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:10px 12px; }
+  .panel .head { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px; }
+  .panel .name { color:var(--muted); text-transform:uppercase; font-size:12px; letter-spacing:.06em; }
+  .panel .val { color:var(--teal); font-variant-numeric:tabular-nums; }
+  canvas { width:100%; height:120px; display:block; }
+  .legend { color:var(--muted); font-size:11px; padding:0 18px 18px; }
+  .legend b { color:var(--teal); } .legend i { color:#8c8070; font-style:normal; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FIELD - live metric charts</h1>
+  <span class="status"><span id="dot" class="dot"></span><span id="statusText">waiting...</span></span>
+  <a href="/">back to viewer</a>
+</header>
+<div class="grid" id="grid"></div>
+<div class="legend">Per chart: <b>bold = value sent to OSC (after per-metric output smoothing)</b>, <i>faint = pre-output value (already One-Euro smoothed at the joints)</i>. Window approx last 30s. Start detection in the viewer, then watch here. Toggle/drag the smoothing sliders in the viewer and watch the curves change.</div>
+<script>
+const METRICS = [
+  {key:'energy', name:'Energy'},
+  {key:'sync_velocity', name:'Sync velocity'},
+  {key:'sync_correlation', name:'Sync correlation'},
+  {key:'expansion', name:'Expansion'},
+  {key:'curvature', name:'Curvature'},
+  {key:'height', name:'CoM height'},
+  {key:'sway', name:'Sway'},
+  {key:'torque', name:'Torque'},
+  {key:'jerk', name:'Jerk'}
+];
+const WINDOW = 300, POLL_MS = 100;
+const buffers = {}, canvases = {}, valEls = {};
+const grid = document.getElementById('grid');
+for (const m of METRICS) {
+  buffers[m.key] = { raw: [], smooth: [] };
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.innerHTML = '<div class="head"><span class="name">' + m.name + '</span><span class="val" id="val-' + m.key + '">-</span></div><canvas></canvas>';
+  grid.appendChild(panel);
+  canvases[m.key] = panel.querySelector('canvas');
+  valEls[m.key] = panel.querySelector('#val-' + m.key);
+}
+function pushVal(arr, v) {
+  arr.push((typeof v === 'number' && isFinite(v)) ? v : null);
+  if (arr.length > WINDOW) arr.shift();
+}
+function fit(c) {
+  const r = c.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  return dpr;
+}
+function series(g, w, h, arr, lo, hi, color, lw) {
+  const span = (hi - lo) || 1;
+  g.strokeStyle = color; g.lineWidth = lw; g.beginPath();
+  let started = false;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v == null) { started = false; continue; }
+    const x = (i / (WINDOW - 1)) * w;
+    const y = h - (((v - lo) / span) * h * 0.9) - h * 0.05;
+    if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+  }
+  g.stroke();
+}
+function draw() {
+  for (const m of METRICS) {
+    const c = canvases[m.key], dpr = fit(c), g = c.getContext('2d');
+    const w = c.width, h = c.height;
+    g.clearRect(0, 0, w, h);
+    const b = buffers[m.key];
+    const all = b.raw.concat(b.smooth).filter(v => v != null);
+    g.strokeStyle = 'rgba(255,255,255,0.05)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
+    if (all.length === 0) continue;
+    let lo = Math.min.apply(null, all), hi = Math.max.apply(null, all);
+    if (lo === hi) { lo -= 1; hi += 1; }
+    series(g, w, h, b.raw, lo, hi, 'rgba(140,128,112,0.5)', 1 * dpr);
+    series(g, w, h, b.smooth, lo, hi, '#34d3c0', 1.8 * dpr);
+    const last = b.smooth.filter(v => v != null).slice(-1)[0];
+    if (last != null) valEls[m.key].textContent = last.toFixed(3);
+  }
+}
+let running = false;
+async function poll() {
+  try {
+    const res = await fetch('/api/metrics', { cache: 'no-store' });
+    const d = await res.json();
+    running = !!d.running;
+    const raw = d.raw || {}, sm = d.smoothed || {};
+    for (const m of METRICS) { pushVal(buffers[m.key].raw, raw[m.key]); pushVal(buffers[m.key].smooth, sm[m.key]); }
+  } catch (e) { running = false; }
+  document.getElementById('dot').className = 'dot' + (running ? ' on' : '');
+  document.getElementById('statusText').textContent = running ? 'streaming' : 'no stream - start detection in the viewer';
+  draw();
+}
+setInterval(poll, POLL_MS);
+poll();
+</script>
+</body>
+</html>"""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local FIELD input viewer with pose overlay, metrics, and OSC output.")
     parser.add_argument("--web-host", default="127.0.0.1")
@@ -1916,7 +2054,7 @@ def main():
     parser.add_argument("--osc-host", default=os.getenv("FIELD_OSC_HOST", "127.0.0.1"))
     parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
     parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
-    parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "0.25")))
+    parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
     parser.add_argument(
         "--pose-model",
