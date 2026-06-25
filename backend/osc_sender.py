@@ -60,6 +60,9 @@ class OSCSender:
         # Per-metric output smoothing override; falls back to self.alpha (the
         # global slider) for any metric without its own value. 1.0 = off.
         self.metric_alphas: Dict[str, float] = {}
+        # Calibrated fixed [lo, hi] ranges per metric, used by mode "fixed"
+        # (comparable across time + bounded + personalised). Empty = none yet.
+        self.metric_ranges: Dict[str, tuple] = {}
         self._peaks: Dict[str, float] = {}
         self._ranges: Dict[str, tuple] = {}
         self.last_prepared_metrics: Dict[str, float] = {}
@@ -112,6 +115,7 @@ class OSCSender:
             "mode": self.mode,
             "alpha": self.alpha,
             "metric_alphas": dict(self.metric_alphas),
+            "metric_ranges": {k: list(v) for k, v in self.metric_ranges.items()},
             "last_sent_at": self.last_sent_at,
         }
 
@@ -147,7 +151,7 @@ class OSCSender:
         if not math.isfinite(numeric):
             return None
 
-        if self.mode == "normalize":
+        if self.mode in ("normalize", "fixed"):
             numeric = self._normalize(key, numeric)
 
         return self._smooth(key, numeric)
@@ -157,6 +161,15 @@ class OSCSender:
             return _clamp((value + 1.0) / 2.0)
         if key in BOUNDED_METRICS:
             return _clamp(value)
+        # Calibrated fixed range takes priority in "fixed" mode (comparable
+        # across time). Metrics without a calibrated range fall through to the
+        # adaptive logic below, so "fixed" degrades gracefully.
+        if self.mode == "fixed" and key in self.metric_ranges:
+            lo, hi = self.metric_ranges[key]
+            span = hi - lo
+            if span < 1e-9:
+                return 0.5
+            return _clamp((value - lo) / span)
         if key in ADAPTIVE_RANGE_METRICS:
             return self._normalize_range(key, value)
         if key in UNBOUNDED_METRICS:
@@ -200,6 +213,19 @@ class OSCSender:
             return
         self.metric_alphas[name] = self._validate_alpha(alpha)
 
+    def set_metric_ranges(self, ranges: Mapping[str, tuple]) -> None:
+        """Install calibrated fixed [lo, hi] ranges (used by mode 'fixed').
+        Ignores unknown metrics and invalid ranges (hi must exceed lo)."""
+        for name, rng in (ranges or {}).items():
+            if name not in METRIC_NAMES or rng is None:
+                continue
+            lo, hi = float(rng[0]), float(rng[1])
+            if hi > lo:
+                self.metric_ranges[name] = (lo, hi)
+
+    def clear_metric_ranges(self) -> None:
+        self.metric_ranges.clear()
+
     def _send_message(self, address: str, value: object) -> None:
         try:
             self.client.send_message(address, value)
@@ -218,8 +244,8 @@ class OSCSender:
     @staticmethod
     def _validate_mode(mode: str) -> str:
         normalized = str(mode).lower()
-        if normalized not in {"raw", "normalize"}:
-            raise ValueError("OSC mode must be 'raw' or 'normalize'")
+        if normalized not in {"raw", "normalize", "fixed"}:
+            raise ValueError("OSC mode must be 'raw', 'normalize' or 'fixed'")
         return normalized
 
     @staticmethod
