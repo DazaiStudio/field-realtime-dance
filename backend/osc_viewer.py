@@ -52,6 +52,11 @@ PERFORMANCE_PRESETS = {
     "quality": {"width": 1920, "height": 1080, "target_fps": 20.0, "analysis_fps": 10.0, "jpeg_quality": 72},
 }
 DEFAULT_PERFORMANCE = "quality"
+DEFAULT_METRIC_SMOOTHNESS = 30.0
+DEFAULT_METRIC_ALPHA = 1.0 - ((DEFAULT_METRIC_SMOOTHNESS / 100.0) * 0.98)
+
+for metric_name in METRIC_NAMES:
+    osc_sender.set_metric_alpha(metric_name, DEFAULT_METRIC_ALPHA)
 
 source_state = {
     "source": "live",
@@ -1703,9 +1708,11 @@ VIEWER_HTML = """
   <script>
     const metricNames = %METRICS%;
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
+    const defaultMetricSmoothness = %DEFAULT_METRIC_SMOOTHNESS%;
     const metricsEl = document.getElementById('metrics');
     const tooltipEl = document.getElementById('customTooltip');
     const maxSeen = {};
+    let metricSmoothnessInitialized = false;
     const metricLabels = {
       energy: 'Energy',
       sync_velocity: 'Sync Velocity',
@@ -1720,7 +1727,7 @@ VIEWER_HTML = """
     const metricDescriptions = {
       energy: 'Overall movement intensity from limb rotation speed. Higher means bigger or faster full-body motion; near 0 means stillness.',
       sync_velocity: 'Left-right activity balance. 1 means both sides are similarly active; 0 means one side is doing most of the movement.',
-      sync_correlation: 'Left-right timing relationship. +1 means both sides move together, 0 means independent timing, -1 means alternating timing.',
+      sync_correlation: 'Left-right timing match, not movement size. +1 means both sides move in the same rhythm, 0 means no clear timing link, -1 means they alternate or move opposite each other.',
       expansion: 'How much space the body occupies. Higher means open or spread-out shapes; lower means compact or closed shapes.',
       curvature: 'How rounded the hand and foot paths are. Higher means curved/circular paths; lower means straighter paths.',
       height: 'Body center height relative to the hips. Lower values usually mean crouching, folding, or dropping the torso.',
@@ -1796,6 +1803,11 @@ VIEWER_HTML = """
     function smoothnessToAlpha(smoothness) {
       return 1 - (clamp01(snapSmoothness(smoothness) / 100) * 0.98);
     }
+    function alphaToSmoothness(alpha) {
+      const numeric = Number(alpha);
+      if (!Number.isFinite(numeric)) return defaultMetricSmoothness;
+      return snapSmoothness(((1 - numeric) / 0.98) * 100);
+    }
 
     for (const name of metricNames) {
       maxSeen[name] = 1;
@@ -1810,8 +1822,8 @@ VIEWER_HTML = """
         </div>
         <div class="metric-smooth-row">
           <span class="ms-label">smoothness</span>
-          <input class="metric-smooth thin-range" type="range" min="0" max="100" step="5" value="0" data-tooltip-title="${labelForMetric(name)} Smoothness" data-tooltip-body="Per-metric output smoothing. Higher values make this output channel smoother; 0% is off. This happens after the One-Euro joint smoothing." />
-          <span class="ms-val">0%</span>
+          <input class="metric-smooth thin-range" type="range" min="0" max="100" step="5" value="${defaultMetricSmoothness}" data-tooltip-title="${labelForMetric(name)} Smoothness" data-tooltip-body="Per-metric output smoothing. Higher values make this output channel smoother; 0% is off. This happens after the One-Euro joint smoothing." />
+          <span class="ms-val">${defaultMetricSmoothness}%</span>
         </div>
         <div class="metric-readout">
           <div class="value" id="v-${name}">0.00</div>
@@ -1822,7 +1834,7 @@ VIEWER_HTML = """
       const toggle = row.querySelector('.metric-toggle');
       const msInput = row.querySelector('.metric-smooth');
       const msVal = row.querySelector('.ms-val');
-      setRangeFill(msInput, 0);
+      setRangeFill(msInput, defaultMetricSmoothness);
       toggle.addEventListener('change', async () => {
         const data = new FormData();
         data.set('metric', name);
@@ -2156,6 +2168,22 @@ VIEWER_HTML = """
       fill.style.width = `${width}%`;
     }
 
+    function syncInitialMetricSmoothness(osc) {
+      if (metricSmoothnessInitialized) return;
+      const metricAlphas = osc?.metric_alphas || {};
+      for (const name of metricNames) {
+        const row = document.getElementById(`metric-${name}`);
+        const smooth = row?.querySelector('.metric-smooth');
+        const smoothValue = row?.querySelector('.ms-val');
+        if (!smooth || !smoothValue) continue;
+        const percent = alphaToSmoothness(metricAlphas[name]);
+        smooth.value = percent;
+        smoothValue.textContent = `${percent}%`;
+        setRangeFill(smooth, percent);
+      }
+      metricSmoothnessInitialized = true;
+    }
+
     function syncPoseBackends(payload) {
       const select = document.getElementById('poseBackend');
       const backends = payload?.pose_backends || [{ id: 'mediapipe', label: 'MediaPipe', description: 'cross-platform' }];
@@ -2182,6 +2210,7 @@ VIEWER_HTML = """
       const active = new Set(source.osc_metrics || metricNames);
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
       syncPoseBackends(payload);
+      syncInitialMetricSmoothness(osc);
       if (!inputDirty) {
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
         document.getElementById('jointSmoothEnabled').checked = Boolean(source.smooth_enabled ?? true);
@@ -2286,6 +2315,8 @@ VIEWER_HTML = """
 </html>
 """.replace("%METRICS%", json.dumps(list(METRIC_NAMES))).replace(
     "%OSC_ADDRESS_NAMES%", json.dumps(OSC_ADDRESS_NAMES)
+).replace(
+    "%DEFAULT_METRIC_SMOOTHNESS%", str(int(DEFAULT_METRIC_SMOOTHNESS))
 )
 
 
