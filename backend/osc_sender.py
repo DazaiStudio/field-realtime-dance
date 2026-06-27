@@ -158,7 +158,7 @@ class OSCSender:
 
     def _normalize(self, key: str, value: float) -> float:
         if key == "sync_correlation":
-            return _clamp((value + 1.0) / 2.0)
+            return _clamp(value, -1.0, 1.0)
         if key in BOUNDED_METRICS:
             return _clamp(value)
         # Calibrated fixed range takes priority in "fixed" mode (comparable
@@ -236,10 +236,15 @@ class OSCSender:
         """Send one extra value under the namespace (derived metrics etc.)."""
         if not self.enabled:
             return
-        self._send_message(f"{self.namespace}/{name}", float(value))
+        self._send_message(self._address(name), float(value))
 
     def metric_address(self, key: str) -> str:
-        return f"{self.namespace}/{OSC_ADDRESS_NAMES.get(key, key)}"
+        return self._address(OSC_ADDRESS_NAMES.get(key, key))
+
+    def _address(self, name: str) -> str:
+        if not self.namespace:
+            return f"/{name}"
+        return f"{self.namespace}/{name}"
 
     @staticmethod
     def _validate_mode(mode: str) -> str:
@@ -257,9 +262,9 @@ class OSCSender:
 
     @staticmethod
     def _normalize_namespace(namespace: str) -> str:
-        value = str(namespace or "/field").strip().rstrip("/")
+        value = str(namespace if namespace is not None else "/field").strip().rstrip("/")
         if not value:
-            return "/field"
+            return ""
         if not value.startswith("/"):
             value = f"/{value}"
         return value

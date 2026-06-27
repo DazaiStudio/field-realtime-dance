@@ -18,10 +18,6 @@ import uvicorn
 
 from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
-from calibration import (
-    CalibrationCollector, RANGE_METRICS, load_profile, save_profile,
-    load_presets, save_presets,
-)
 from pose_engine import PoseEngine, VALID_BACKENDS
 
 
@@ -33,30 +29,20 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 pose_engine: Optional[PoseEngine] = None
 pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
 camera = None
+camera_owner: Optional[int] = None
+camera_index_opened: Optional[int] = None
+camera_lock = threading.Lock()
 camera_cache = {"updated_at": 0.0, "cameras": []}
 camera_signal_cache = {"updated_at": 0.0, "signals": {}}
 osc_sender = OSCSender(
     host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
-    mode=os.getenv("FIELD_OSC_MODE", "raw"),
+    mode=os.getenv("FIELD_OSC_MODE", "normalize"),
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 
-# Calibration ("sound-check") -> fixed-range normalize.
-CALIB_PROFILE_PATH = REPO_ROOT / "calibration_profile.json"
-calibration = CalibrationCollector()
-calibrating = False
-_calib_profile = load_profile(CALIB_PROFILE_PATH)
-if _calib_profile:
-    osc_sender.set_metric_ranges(_calib_profile)
-    print(f"Loaded calibration profile: {sorted(_calib_profile)}")
-
-# Named calibration presets (multiple saved calibrations, e.g. per dancer/venue).
-PRESETS_PATH = REPO_ROOT / "calibration_presets.json"
-calib_presets = load_presets(PRESETS_PATH)
-active_preset = None
 # Optional: offline culture centroids enable the /field/morrisness output.
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 
@@ -65,7 +51,7 @@ PERFORMANCE_PRESETS = {
     "balanced": {"width": 1280, "height": 720, "target_fps": 24.0, "analysis_fps": 12.0, "jpeg_quality": 65},
     "quality": {"width": 1920, "height": 1080, "target_fps": 20.0, "analysis_fps": 10.0, "jpeg_quality": 72},
 }
-DEFAULT_PERFORMANCE = "balanced"
+DEFAULT_PERFORMANCE = "quality"
 
 source_state = {
     "source": "live",
@@ -86,7 +72,7 @@ source_state = {
     "detect_enabled": False,
     "pose_backend": os.getenv("FIELD_POSE_BACKEND", "mediapipe"),
     "smooth_enabled": True,
-    "smooth_min_cutoff": 1.5,
+    "smooth_min_cutoff": 0.3,
     "applied_at": time.time(),
 }
 
@@ -113,7 +99,7 @@ processing_state = {
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     yield
-    release_camera()
+    release_camera(force=True)
     if pose_engine is not None:
         pose_engine.close()
 
@@ -131,7 +117,7 @@ def get_pose_engine() -> PoseEngine:
     if desired not in VALID_BACKENDS:
         desired = "mediapipe"
     smooth_enabled = bool(source_state.get("smooth_enabled", True))
-    min_cutoff = float(source_state.get("smooth_min_cutoff", 1.5))
+    min_cutoff = float(source_state.get("smooth_min_cutoff", 0.3))
 
     if pose_engine is None:
         pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
@@ -154,32 +140,110 @@ def get_pose_engine() -> PoseEngine:
     return pose_engine
 
 
-def release_camera() -> None:
-    global camera
-    if camera is not None:
-        camera.release()
+def release_camera(owner: Optional[int] = None, force: bool = False) -> None:
+    """Release the active camera.
+
+    Stream cleanup passes its session id as owner, so an old stream cannot
+    release a newer stream's camera after /api/apply has already restarted it.
+    Explicit UI/server release calls use force=True.
+    """
+    global camera, camera_owner, camera_index_opened
+    cap = None
+    with camera_lock:
+        if camera is None:
+            return
+        if not force and owner is not None and camera_owner != owner:
+            return
+        cap = camera
         camera = None
+        camera_owner = None
+        camera_index_opened = None
+    cap.release()
 
 
-def open_camera(index: int):
-    global camera
-    if camera is None:
+def open_camera(index: int, owner: Optional[int] = None):
+    global camera, camera_owner, camera_index_opened
+    with camera_lock:
+        if camera is not None and camera_owner == owner and camera_index_opened == index:
+            return camera
+        if camera is not None:
+            camera.release()
+            camera = None
+            camera_owner = None
+            camera_index_opened = None
+
         backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-        camera = cv2.VideoCapture(index, backend)
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(source_state["width"]))
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(source_state["height"]))
-    return camera
+        cap = cv2.VideoCapture(index, backend)
+        if os.name == "nt":
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(source_state["width"]))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(source_state["height"]))
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(f"Camera {index} could not be opened")
+        camera = cap
+        camera_owner = owner
+        camera_index_opened = index
+        return camera
+
+
+async def reopen_live_camera(session_id: int, reason: str):
+    processing_state["error"] = reason
+    await asyncio.to_thread(release_camera, session_id)
+    await asyncio.sleep(0.35)
+    return await asyncio.to_thread(open_camera, int(source_state["camera_index"]), session_id)
 
 
 def state_payload() -> dict:
+    active_metrics = set(active_metric_names())
+    backends = available_pose_backends()
+    backend_ids = {item["id"] for item in backends}
+    if source_state.get("pose_backend") not in backend_ids:
+        source_state["pose_backend"] = "mediapipe"
     payload = {
         "source": dict(source_state),
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
-        "addresses": [osc_sender.metric_address(name) for name in METRIC_NAMES],
+        "addresses": [osc_sender.metric_address(name) for name in METRIC_NAMES if name in active_metrics],
+        "pose_backends": backends,
     }
     payload["source"]["video_path"] = None
     return payload
+
+
+def active_metric_names() -> list[str]:
+    selected = source_state.get("osc_metrics") or []
+    return [name for name in METRIC_NAMES if name in selected]
+
+
+def active_metric_set() -> set[str]:
+    return set(active_metric_names())
+
+
+def filter_active_metrics(metrics: dict) -> dict:
+    active = active_metric_set()
+    return {k: v for k, v in (metrics or {}).items() if k in active}
+
+
+def rtmpose3d_selectable() -> bool:
+    """RTMPose3D remains available in code, but is hidden from the rehearsal UI."""
+    return False
+
+
+def available_pose_backends() -> list[dict]:
+    backends = [{
+        "id": "mediapipe",
+        "label": "MediaPipe",
+        "description": "default, cross-platform",
+    }]
+    if rtmpose3d_selectable():
+        backends.append({
+            "id": "rtmpose3d",
+            "label": "RTMPose3D",
+            "description": "NVIDIA GPU",
+        })
+    return backends
 
 
 def get_windows_camera_names() -> list[str]:
@@ -195,7 +259,7 @@ def get_windows_camera_names() -> list[str]:
             ["powershell", "-NoProfile", "-Command", command],
             capture_output=True,
             text=True,
-            timeout=4,
+            timeout=10,
             check=False,
         )
     except Exception:
@@ -362,16 +426,15 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
-    if calibrating:
-        calibration.add(metrics)
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
     if elapsed > 0.25:
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
-    osc_sender.send_metrics(metrics)
-    processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
+    active = active_metric_set()
+    osc_sender.send_metrics(metrics, send_keys=active)
+    processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
     if culture_score is not None:
         # All-zero metrics mean "no pose detected"; keep the previous score
         # instead of letting zeros drag the rolling average around.
@@ -421,98 +484,145 @@ def apply_performance_preset(performance: str) -> None:
 async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
-    cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]))
-    engine = get_pose_engine()
+    try:
+        cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]), session_id)
+    except Exception as exc:
+        processing_state["error"] = f"Camera unavailable: {exc}"
+        processing_state["running"] = False
+        return
+    engine_task = asyncio.create_task(asyncio.to_thread(get_pose_engine))
+    engine = None
     next_analysis_at = 0.0
     last_analysis_at = None
     measured_fps = max(float(source_state["analysis_fps"]), 1.0)
+    missed_frames = 0
 
-    while (
-        source_state["source"] == "live"
-        and source_state["session_id"] == session_id
-        and source_state["detect_enabled"]
-    ):
-        started = time.time()
-        ok, frame = await asyncio.to_thread(cap.read)
-        if not ok:
-            processing_state["error"] = "Camera frame not available"
-            await asyncio.sleep(0.2)
-            continue
-        frame = apply_live_mirror(frame)
-        frame = resize_frame(frame)
+    try:
+        while (
+            source_state["source"] == "live"
+            and source_state["session_id"] == session_id
+            and source_state["detect_enabled"]
+        ):
+            started = time.time()
+            ok, frame = await asyncio.to_thread(cap.read)
+            if not ok:
+                missed_frames += 1
+                if missed_frames >= 5:
+                    try:
+                        cap = await reopen_live_camera(session_id, "Camera frame dropped; reconnecting")
+                        missed_frames = 0
+                    except Exception as exc:
+                        processing_state["error"] = f"Camera reconnect failed: {exc}"
+                        await asyncio.sleep(0.75)
+                else:
+                    processing_state["error"] = "Camera frame not available"
+                    await asyncio.sleep(0.08)
+                continue
+            missed_frames = 0
+            frame = apply_live_mirror(frame)
+            frame = resize_frame(frame)
 
-        timestamp_ms = int(time.time() * 1000)
-        processed = frame
-        now = time.time()
-        analysis_interval = 1.0 / max(float(source_state["analysis_fps"]), 1.0)
-        if now >= next_analysis_at:
-            # The metrics engine divides by dt, so feed it the measured
-            # analysis rate (EMA-smoothed) instead of the scheduled one;
-            # otherwise energy/torque/jerk scale with machine load.
-            if last_analysis_at is not None and now > last_analysis_at:
-                measured_fps = 0.8 * measured_fps + 0.2 * (1.0 / (now - last_analysis_at))
-            last_analysis_at = now
-            engine.set_metrics_fps(measured_fps)
-            pose_started = time.perf_counter()
-            processed, metrics = await asyncio.to_thread(
-                engine.process_frame,
-                frame,
-                timestamp_ms,
-                draw_overlay=bool(source_state.get("overlay_enabled", True)),
-            )
-            pose_ms = (time.perf_counter() - pose_started) * 1000.0
-            set_analysis_result(metrics, timestamp_ms, pose_ms)
-            next_analysis_at = now + analysis_interval
-        elif source_state.get("overlay_enabled", True):
-            processed = engine.draw_cached_overlay(frame)
+            timestamp_ms = int(time.time() * 1000)
+            processed = frame
+            now = time.time()
 
-        encode_started = time.perf_counter()
-        encoded = await asyncio.to_thread(encode_frame, processed)
-        encode_ms = (time.perf_counter() - encode_started) * 1000.0
-        set_stream_frame(frame, encode_ms)
-        if encoded:
-            yield encoded
-        frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
-        elapsed = time.time() - started
-        await asyncio.sleep(max(0.0, frame_interval - elapsed))
+            if engine is None and engine_task.done():
+                try:
+                    engine = engine_task.result()
+                except Exception as exc:
+                    processing_state["error"] = f"Pose engine unavailable: {exc}"
 
-    processing_state["running"] = False
+            if engine is not None:
+                analysis_interval = 1.0 / max(float(source_state["analysis_fps"]), 1.0)
+                if now >= next_analysis_at:
+                    # The metrics engine divides by dt, so feed it the measured
+                    # analysis rate (EMA-smoothed) instead of the scheduled one;
+                    # otherwise energy/torque/jerk scale with machine load.
+                    if last_analysis_at is not None and now > last_analysis_at:
+                        measured_fps = 0.8 * measured_fps + 0.2 * (1.0 / (now - last_analysis_at))
+                    last_analysis_at = now
+                    engine.set_metrics_fps(measured_fps)
+                    pose_started = time.perf_counter()
+                    processed, metrics = await asyncio.to_thread(
+                        engine.process_frame,
+                        frame,
+                        timestamp_ms,
+                        draw_overlay=bool(source_state.get("overlay_enabled", True)),
+                    )
+                    pose_ms = (time.perf_counter() - pose_started) * 1000.0
+                    set_analysis_result(metrics, timestamp_ms, pose_ms)
+                    next_analysis_at = now + analysis_interval
+                elif source_state.get("overlay_enabled", True):
+                    processed = engine.draw_cached_overlay(frame)
+
+            encode_started = time.perf_counter()
+            encoded = await asyncio.to_thread(encode_frame, processed)
+            encode_ms = (time.perf_counter() - encode_started) * 1000.0
+            set_stream_frame(frame, encode_ms)
+            if encoded:
+                yield encoded
+            frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
+            elapsed = time.time() - started
+            await asyncio.sleep(max(0.0, frame_interval - elapsed))
+    finally:
+        if not engine_task.done():
+            engine_task.cancel()
+        release_camera(session_id)
+        processing_state["running"] = False
 
 
 async def stream_live_preview():
     session_id = source_state["session_id"]
-    cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]))
+    try:
+        cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]), session_id)
+    except Exception as exc:
+        processing_state["error"] = f"Camera unavailable: {exc}"
+        return
+    missed_frames = 0
 
-    while (
-        source_state["source"] == "live"
-        and source_state["session_id"] == session_id
-        and not source_state["detect_enabled"]
-    ):
-        started = time.time()
-        ok, frame = await asyncio.to_thread(cap.read)
-        if not ok:
-            processing_state["error"] = "Camera frame not available"
-            await asyncio.sleep(0.2)
-            continue
-        frame = apply_live_mirror(frame)
-        frame = resize_frame(frame)
+    try:
+        while (
+            source_state["source"] == "live"
+            and source_state["session_id"] == session_id
+            and not source_state["detect_enabled"]
+        ):
+            started = time.time()
+            ok, frame = await asyncio.to_thread(cap.read)
+            if not ok:
+                missed_frames += 1
+                if missed_frames >= 5:
+                    try:
+                        cap = await reopen_live_camera(session_id, "Camera frame dropped; reconnecting")
+                        missed_frames = 0
+                    except Exception as exc:
+                        processing_state["error"] = f"Camera reconnect failed: {exc}"
+                        await asyncio.sleep(0.75)
+                else:
+                    processing_state["error"] = "Camera frame not available"
+                    await asyncio.sleep(0.08)
+                continue
+            missed_frames = 0
+            frame = apply_live_mirror(frame)
+            frame = resize_frame(frame)
 
-        encode_started = time.perf_counter()
-        encoded = await asyncio.to_thread(encode_frame, frame)
-        encode_ms = (time.perf_counter() - encode_started) * 1000.0
-        set_stream_frame(frame, encode_ms)
-        if encoded:
-            yield encoded
+            encode_started = time.perf_counter()
+            encoded = await asyncio.to_thread(encode_frame, frame)
+            encode_ms = (time.perf_counter() - encode_started) * 1000.0
+            set_stream_frame(frame, encode_ms)
+            if encoded:
+                yield encoded
 
-        frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
-        elapsed = time.time() - started
-        await asyncio.sleep(max(0.0, frame_interval - elapsed))
+            frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
+            elapsed = time.time() - started
+            await asyncio.sleep(max(0.0, frame_interval - elapsed))
+    finally:
+        release_camera(session_id)
 
 
 async def stream_video():
     processing_state["running"] = True
     session_id = source_state["session_id"]
-    release_camera()
+    release_camera(force=True)
     engine = get_pose_engine()
 
     while (
@@ -605,8 +715,9 @@ async def charts():
 async def api_metrics():
     """Lightweight metrics snapshot for the live charts page."""
     return {
-        "raw": processing_state.get("latest_raw_metrics", {}),
-        "smoothed": processing_state.get("latest_metrics", {}),
+        "raw": filter_active_metrics(processing_state.get("latest_raw_metrics", {})),
+        "smoothed": filter_active_metrics(processing_state.get("latest_metrics", {})),
+        "enabled": active_metric_names(),
         "running": bool(processing_state.get("running", False)),
         "t": processing_state.get("latest_timestamp_ms"),
     }
@@ -627,7 +738,7 @@ async def api_camera_release():
     """Stop any running stream and release the camera (UI camera-off)."""
     source_state["session_id"] += 1
     source_state["detect_enabled"] = False
-    await asyncio.to_thread(release_camera)
+    await asyncio.to_thread(release_camera, None, True)
     processing_state["error"] = None
     return {"status": "released", **state_payload()}
 
@@ -638,7 +749,7 @@ async def api_shutdown():
     source_state["session_id"] += 1
     source_state["detect_enabled"] = False
     try:
-        await asyncio.to_thread(release_camera)
+        await asyncio.to_thread(release_camera, None, True)
     except Exception:
         pass
     # Delay the hard exit so the HTTP response reaches the browser first.
@@ -663,9 +774,9 @@ async def apply_osc_config(
     osc_host: str = Form("127.0.0.1"),
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
-    osc_mode: str = Form("raw"),
+    osc_mode: str = Form("normalize"),
     osc_alpha: float = Form(1.0),
-    osc_namespace: str = Form("/field"),
+    osc_namespace: str = Form(""),
 ):
     osc_sender.configure(
         host=osc_host,
@@ -678,7 +789,7 @@ async def apply_osc_config(
     raw_metrics = processing_state.get("latest_raw_metrics") or {}
     if raw_metrics:
         osc_sender.send_metrics(raw_metrics, send_keys=set())
-        processing_state["latest_metrics"] = dict(osc_sender.last_prepared_metrics)
+        processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
 
     return {"status": "applied", **state_payload()}
 
@@ -686,7 +797,7 @@ async def apply_osc_config(
 @app.post("/api/smoothing")
 async def apply_smoothing(
     smooth_enabled: bool = Form(True),
-    smooth_min_cutoff: float = Form(1.5),
+    smooth_min_cutoff: float = Form(0.3),
 ):
     """Live-tune the One-Euro joint smoothing WITHOUT restarting the stream.
     Unlike /api/apply this does NOT bump session_id or reset state, so dragging
@@ -701,8 +812,8 @@ async def apply_smoothing(
 
 @app.post("/api/metric_smoothing")
 async def apply_metric_smoothing(metric: str = Form(...), alpha: float = Form(...)):
-    """Live per-metric OSC output smoothing (no stream restart). alpha in (0,1],
-    1 = off; falls back to the global smoothing for metrics left untouched."""
+    """Live per-metric OSC output smoothing (no stream restart).
+    alpha in (0,1], 1 = off."""
     try:
         osc_sender.set_metric_alpha(metric, alpha)
     except ValueError:
@@ -710,85 +821,18 @@ async def apply_metric_smoothing(metric: str = Form(...), alpha: float = Form(..
     return {"status": "applied", "metric": metric, "alpha": float(alpha)}
 
 
-@app.post("/api/calibrate/start")
-async def calibrate_start():
-    """Begin a calibration ('sound-check') recording. Requires detection running
-    so metrics flow into the collector."""
-    global calibrating
-    calibration.reset()
-    calibrating = True
-    return {"status": "calibrating"}
-
-
-@app.post("/api/calibrate/stop")
-async def calibrate_stop():
-    """Finish calibration: derive per-metric ranges (percentiles), install them,
-    save the profile, and switch OSC to 'fixed' mode."""
-    global calibrating
-    calibrating = False
-    ranges = calibration.ranges()
-    if ranges:
-        osc_sender.set_metric_ranges(ranges)
-        try:
-            save_profile(CALIB_PROFILE_PATH, osc_sender.metric_ranges)
-        except Exception as exc:
-            print(f"calibration profile save failed: {exc}")
-        osc_sender.configure(mode="fixed")
-    return {
-        "status": "applied",
-        "mode": osc_sender.mode,
-        "ranges": {k: list(v) for k, v in osc_sender.metric_ranges.items()},
-        "counts": {m: calibration.count(m) for m in RANGE_METRICS},
-    }
-
-
-@app.get("/api/calibrate/presets")
-async def calibrate_presets():
-    return {"presets": sorted(calib_presets.keys()), "active": active_preset}
-
-
-@app.post("/api/calibrate/save_preset")
-async def calibrate_save_preset(name: str = Form(...)):
-    global active_preset
-    name = name.strip()
-    if not name:
-        return {"status": "error", "error": "name required"}
-    if not osc_sender.metric_ranges:
-        return {"status": "error", "error": "calibrate first (no ranges yet)"}
-    calib_presets[name] = dict(osc_sender.metric_ranges)
-    try:
-        save_presets(PRESETS_PATH, calib_presets)
-    except Exception as exc:
-        print(f"preset save failed: {exc}")
-    active_preset = name
-    return {"status": "saved", "name": name, "presets": sorted(calib_presets.keys())}
-
-
-@app.post("/api/calibrate/load_preset")
-async def calibrate_load_preset(name: str = Form(...)):
-    global active_preset
-    rng = calib_presets.get(name)
-    if not rng:
-        return {"status": "error", "error": "unknown preset"}
-    osc_sender.clear_metric_ranges()
-    osc_sender.set_metric_ranges(rng)
-    osc_sender.configure(mode="fixed")
-    active_preset = name
-    return {"status": "applied", "name": name, "mode": osc_sender.mode,
-            "ranges": {k: list(v) for k, v in osc_sender.metric_ranges.items()}}
-
-
-@app.post("/api/calibrate/delete_preset")
-async def calibrate_delete_preset(name: str = Form(...)):
-    global active_preset
-    calib_presets.pop(name, None)
-    if active_preset == name:
-        active_preset = None
-    try:
-        save_presets(PRESETS_PATH, calib_presets)
-    except Exception as exc:
-        print(f"preset delete-save failed: {exc}")
-    return {"status": "deleted", "presets": sorted(calib_presets.keys())}
+@app.post("/api/metrics/enabled")
+async def apply_metric_enabled(metric: str = Form(...), enabled: bool = Form(True)):
+    if metric not in METRIC_NAMES:
+        return {"status": "error", "error": "unknown metric"}
+    current = active_metric_names()
+    if enabled and metric not in current:
+        current.append(metric)
+    elif not enabled:
+        current = [name for name in current if name != metric]
+    source_state["osc_metrics"] = [name for name in METRIC_NAMES if name in current]
+    processing_state["latest_metrics"] = filter_active_metrics(processing_state.get("latest_metrics", {}))
+    return {"status": "applied", **state_payload()}
 
 
 @app.post("/api/apply")
@@ -801,13 +845,13 @@ async def apply_input(
     osc_host: str = Form("127.0.0.1"),
     osc_port: int = Form(9000),
     osc_enabled: bool = Form(True),
-    osc_mode: str = Form("raw"),
+    osc_mode: str = Form("normalize"),
     osc_alpha: float = Form(1.0),
-    osc_namespace: str = Form("/field"),
+    osc_namespace: str = Form(""),
     performance: str = Form(DEFAULT_PERFORMANCE),
     pose_backend: str = Form("mediapipe"),
     smooth_enabled: bool = Form(True),
-    smooth_min_cutoff: float = Form(1.5),
+    smooth_min_cutoff: float = Form(0.3),
     video: Optional[UploadFile] = File(None),
 ):
     if source not in {"live", "video"}:
@@ -822,7 +866,8 @@ async def apply_input(
         namespace=osc_namespace,
     )
 
-    source_state["pose_backend"] = pose_backend if pose_backend in VALID_BACKENDS else "mediapipe"
+    available_backend_ids = {item["id"] for item in available_pose_backends()}
+    source_state["pose_backend"] = pose_backend if pose_backend in available_backend_ids else "mediapipe"
     source_state["smooth_enabled"] = bool(smooth_enabled)
     source_state["smooth_min_cutoff"] = float(smooth_min_cutoff)
     # Live-apply smoothing to the running engine (cheap). A backend SWAP is
@@ -836,10 +881,9 @@ async def apply_input(
     source_state["detect_enabled"] = bool(detect_enabled)
     apply_performance_preset(performance)
     source_state["overlay_enabled"] = True
-    source_state["osc_metrics"] = list(METRIC_NAMES)
 
     if source == "live":
-        release_camera()
+        release_camera(force=True)
         source_state.update(
             {
                 "source": "live",
@@ -1109,7 +1153,7 @@ VIEWER_HTML = """
       border: 1px solid var(--line);
       border-radius: 8px;
     }
-    .input-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: start; }
+    .input-row { display: grid; grid-template-columns: 1fr; gap: 12px; align-items: start; }
     .camera-row { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: end; }
     .mirror-row {
       display: flex;
@@ -1122,26 +1166,6 @@ VIEWER_HTML = """
       letter-spacing: .06em;
     }
     .mirror-row input { width: 15px; min-height: 15px; }
-    .or { color: var(--muted); align-self: start; padding-top: 33px; font: 13px ui-monospace, monospace; }
-    .drop-zone {
-      min-height: 42px;
-      height: 42px;
-      display: grid;
-      place-items: center;
-      border: 1px dashed var(--line);
-      border-radius: 8px;
-      color: var(--muted);
-      padding: 10px 11px;
-      text-align: center;
-      cursor: pointer;
-      background: #211f1c;
-      text-transform: none;
-      letter-spacing: 0;
-      font-size: 13px;
-      transition: border-color .15s ease, color .15s ease;
-    }
-    .drop-zone:hover { border-color: var(--amber); color: var(--text); }
-    .drop-zone.has-file { border: 1px solid var(--amber); color: var(--text); }
     .control-bar {
       position: absolute;
       left: 50%;
@@ -1251,9 +1275,9 @@ VIEWER_HTML = """
     .meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .metric-osc-controls {
       display: grid;
-      grid-template-columns: 126px minmax(150px, 1fr);
-      gap: 10px;
-      align-items: end;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-items: center;
       padding: 12px;
       border-bottom: 1px solid var(--line);
       background: #171411;
@@ -1268,27 +1292,128 @@ VIEWER_HTML = """
       text-transform: uppercase;
       letter-spacing: .06em;
     }
-    .label-row { display: flex; align-items: center; gap: 6px; }
-    .info-dot {
-      display: inline-grid;
-      place-items: center;
-      width: 18px;
+    .switch-row {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 9px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .04em;
+      min-height: 34px;
+      white-space: nowrap;
+    }
+    .metric-osc-controls .switch-row:last-child { justify-content: flex-end; }
+    .switch-row input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .switch-track {
+      position: relative;
+      width: 38px;
       height: 18px;
       border-radius: 999px;
-      border: 1px solid var(--line);
-      color: var(--muted);
-      font: 12px ui-monospace, monospace;
-      text-transform: none;
-      letter-spacing: 0;
-      cursor: help;
+      background: #453d35;
+      border: 1px solid #5a5046;
+      transition: background .12s ease, border-color .12s ease;
     }
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #a69a8b;
+      transition: transform .12s ease, background .12s ease;
+    }
+    .switch-row input:checked + .switch-track {
+      background: rgba(79, 189, 176, .28);
+      border-color: rgba(79, 189, 176, .65);
+    }
+    .switch-row input:checked + .switch-track::after {
+      transform: translateX(20px);
+      background: var(--teal);
+    }
+    .label-row { display: flex; align-items: center; gap: 6px; }
+    [data-tooltip-title], [data-tooltip-body] { cursor: help; }
     .range-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .range-value { color: var(--text); font: 12px ui-monospace, monospace; }
-    .range-hint { color: var(--muted); font-size: 12px; text-transform: none; letter-spacing: 0; }
+    .custom-tooltip {
+      position: fixed;
+      z-index: 30;
+      max-width: 340px;
+      padding: 12px 14px;
+      border: 1px solid rgba(79, 189, 176, .45);
+      border-radius: 8px;
+      background: rgba(20, 17, 14, .97);
+      box-shadow: 0 14px 38px rgba(0, 0, 0, .42);
+      color: var(--text);
+      font: 14px/1.4 Inter, system-ui, sans-serif;
+      pointer-events: none;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity .08s ease;
+    }
+    .custom-tooltip.visible { opacity: 1; visibility: visible; }
+    .tooltip-title {
+      margin-bottom: 6px;
+      color: var(--teal);
+      font: 13px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .04em;
+    }
+    .tooltip-body { color: #e2d8cb; font-size: 15px; }
+    .thin-range {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 10px;
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      --range-fill: 0%;
+      cursor: pointer;
+    }
+    .thin-range::-webkit-slider-runnable-track {
+      height: 3px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--teal) 0 var(--range-fill), #4a4239 var(--range-fill) 100%);
+    }
+    .thin-range::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 9px;
+      height: 9px;
+      margin-top: -3px;
+      border-radius: 50%;
+      background: var(--teal);
+      border: 0;
+    }
+    .thin-range::-moz-range-track {
+      height: 3px;
+      border-radius: 999px;
+      background: #4a4239;
+    }
+    .thin-range::-moz-range-progress {
+      height: 3px;
+      border-radius: 999px;
+      background: var(--teal);
+    }
+    .thin-range::-moz-range-thumb {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--teal);
+      border: 0;
+    }
+    .thin-range:disabled { opacity: .35; cursor: default; }
+    .thin-range:focus-visible { outline: 1px solid rgba(79, 189, 176, .55); outline-offset: 3px; }
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 162px 96px 1fr;
+      grid-template-columns: 28px minmax(0, 1fr) 184px;
       align-items: center;
       gap: 10px;
       min-height: 52px;
@@ -1297,20 +1422,31 @@ VIEWER_HTML = """
       border: 1px solid var(--line);
       border-radius: 8px;
     }
+    .metric.disabled { opacity: .45; }
+    .metric-enable { display: grid; place-items: center; }
+    .metric-enable input { width: 16px; height: 16px; accent-color: var(--teal); }
     .metric-label { display: grid; gap: 3px; min-width: 0; }
-    .name { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; overflow-wrap: anywhere; }
-    .metric-hint { color: #93887c; font-size: 12px; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .metric-smooth-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 4px; }
-    .metric-smooth-row .ms-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
-    .metric-smooth-row input[type=range] { flex: 1; min-width: 0; }
+    .name { color: var(--muted); font-size: 13px; letter-spacing: .02em; overflow-wrap: anywhere; }
+    .metric-smooth-row { display: flex; align-items: center; gap: 7px; justify-self: end; width: 184px; }
+    .metric-smooth-row .ms-label { color: #756b60; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .metric-smooth-row input[type=range] {
+      flex: 1;
+      min-width: 0;
+    }
     .metric-smooth-row .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 32px; text-align: right; }
-    .calib-btn { width: 100%; padding: 9px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-soft); color: inherit; cursor: pointer; font-size: 13px; }
-    .calib-btn.recording { border-color: #c0392b; color: #f1948a; }
-    .calib-info { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .metric-readout {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+    }
     .value {
       font: 16px ui-monospace, SFMono-Regular, Menlo, monospace;
       font-variant-numeric: tabular-nums;
-      text-align: right;
+      min-width: 4.5ch;
+      text-align: left;
       overflow: hidden;
       text-overflow: ellipsis;
     }
@@ -1391,24 +1527,35 @@ VIEWER_HTML = """
       align-items: end;
     }
     .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
+    .output-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 190px;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 10px;
+    }
+    .output-header .section-title { margin: 0 0 8px; }
+    .output-mode select { min-height: 34px; padding: 6px 10px; }
     .address-list { display: grid; gap: 7px; color: var(--muted); font: 13px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
-      .controls-grid, .osc-settings, .metric-osc-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls-grid, .osc-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .apply-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-settings, .metric-osc-controls, .meta { grid-template-columns: 1fr; }
-      .metric { grid-template-columns: minmax(0, 1fr) auto; }
-      .metric .value { text-align: right; }
-      .metric .bar { grid-column: 1 / -1; }
+      .controls-grid, .osc-settings, .metric-osc-controls, .meta, .output-header { grid-template-columns: 1fr; }
+      .switch-row { justify-content: flex-start; }
+      .metric-osc-controls .switch-row:last-child { justify-content: flex-start; }
+      .metric { grid-template-columns: 28px minmax(0, 1fr); align-items: start; }
+      .metric-smooth-row { grid-column: 1 / -1; justify-self: stretch; width: 100%; }
+      .metric-readout { grid-column: 1 / -1; }
     }
   </style>
 </head>
 <body>
-  <main>
+      <main>
     <header>
       <div>
         <h1>FIELD<span class="h1-sub">Realtime Dance</span></h1>
@@ -1447,23 +1594,10 @@ VIEWER_HTML = """
                     <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" checked /> Mirror camera</span>
                   </div>
                 </label>
-                <div class="or">or</div>
-                <label>Video
-                  <input id="video" name="video" type="file" accept="video/*" class="hidden" />
-                  <div id="dropZone" class="drop-zone">Click to upload video</div>
-                </label>
               </div>
               <label class="model-row">Detection model
                 <select id="poseBackend" name="pose_backend">
-                  <option value="mediapipe">MediaPipe (default &middot; any GPU)</option>
-                  <option value="rtmpose3d">RTMPose3D (NVIDIA GPU)</option>
-                </select>
-              </label>
-              <label class="model-row">Quality
-                <select id="quality" name="performance">
-                  <option value="fast">Fast (854x480)</option>
-                  <option value="balanced" selected>Balanced (1280x720)</option>
-                  <option value="quality">Quality (1920x1080)</option>
+                  <option value="mediapipe">MediaPipe</option>
                 </select>
               </label>
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
@@ -1471,8 +1605,8 @@ VIEWER_HTML = """
           </div>
           <div id="emptyState" class="empty hidden">camera off</div>
           <div id="metricOverlay" class="metric-overlay"></div>
-          <button id="changeInputButton" class="change-input" type="button">Change Input</button>
-          <div class="control-bar">
+          <button id="changeInputButton" class="change-input hidden" type="button">Change Input</button>
+          <div id="controlBar" class="control-bar hidden">
             <button id="cameraButton" class="ctrl-btn off" type="button" title="Turn camera on">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="2.5" y="6.5" width="13" height="11" rx="2.5"/>
@@ -1527,52 +1661,40 @@ VIEWER_HTML = """
           </div>
         </div>
         <div class="metric-address-panel">
-          <p class="section-title">Output values</p>
+          <div class="output-header">
+            <p class="section-title">Output values</p>
+          </div>
           <div id="addresses" class="address-list"></div>
         </div>
       </section>
 
       <aside class="panel">
         <div class="metric-osc-controls">
-          <label><span class="label-row">Mode <span class="info-dot" title="raw: values in their original units. normalize: every metric mapped into 0-1 with an adaptive range (sync_corr -1..1 becomes 0..1, 0.5 neutral).">?</span></span>
-            <select id="oscMode" name="osc_mode">
-              <option value="raw">raw</option>
-              <option value="normalize">normalize (adaptive)</option>
-              <option value="fixed">fixed (calibrated)</option>
-            </select>
+          <label class="switch-row" data-tooltip-title="Joint Smoothness" data-tooltip-body="One-Euro filter on the skeleton before metrics. When on, the source skeleton is smoothed before the metrics are calculated.">
+            <span>Joint smoothness</span>
+            <input id="jointSmoothEnabled" type="checkbox" checked />
+            <span class="switch-track"></span>
           </label>
-          <label><span class="range-label-row"><span class="label-row">Smoothing <span class="info-dot" title="Global EMA on the OSC output (fallback for metrics without their own slider). 1 = off; lower = steadier but slower. Default off -- One-Euro on the joints is the primary smoother.">?</span></span><span id="oscAlphaValue" class="range-value">1.00</span></span>
-            <input id="oscAlpha" name="osc_alpha" type="range" min="0.01" max="1" step="0.01" value="1" />
-            <span class="range-hint">lower = smoother &middot; 1 = off</span>
-          </label>
-          <label class="osc-toggle-row"><input id="smoothEnabled" name="smooth_enabled" type="checkbox" checked /> Smooth joints (One-Euro)</label>
-          <label><span class="range-label-row"><span class="label-row">Joint smoothing <span class="info-dot" title="One-Euro filter on the skeleton before metrics. Lower = smoother (more lag); higher = more responsive. Cuts jitter in torque/jerk at the source.">?</span></span><span id="smoothCutoffValue" class="range-value">1.5</span></span>
-            <input id="smoothCutoff" name="smooth_min_cutoff" type="range" min="0.3" max="6" step="0.1" value="1.5" />
-            <span class="range-hint">lower = smoother</span>
+          <label class="switch-row" data-tooltip-title="Normalize Output" data-tooltip-body="Off keeps raw metric units. On maps most active metrics into an adaptive 0-1 range for easier visual and audio mapping. Sync Correlation stays -1 to 1.">
+            <span>Normalize</span>
+            <input id="normalizeOutput" type="checkbox" checked />
+            <span class="switch-track"></span>
           </label>
         </div>
-        <div class="calib-panel" style="padding:6px 14px;">
-          <button id="calibBtn" type="button" class="calib-btn">Calibrate (&#35430;&#38899;)</button>
-          <div id="calibInfo" class="calib-info hidden">Recording &mdash; hold each ~4s while detecting: <b>1) small &amp; still</b> (curl up, crouch low, freeze) &middot; <b>2) big &amp; round</b> (reach/hop up tall, spread wide, big circles with hands &amp; feet, lean far each way) &middot; <b>3) fast &amp; sharp</b> (explosive bursts, sudden stops). Then press stop.</div>
-          <div class="preset-row" style="display:flex; gap:6px; margin-top:6px; align-items:center;">
-            <select id="presetSelect" style="flex:1; min-width:0;"><option value="">&mdash; preset &mdash;</option></select>
-            <button id="presetSaveBtn" type="button" class="calib-btn" style="width:auto; padding:6px 10px;">Save as&hellip;</button>
-            <button id="presetDelBtn" type="button" class="calib-btn" style="width:auto; padding:6px 10px;">Del</button>
-          </div>
-        </div>
-        <div class="charts-link" style="padding:2px 14px 8px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">&#128200; Open live charts &#8599;</a></div>
         <div id="metrics" class="metric-grid"></div>
+        <div class="charts-link" style="padding:0 14px 12px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">Open live charts &#8599;</a></div>
         <div id="culturePanel" class="culture-panel hidden">
-          <p class="section-title">Culture Axis <span class="info-dot" title="A rolling ~2s average of the 9 metrics, compared against the Morris and BaYe training clips. 1.0 = movement statistics match Morris, 0.0 = match BaYe, 0.5 = between the two.">?</span></p>
+          <p class="section-title" data-tooltip-title="Culture Axis" data-tooltip-body="A rolling average of the 9 metrics compared against the Morris and BaYe training clips. 1.0 matches Morris, 0.0 matches BaYe, 0.5 sits between the two.">Culture Axis</p>
           <div class="culture-row">
             <span class="culture-end baye">BAYE</span>
             <div class="culture-track"><div id="cultureMarker" class="culture-marker"></div></div>
             <span class="culture-end morris">MORRIS</span>
           </div>
-          <div id="cultureValue" class="culture-value">/field/morrisness –</div>
+          <div id="cultureValue" class="culture-value">/field/morrisness -</div>
         </div>
       </aside>
     </section>
+    <div id="customTooltip" class="custom-tooltip" role="tooltip"></div>
     <input id="source" name="source" type="hidden" value="live" />
     <input id="loop" name="loop" type="hidden" value="true" />
     <input id="detectEnabled" name="detect_enabled" type="hidden" value="false" />
@@ -1582,64 +1704,154 @@ VIEWER_HTML = """
     const metricNames = %METRICS%;
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
     const metricsEl = document.getElementById('metrics');
+    const tooltipEl = document.getElementById('customTooltip');
     const maxSeen = {};
-    const metricHints = {
-      energy: 'high = more motion',
-      sync_velocity: '1 = both sides active',
-      sync_correlation: 'high = left/right in phase',
-      expansion: 'high = open posture',
-      curvature: 'high = rounder paths',
-      height: 'body centre level',
-      sway: 'low = steadier balance',
-      torque: 'high = forceful accents',
-      jerk: 'low = smoother motion',
+    const metricLabels = {
+      energy: 'Energy',
+      sync_velocity: 'Sync Velocity',
+      sync_correlation: 'Sync Correlation',
+      expansion: 'Expansion',
+      curvature: 'Curvature',
+      height: 'Height',
+      sway: 'Sway',
+      torque: 'Torque',
+      jerk: 'Jerk',
     };
     const metricDescriptions = {
-      energy: 'Overall movement intensity, from how fast all limbs rotate. Big, fast motion pushes it up; standing still reads near 0.',
-      sync_velocity: 'How evenly left and right move. 1 = both sides equally active, 0 = one side does all the work.',
-      sync_correlation: 'Whether left and right move at the same time. +1 = together, 0 = independent, -1 = alternating. Normalize shows it as 0-1 with 0.5 neutral.',
-      expansion: 'How much space the body occupies. High = open, spread-out postures; low = compact, closed shapes.',
-      curvature: 'How curved the hand and foot paths are. High = round, circular movement; low = straight lines.',
-      height: 'Body centre height relative to the hips. Drops when crouching or folding the torso.',
-      sway: 'Horizontal drift of the body centre away from the feet. High = leaning or off balance.',
-      torque: 'How hard the movement changes speed. High = sharp, forceful accents; low = even pacing.',
-      jerk: 'How abrupt those speed changes are. Low = flowing; high = jagged, twitchy. Raw values get very large - use normalize for a readable range.',
+      energy: 'Overall movement intensity from limb rotation speed. Higher means bigger or faster full-body motion; near 0 means stillness.',
+      sync_velocity: 'Left-right activity balance. 1 means both sides are similarly active; 0 means one side is doing most of the movement.',
+      sync_correlation: 'Left-right timing relationship. +1 means both sides move together, 0 means independent timing, -1 means alternating timing.',
+      expansion: 'How much space the body occupies. Higher means open or spread-out shapes; lower means compact or closed shapes.',
+      curvature: 'How rounded the hand and foot paths are. Higher means curved/circular paths; lower means straighter paths.',
+      height: 'Body center height relative to the hips. Lower values usually mean crouching, folding, or dropping the torso.',
+      sway: 'Horizontal drift of the body center away from the feet. Higher means leaning, traveling, or less steady balance.',
+      torque: 'How strongly movement changes speed around the joints. Higher means sharper accents or more forceful changes.',
+      jerk: 'Abruptness of acceleration changes. Higher means jagged or twitchy motion; lower means smoother, more continuous flow.',
     };
+    function labelForMetric(name) {
+      return metricLabels[name] || name;
+    }
+    function setTooltipTarget(el, title, body) {
+      el.dataset.tooltipTitle = title || '';
+      el.dataset.tooltipBody = body || '';
+    }
+    function tooltipTargetFrom(eventTarget) {
+      return eventTarget?.closest?.('[data-tooltip-title], [data-tooltip-body]');
+    }
+    function setTooltipPosition(event) {
+      const margin = 14;
+      let left = event.clientX + 16;
+      let top = event.clientY + 16;
+      tooltipEl.style.left = `${left}px`;
+      tooltipEl.style.top = `${top}px`;
+      const rect = tooltipEl.getBoundingClientRect();
+      if (rect.right > window.innerWidth - margin) left = event.clientX - rect.width - 16;
+      if (rect.bottom > window.innerHeight - margin) top = event.clientY - rect.height - 16;
+      tooltipEl.style.left = `${Math.max(margin, left)}px`;
+      tooltipEl.style.top = `${Math.max(margin, top)}px`;
+    }
+    function showTooltip(target, event) {
+      const title = target.dataset.tooltipTitle || '';
+      const body = target.dataset.tooltipBody || '';
+      if (!title && !body) return;
+      tooltipEl.innerHTML = '';
+      if (title) {
+        const titleEl = document.createElement('div');
+        titleEl.className = 'tooltip-title';
+        titleEl.textContent = title;
+        tooltipEl.appendChild(titleEl);
+      }
+      if (body) {
+        const bodyEl = document.createElement('div');
+        bodyEl.className = 'tooltip-body';
+        bodyEl.textContent = body;
+        tooltipEl.appendChild(bodyEl);
+      }
+      tooltipEl.classList.add('visible');
+      setTooltipPosition(event);
+    }
+    function hideTooltip() {
+      tooltipEl.classList.remove('visible');
+    }
+    document.addEventListener('pointermove', event => {
+      const target = tooltipTargetFrom(event.target);
+      if (!target) {
+        hideTooltip();
+        return;
+      }
+      showTooltip(target, event);
+    });
+    document.addEventListener('pointerleave', hideTooltip);
+    document.addEventListener('scroll', hideTooltip, true);
     const centeredMetrics = new Set(['sync_correlation']);
     const metricOverlayEl = document.getElementById('metricOverlay');
+    function clamp01(v) { return Math.max(0, Math.min(1, Number(v))); }
+    function snapSmoothness(value) {
+      return Math.round(Number(value) / 5) * 5;
+    }
+    function setRangeFill(input, value = input.value) {
+      const pct = Math.max(0, Math.min(100, Number(value) || 0));
+      input.style.setProperty('--range-fill', `${pct}%`);
+    }
+    function smoothnessToAlpha(smoothness) {
+      return 1 - (clamp01(snapSmoothness(smoothness) / 100) * 0.98);
+    }
 
     for (const name of metricNames) {
       maxSeen[name] = 1;
       const row = document.createElement('div');
       row.className = 'metric';
-      row.title = metricDescriptions[name] || name;
+      row.id = `metric-${name}`;
+      setTooltipTarget(row, labelForMetric(name), metricDescriptions[name] || '');
       row.innerHTML = `
-        <div class="metric-label" title="${metricDescriptions[name] || name}">
-          <div class="name">${name}</div>
-          <div class="metric-hint">${metricHints[name] || ''}</div>
+        <label class="metric-enable" data-tooltip-title="Output ${labelForMetric(name)}" data-tooltip-body="Checked metrics are included in OSC output, Output values, overlays, and live charts."><input class="metric-toggle" type="checkbox" checked /></label>
+        <div class="metric-label" data-tooltip-title="${labelForMetric(name)}" data-tooltip-body="${metricDescriptions[name] || ''}">
+          <div class="name">${labelForMetric(name)}</div>
         </div>
-        <div class="value" id="v-${name}">0.00</div>
-        <div class="bar" id="bar-${name}"><div class="fill" id="b-${name}"></div></div>
         <div class="metric-smooth-row">
-          <span class="ms-label">smooth</span>
-          <input class="metric-smooth" type="range" min="0.02" max="1" step="0.01" value="1" title="Per-metric output smoothing (lower = smoother, 1 = off). On top of One-Euro." />
-          <span class="ms-val">1.00</span>
+          <span class="ms-label">smoothness</span>
+          <input class="metric-smooth thin-range" type="range" min="0" max="100" step="5" value="0" data-tooltip-title="${labelForMetric(name)} Smoothness" data-tooltip-body="Per-metric output smoothing. Higher values make this output channel smoother; 0% is off. This happens after the One-Euro joint smoothing." />
+          <span class="ms-val">0%</span>
+        </div>
+        <div class="metric-readout">
+          <div class="value" id="v-${name}">0.00</div>
+          <div class="bar" id="bar-${name}"><div class="fill" id="b-${name}"></div></div>
         </div>
       `;
       metricsEl.appendChild(row);
+      const toggle = row.querySelector('.metric-toggle');
       const msInput = row.querySelector('.metric-smooth');
       const msVal = row.querySelector('.ms-val');
-      msInput.addEventListener('input', () => { msVal.textContent = msInput.value; });
-      msInput.addEventListener('change', async () => {
+      setRangeFill(msInput, 0);
+      toggle.addEventListener('change', async () => {
         const data = new FormData();
         data.set('metric', name);
-        data.set('alpha', msInput.value);
+        data.set('enabled', toggle.checked ? 'true' : 'false');
+        try {
+          const res = await fetch('/api/metrics/enabled', { method: 'POST', body: data });
+          update(await res.json());
+        } catch (e) {}
+      });
+      msInput.addEventListener('input', () => {
+        const snapped = snapSmoothness(msInput.value);
+        setRangeFill(msInput, snapped);
+        msVal.textContent = `${snapped}%`;
+      });
+      msInput.addEventListener('change', async () => {
+        const snapped = snapSmoothness(msInput.value);
+        msInput.value = snapped;
+        setRangeFill(msInput, snapped);
+        msVal.textContent = `${snapped}%`;
+        const data = new FormData();
+        data.set('metric', name);
+        data.set('alpha', String(smoothnessToAlpha(snapped)));
         try { await fetch('/api/metric_smoothing', { method: 'POST', body: data }); } catch (e) {}
       });
 
       const ovRow = document.createElement('div');
       ovRow.className = 'ov-row';
-      ovRow.innerHTML = `<span class="ov-name">${name}</span><span class="ov-val" id="ov-${name}">0.00</span>`;
+      ovRow.id = `ov-row-${name}`;
+      ovRow.innerHTML = `<span class="ov-name">${labelForMetric(name)}</span><span class="ov-val" id="ov-${name}">0.00</span>`;
       metricOverlayEl.appendChild(ovRow);
     }
 
@@ -1649,7 +1861,8 @@ VIEWER_HTML = """
       data.set('loop', 'true');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
-      data.set('smooth_enabled', document.getElementById('smoothEnabled').checked ? 'true' : 'false');
+      data.set('smooth_enabled', document.getElementById('jointSmoothEnabled').checked ? 'true' : 'false');
+      data.set('smooth_min_cutoff', '0.3');
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
       }
@@ -1671,8 +1884,8 @@ VIEWER_HTML = """
       data.set('osc_host', document.getElementById('oscHost').value);
       data.set('osc_port', document.getElementById('oscPort').value);
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
-      data.set('osc_mode', document.getElementById('oscMode').value);
-      data.set('osc_alpha', document.getElementById('oscAlpha').value);
+      data.set('osc_mode', document.getElementById('normalizeOutput').checked ? 'normalize' : 'raw');
+      data.set('osc_alpha', '1');
       data.set('osc_namespace', document.getElementById('oscNamespace').value);
       return data;
     }
@@ -1710,16 +1923,16 @@ VIEWER_HTML = """
       }
     }
 
-    const videoInput = document.getElementById('video');
-    const dropZone = document.getElementById('dropZone');
     const sourceInput = document.getElementById('source');
     const detectInput = document.getElementById('detectEnabled');
     const streamImage = document.getElementById('stream');
     const previewVideo = document.getElementById('previewVideo');
     const detectButton = document.getElementById('detectButton');
     const cameraButton = document.getElementById('cameraButton');
+    const inputOverlay = document.getElementById('inputOverlay');
+    const changeInputButton = document.getElementById('changeInputButton');
+    const controlBar = document.getElementById('controlBar');
 
-    let selectedVideoUrl = null;
     let isDetecting = false;
     let cameraOn = false;
     let lastPayload = null;
@@ -1727,17 +1940,27 @@ VIEWER_HTML = """
     let oscDirty = false;
     let oscApplyTimer = null;
 
+    function setInputControlsVisible(visible) {
+      changeInputButton.classList.toggle('hidden', !visible);
+      controlBar.classList.toggle('hidden', !visible);
+    }
+
+    function showInputMenu() {
+      inputOverlay.classList.remove('compact');
+      setInputControlsVisible(false);
+      document.getElementById('emptyState').classList.add('hidden');
+    }
+
+    function showActiveInput() {
+      inputOverlay.classList.add('compact');
+      setInputControlsVisible(true);
+    }
+
     function showPreview() {
       streamImage.classList.add('hidden');
-      if (sourceInput.value === 'video' && selectedVideoUrl) {
-        previewVideo.src = selectedVideoUrl;
-        previewVideo.classList.remove('hidden');
-        previewVideo.play().catch(() => {});
-      } else {
-        previewVideo.classList.add('hidden');
-        streamImage.classList.remove('hidden');
-        streamImage.src = `/preview_stream?t=${Date.now()}`;
-      }
+      previewVideo.classList.add('hidden');
+      streamImage.classList.remove('hidden');
+      streamImage.src = `/preview_stream?t=${Date.now()}`;
     }
 
     function showDetectionStream() {
@@ -1772,34 +1995,18 @@ VIEWER_HTML = """
     document.getElementById('camera').addEventListener('change', () => {
       inputDirty = true;
       sourceInput.value = 'live';
-      videoInput.value = '';
-      selectedVideoUrl = null;
       previewVideo.removeAttribute('src');
-      dropZone.classList.remove('has-file');
-      dropZone.textContent = 'Click to upload video';
     });
     document.getElementById('mirrorLive').addEventListener('change', () => {
       inputDirty = true;
       sourceInput.value = 'live';
     });
-    dropZone.addEventListener('click', event => {
-      event.preventDefault();
-      event.stopPropagation();
-      videoInput.click();
-    });
-    videoInput.addEventListener('change', () => {
-      if (videoInput.files.length > 0) {
-        inputDirty = true;
-        sourceInput.value = 'video';
-        if (selectedVideoUrl) URL.revokeObjectURL(selectedVideoUrl);
-        selectedVideoUrl = URL.createObjectURL(videoInput.files[0]);
-        dropZone.classList.add('has-file');
-        dropZone.textContent = videoInput.files[0].name;
-        showPreview();
-      }
-    });
-    document.getElementById('changeInputButton').addEventListener('click', () => {
-      document.getElementById('inputOverlay').classList.remove('compact');
+    changeInputButton.addEventListener('click', async () => {
+      setDetectButton(false);
+      setCameraButton(false);
+      await applySettings(false).catch(() => null);
+      await stopStream();
+      showInputMenu();
     });
     const videoWrap = document.querySelector('.video-wrap');
     const fullscreenButton = document.getElementById('fullscreenButton');
@@ -1842,12 +2049,12 @@ VIEWER_HTML = """
       document.getElementById('stoppedOverlay').classList.remove('hidden');
     });
     document.getElementById('enterInputButton').addEventListener('click', async () => {
-      setDetectButton(false);
-      const payload = await applySettings(false);
+      const payload = await applySettings(true);
       if (!payload || payload.status !== 'applied') return;
-      document.getElementById('inputOverlay').classList.add('compact');
+      setDetectButton(true);
+      showActiveInput();
       setCameraButton(true);
-      showPreview();
+      showDetectionStream();
     });
     cameraButton.addEventListener('click', async () => {
       if (cameraOn) {
@@ -1857,7 +2064,7 @@ VIEWER_HTML = """
       } else {
         const payload = await applySettings(false);
         if (!payload || payload.status !== 'applied') return;
-        document.getElementById('inputOverlay').classList.add('compact');
+        showActiveInput();
         setCameraButton(true);
         showPreview();
       }
@@ -1868,7 +2075,7 @@ VIEWER_HTML = """
       if (!payload || payload.status !== 'applied') return;
       setDetectButton(nextState);
       setCameraButton(true);
-      document.getElementById('inputOverlay').classList.add('compact');
+      showActiveInput();
       if (nextState) {
         showDetectionStream();
       } else {
@@ -1885,123 +2092,40 @@ VIEWER_HTML = """
         if (payload && payload.status === 'applied') showDetectionStream();
       }
     });
-    document.getElementById('quality').addEventListener('change', async () => {
-      inputDirty = true;
-      // Resolution change reopens the camera (apply releases it), so re-apply.
-      if (!cameraOn && !isDetecting) return;
-      const payload = await applySettings(isDetecting);
-      if (!payload || payload.status !== 'applied') return;
-      if (isDetecting) showDetectionStream(); else showPreview();
-    });
-    const smoothCutoffEl = document.getElementById('smoothCutoff');
-    const smoothCutoffValueEl = document.getElementById('smoothCutoffValue');
-    async function applySmoothing() {
-      // Lightweight live-tune: does NOT restart the stream (no session bump).
+    const jointSmoothEnabledEl = document.getElementById('jointSmoothEnabled');
+    async function applyJointSmoothing() {
       const data = new FormData();
-      data.set('smooth_enabled', document.getElementById('smoothEnabled').checked ? 'true' : 'false');
-      data.set('smooth_min_cutoff', smoothCutoffEl.value);
+      data.set('smooth_enabled', jointSmoothEnabledEl.checked ? 'true' : 'false');
+      data.set('smooth_min_cutoff', '0.3');
       try { await fetch('/api/smoothing', { method: 'POST', body: data }); } catch (e) {}
     }
-    smoothCutoffEl.addEventListener('input', () => {
-      smoothCutoffValueEl.textContent = smoothCutoffEl.value;
-    });
-    smoothCutoffEl.addEventListener('change', applySmoothing);
-    document.getElementById('smoothEnabled').addEventListener('change', applySmoothing);
-
-    let calibrating = false;
-    const calibBtn = document.getElementById('calibBtn');
-    const calibInfo = document.getElementById('calibInfo');
-    calibBtn.addEventListener('click', async () => {
-      if (!calibrating) {
-        if (!isDetecting) { alert('Start detection first, then Calibrate.'); return; }
-        try { await fetch('/api/calibrate/start', { method: 'POST' }); } catch (e) { return; }
-        calibrating = true;
-        calibBtn.textContent = 'Stop & save (recording...)';
-        calibBtn.classList.add('recording');
-        calibInfo.classList.remove('hidden');
-      } else {
-        let d = {};
-        try { const r = await fetch('/api/calibrate/stop', { method: 'POST' }); d = await r.json(); } catch (e) {}
-        calibrating = false;
-        calibBtn.textContent = 'Calibrate (試音)';
-        calibBtn.classList.remove('recording');
-        calibInfo.classList.add('hidden');
-        const n = Object.keys(d.ranges || {}).length;
-        if (n > 0) {
-          document.getElementById('oscMode').value = 'fixed';
-          alert('Calibrated ' + n + ' metrics. OSC mode set to fixed (calibrated ranges).');
-        } else {
-          alert('Not enough data - keep detection running and keep moving for a few seconds, then Calibrate again.');
-        }
-      }
-    });
-
-    const presetSelect = document.getElementById('presetSelect');
-    async function refreshPresets(active) {
-      try {
-        const r = await fetch('/api/calibrate/presets');
-        const d = await r.json();
-        const sel = (active !== undefined) ? active : d.active;
-        presetSelect.innerHTML = '<option value="">— preset —</option>';
-        for (const n of (d.presets || [])) {
-          const o = document.createElement('option');
-          o.value = n; o.textContent = n;
-          if (n === sel) o.selected = true;
-          presetSelect.appendChild(o);
-        }
-      } catch (e) {}
-    }
-    presetSelect.addEventListener('change', async () => {
-      const name = presetSelect.value;
-      if (!name) return;
-      const data = new FormData(); data.set('name', name);
-      const r = await fetch('/api/calibrate/load_preset', { method: 'POST', body: data });
-      const d = await r.json();
-      if (d.status === 'applied') document.getElementById('oscMode').value = 'fixed';
-      else alert(d.error || 'load failed');
-    });
-    document.getElementById('presetSaveBtn').addEventListener('click', async () => {
-      const name = prompt('Save current calibration as preset:');
-      if (!name) return;
-      const data = new FormData(); data.set('name', name);
-      const r = await fetch('/api/calibrate/save_preset', { method: 'POST', body: data });
-      const d = await r.json();
-      if (d.status === 'saved') refreshPresets(name);
-      else alert(d.error || 'save failed - calibrate first');
-    });
-    document.getElementById('presetDelBtn').addEventListener('click', async () => {
-      const name = presetSelect.value;
-      if (!name) { alert('Pick a preset to delete first.'); return; }
-      if (!confirm('Delete preset "' + name + '"?')) return;
-      const data = new FormData(); data.set('name', name);
-      await fetch('/api/calibrate/delete_preset', { method: 'POST', body: data });
-      refreshPresets('');
-    });
-    refreshPresets();
+    jointSmoothEnabledEl.addEventListener('change', applyJointSmoothing);
 
     function normalizePrefix(prefix) {
-      let value = (prefix || '/field').trim().replace(/\\/+$/, '');
-      if (!value) value = '/field';
+      let value = (prefix || '').trim().replace(/\\/+$/, '');
+      if (!value) return '';
       if (!value.startsWith('/')) value = `/${value}`;
       return value;
     }
 
+    function metricAddress(prefix, name) {
+      const leaf = oscAddressNames[name] || name;
+      return prefix ? `${prefix}/${leaf}` : `/${leaf}`;
+    }
+
     function updateAddresses(payload = lastPayload) {
       const metrics = payload?.processing?.latest_metrics || {};
+      const active = new Set(payload?.source?.osc_metrics || metricNames);
       const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
       const container = document.getElementById('addresses');
       container.innerHTML = '';
       for (const name of metricNames) {
+        if (!active.has(name)) continue;
         const row = document.createElement('div');
         const value = Number(metrics[name] ?? 0);
-        row.textContent = `${prefix}/${oscAddressNames[name] || name}  ${formatMetric(value)}`;
+        row.textContent = `${metricAddress(prefix, name)}  ${formatMetric(value)}`;
         container.appendChild(row);
       }
-    }
-
-    function syncAlphaLabel() {
-      const alpha = Number(document.getElementById('oscAlpha').value || 0.25);
-      document.getElementById('oscAlphaValue').textContent = alpha.toFixed(2);
     }
 
     function formatMetric(value) {
@@ -2016,7 +2140,7 @@ VIEWER_HTML = """
       const fill = document.getElementById(`b-${name}`);
       if (!bar || !fill) return;
 
-      if (centeredMetrics.has(name) && mode !== 'normalize') {
+      if (centeredMetrics.has(name)) {
         bar.classList.add('centered');
         const delta = Math.max(-1, Math.min(1, value));
         const width = Math.abs(delta) * 50;
@@ -2032,23 +2156,42 @@ VIEWER_HTML = """
       fill.style.width = `${width}%`;
     }
 
+    function syncPoseBackends(payload) {
+      const select = document.getElementById('poseBackend');
+      const backends = payload?.pose_backends || [{ id: 'mediapipe', label: 'MediaPipe', description: 'cross-platform' }];
+      const signature = backends.map(b => `${b.id}:${b.label}:${b.description || ''}`).join('|');
+      if (select.dataset.signature !== signature) {
+        select.innerHTML = '';
+        for (const backend of backends) {
+          const option = document.createElement('option');
+          option.value = backend.id;
+          option.textContent = backend.description ? `${backend.label} (${backend.description})` : backend.label;
+          select.appendChild(option);
+        }
+        select.dataset.signature = signature;
+      }
+      select.value = payload?.source?.pose_backend || 'mediapipe';
+    }
+
     function update(payload) {
       lastPayload = payload;
       const source = payload.source || {};
       const processing = payload.processing || {};
       const osc = payload.osc || {};
       const metrics = processing.latest_metrics || {};
+      const active = new Set(source.osc_metrics || metricNames);
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
+      syncPoseBackends(payload);
       if (!inputDirty) {
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
+        document.getElementById('jointSmoothEnabled').checked = Boolean(source.smooth_enabled ?? true);
       }
       if (!oscDirty) {
         document.getElementById('oscHost').value = osc.host || '127.0.0.1';
         document.getElementById('oscPort').value = osc.port || 9000;
-        document.getElementById('oscNamespace').value = osc.namespace || '/field';
-        document.getElementById('oscAlpha').value = osc.alpha ?? 0.25;
-        syncAlphaLabel();
-        document.getElementById('oscMode').value = osc.mode || 'raw';
+        document.getElementById('oscNamespace').value =
+          (osc.namespace === undefined || osc.namespace === null) ? '/field' : osc.namespace;
+        document.getElementById('normalizeOutput').checked = (osc.mode || 'normalize') === 'normalize';
         document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
       }
 
@@ -2071,8 +2214,27 @@ VIEWER_HTML = """
       updateAddresses(payload);
 
       for (const name of metricNames) {
-        const value = Number(metrics[name] ?? 0);
+        const enabled = active.has(name);
+        const row = document.getElementById(`metric-${name}`);
+        const toggle = row?.querySelector('.metric-toggle');
+        const smooth = row?.querySelector('.metric-smooth');
         const valueEl = document.getElementById(`v-${name}`);
+        if (row) row.classList.toggle('disabled', !enabled);
+        if (toggle) toggle.checked = enabled;
+        if (smooth) smooth.disabled = !enabled;
+        const ovRow = document.getElementById(`ov-row-${name}`);
+        if (ovRow) ovRow.style.display = enabled ? '' : 'none';
+        if (!enabled) {
+          valueEl.textContent = 'off';
+          valueEl.title = 'Metric disabled';
+          const fill = document.getElementById(`b-${name}`);
+          if (fill) {
+            fill.style.left = '0%';
+            fill.style.width = '0%';
+          }
+          continue;
+        }
+        const value = Number(metrics[name] ?? 0);
         valueEl.textContent = formatMetric(value);
         valueEl.title = Number.isFinite(value) ? value.toFixed(2) : String(value);
         updateMetricBar(name, value, osc.mode || 'raw');
@@ -2085,8 +2247,10 @@ VIEWER_HTML = """
         document.getElementById('culturePanel').classList.remove('hidden');
         const pct = Math.max(0, Math.min(100, Number(morrisness) * 100));
         document.getElementById('cultureMarker').style.left = `${pct.toFixed(1)}%`;
+        const culturePrefix = normalizePrefix(document.getElementById('oscNamespace').value);
+        const cultureAddress = culturePrefix ? `${culturePrefix}/morrisness` : '/morrisness';
         document.getElementById('cultureValue').textContent =
-          `/field/morrisness  ${Number(morrisness).toFixed(2)}`;
+          `${cultureAddress}  ${Number(morrisness).toFixed(2)}`;
       }
     }
 
@@ -2102,10 +2266,9 @@ VIEWER_HTML = """
       }, delay);
     }
 
-    ['oscHost', 'oscPort', 'oscAlpha', 'oscMode', 'oscEnabled'].forEach(id => {
+    ['oscHost', 'oscPort', 'normalizeOutput', 'oscEnabled'].forEach(id => {
       const input = document.getElementById(id);
       input.addEventListener('input', () => {
-        if (id === 'oscAlpha') syncAlphaLabel();
         scheduleOscApply();
       });
       input.addEventListener('change', () => scheduleOscApply(0));
@@ -2253,7 +2416,7 @@ def main():
     parser.add_argument("--web-port", type=int, default=9100)
     parser.add_argument("--osc-host", default=os.getenv("FIELD_OSC_HOST", "127.0.0.1"))
     parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
-    parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "raw"))
+    parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "normalize"))
     parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
     parser.add_argument(

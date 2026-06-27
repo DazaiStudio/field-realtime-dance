@@ -41,14 +41,16 @@ class TestAddresses(unittest.TestCase):
     def test_namespace_normalization(self):
         self.assertEqual(make_sender(namespace="field").namespace, "/field")
         self.assertEqual(make_sender(namespace="/custom/").namespace, "/custom")
-        self.assertEqual(make_sender(namespace="").namespace, "/field")
+        empty = make_sender(namespace="")
+        self.assertEqual(empty.namespace, "")
+        self.assertEqual(empty.metric_address("energy"), "/energy")
 
 
 class TestNormalize(unittest.TestCase):
-    def test_sync_correlation_maps_minus1_1_to_0_1(self):
+    def test_sync_correlation_stays_bipolar_in_normalize_mode(self):
         sender = make_sender(mode="normalize")
-        self.assertAlmostEqual(sender._prepare_value("sync_correlation", -1.0), 0.0)
-        self.assertAlmostEqual(sender._prepare_value("sync_correlation", 0.0), 0.5)
+        self.assertAlmostEqual(sender._prepare_value("sync_correlation", -1.0), -1.0)
+        self.assertAlmostEqual(sender._prepare_value("sync_correlation", 0.0), 0.0)
         self.assertAlmostEqual(sender._prepare_value("sync_correlation", 1.0), 1.0)
 
     def test_unbounded_metric_tracks_peak(self):
