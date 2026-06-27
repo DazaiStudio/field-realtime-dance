@@ -1,134 +1,108 @@
-# Handoff — field-realtime-dance (2026-06-24)
+# Handoff - field-realtime-dance (2026-06-27)
 
-Continuation notes for picking up development on another machine (e.g. macOS).
+Continuation notes for picking up development on another machine, including macOS.
 
-## TL;DR — where things are
+## TL;DR
 
-- **`feat/rtmpose-backend`** ← **current deliverable.** Clean single-person
-  viewer: original MediaPipe path in the rehearsal UI, RTMPose3D code retained
-  but hidden from the dropdown, and **One-Euro joint smoothing**. Branched off
-  `master`,
-  so it does NOT carry the multi-person machinery. **Develop on this branch.**
-- **`feat/multi-person`** ← shelved exploration (4-dancer slots, per-slot OSC).
-  Pushed as a backup. Its `docs/superpowers/specs|plans/` hold the original
-  RTMPose3D design/plan and the multi-person spec if you ever want them.
-- `master` ← the original single-person MediaPipe viewer (unchanged).
+- `master` is the current deliverable branch. It contains the clean single-person rehearsal viewer: MediaPipe-only in the UI, camera-only input, Normalize default-on, One-Euro joint smoothing default-on, and per-metric output Smoothness defaulting to 30%.
+- `feat/rtmpose-backend` was fast-forward merged into `master` at `d8526ef`. The branch remains on origin as a backup/history branch, but new work should continue from `master`.
+- `feat/multi-person` is a shelved exploration for 4-dancer slots and per-slot OSC. Its `docs/superpowers/specs|plans/` keep the original RTMPose3D design/plan and multi-person spec.
+- The remote default branch is `master`: https://github.com/DazaiStudio/field-realtime-dance.
 
-Both feature branches are pushed to `origin`
-(https://github.com/DazaiStudio/field-realtime-dance).
+## Run It
 
-## Run it
-
-Python 3.10. From the repo root:
+Python 3.10+ from the repo root:
 
 ```bash
 pip install -r requirements.txt
-python backend/osc_viewer.py        # web UI on http://127.0.0.1:9100, OSC out on :9000
+python backend/osc_viewer.py
 ```
 
-In the browser: pick a **Camera** → **Enter**. The viewer opens the camera and
-starts detection immediately. Metrics stream to the right panel and out over
-OSC at `/field/<metric>` (energy, sync_velocity, sync_correlation, expansion,
-curvature, height, sway, torque, jerk).
+Open `http://127.0.0.1:9100`. OSC defaults to `udp://127.0.0.1:9000` with prefix `/field`.
 
-## Backends & cross-platform (important for the Mac)
+In the browser: pick a **Camera** -> **Enter**. The viewer opens the camera and starts detection immediately. Metrics stream to the right panel and out over OSC at `/field/<metric>`:
+
+```text
+energy, sync_velocity, sync_correlation, expansion, curvature,
+height, sway, torque, jerk
+```
+
+## Backends And Mac Notes
 
 | Backend | Where it runs | Notes |
 |---|---|---|
-| **MediaPipe** (default) | Win / **macOS** / Linux, CPU or any GPU | Pseudo-3D. The cross-platform path — **use this on the Mac.** No extra deps. |
-| **RTMPose3D** (hidden from rehearsal UI) | NVIDIA GPU for real-time | Cleaner monocular 3D (rtmlib RTMW3D-x, ONNX). Needs `pip install rtmlib onnxruntime-gpu` + CUDA 12/cuDNN 9. Code remains available, but the viewer currently exposes MediaPipe only so Mac/field use stays simple. |
+| MediaPipe (default) | Windows / macOS / Linux, CPU or any GPU | Cross-platform pseudo-3D path. Use this on the Mac. No extra deps. |
+| RTMPose3D (hidden from rehearsal UI) | NVIDIA GPU for real-time | Cleaner monocular 3D via rtmlib RTMW3D-x/ONNX. Needs `rtmlib`, `onnxruntime-gpu`, CUDA 12, cuDNN 9. Code remains available, but the viewer exposes MediaPipe only for field use. |
 
-So on the Mac you can develop the whole pipeline with MediaPipe + One-Euro.
-RTMPose3D is the Windows/NVIDIA path and is fully optional (lazy-imported).
+RTMPose3D is fully optional and lazy-imported. The rehearsal UI intentionally hides it.
 
-## Architecture / file map (`backend/`)
+## File Map
 
-- `osc_viewer.py` — FastAPI app, camera streaming, the web UI, OSC config,
-  `/api/apply` (carries `pose_backend`, `smooth_enabled`, `smooth_min_cutoff`).
-  `get_pose_engine()` (re)builds the engine when the backend changes.
-- `pose_engine.py` — thin orchestrator: picks a pose source by backend name,
-  runs One-Euro on the joints, feeds `DanceMetricsEngine`. Public interface
-  unchanged from the original. `set_backend()` swaps live; graceful fallback to
-  MediaPipe if RTMPose3D can't load.
-- `pose_sources.py` — `MediaPipePoseSource` + `RTMPose3DPoseSource`
-  (single-person = the largest detected person; no tracker needed). RTMPose3D
-  coordinate scaling + the CUDA-DLL registration live here.
-- `one_euro.py` — `JointSmoother`: speed-adaptive One-Euro filter over (17,3),
-  applied **before** the metrics engine. Tunable `min_cutoff` (UI slider) /
-  `beta`. Measured ~82–88% jerk-jitter reduction on a test clip.
-- `keypoint_mapping.py` — `mp33_to_h36m17` (MediaPipe) and `coco17_to_h36m17_3d`
-  (RTMW3D body-17) → **standard** H36M-17.
-- `dance_metrics.py` / `constants.py` — the NCKU 9-metric engine (unchanged).
-- `osc_sender.py` — OSC output (`/field/<metric>`, per-metric EMA + normalize).
+- `backend/osc_viewer.py` - FastAPI app, camera streaming, web UI, OSC config, metric toggles, smoothing controls, `/charts`, `/api/apply`.
+- `backend/pose_engine.py` - selects the pose source, runs One-Euro over joints, feeds `DanceMetricsEngine`.
+- `backend/pose_sources.py` - `MediaPipePoseSource` and `RTMPose3DPoseSource`; single-person = largest detected person.
+- `backend/one_euro.py` - speed-adaptive One-Euro joint smoother over `(17, 3)`.
+- `backend/keypoint_mapping.py` - MediaPipe 33 and COCO/RTM 17 into standard H36M-17.
+- `backend/dance_metrics.py` / `backend/constants.py` - the NCKU 9-metric engine.
+- `backend/osc_sender.py` - OSC output, normalization, per-metric EMA smoothing.
 
-## Key technical notes
+## Current Viewer Behavior
 
-- **H36M mapping bug (fixed here).** Upstream NCKU realtime-dance-analysis
-  placed the wrists on H36M indices 12/15 instead of the standard 13/16 (and
-  shifted the head/shoulders), so `curvature` actually tracked the shoulders +
-  neck and each arm's energy included a cross-body segment. `keypoint_mapping.py`
-  uses the correct standard layout. **Consequence:** metric magnitudes now
-  differ from the old/NCKU behaviour (intended; we don't do quantitative
-  comparison). If you use the **CultureScore / morrisness** feature, the
-  culture-map in the sibling `ai-motion` repo was exported with the OLD mapping
-  and **must be re-exported** to stay consistent.
-- **RTMPose3D coordinate scaling** (see `pose_sources.py` docstrings): RTMW3D x,y are
-  model-input pixels and z is a dimensionless depth; we make z share x,y units
-  (× bbox height), apply a uniform `RTM_POSE_SCALE = 3.0`, then root-center on
-  the pelvis to match MediaPipe's per-frame hip origin. Tuned so the 9 metrics
-  land in MediaPipe's magnitude band.
-- **Two smoothing stages (different jobs).** (1) **Joint layer** — One-Euro on
-  the skeleton before metrics (`one_euro.py`, global min_cutoff/beta). It is
-  controlled by the `Joint smoothness` switch in the rehearsal UI and defaults
-  on. This is the primary jitter reducer; cleans positions before the
-  derivative-heavy torque/jerk. (2) **Output layer** — per-metric EMA
-  on each of the enabled OSC channels (`osc_sender.py` `metric_alphas`, a "smoothness"
-  slider on every metric card; live via
-  `/api/metric_smoothing`). Stage 1 = clean source; stage 2 = per-channel feel
-  for the OSC consumers (visuals/sound) since metrics differ wildly (jerk noisy
-  vs height slow). The old global OSC alpha is kept internally at 1.0 for
-  compatibility, but it is no longer shown in the viewer. **Output EMA defaults
-  OFF (alpha=1)** so One-Euro is the sole default smoother (no double-smoothing).
-  Smoothness sliders snap in 5% steps for repeatable values. Each
-  per-metric Smoothness control sits at the top-right of its card, with the
-  value/bar readout on a full row below it.
-- **Metric output toggles.** Each of the 9 metric cards has a checkbox. Checked
-  metrics are shown and sent over OSC; unchecked metrics remain visible as
-  disabled cards but are omitted from `/field/<metric>`, Output values, fullscreen
-  overlay, and `/charts` output snapshots. Metric cards keep the visible label
-  compact; hover the card/name for a fuller explanation. The metrics engine
-  still computes all 9 internally.
-- **Live charts page** `GET /charts` (link on the viewer): canvas waveforms of
-  enabled metrics, polling `/api/metrics` (~10 Hz). Bold = OSC value, faint =
-  pre-output. Use it to watch the smoothing while tuning the sliders.
-- **OSC modes.** Viewer currently exposes `raw` (physical units, comparable
-  across time, unbounded) and `normalize` (adaptive 0..1 — auto-ranges to the
-  dancer but NOT comparable across time, the reference peak drifts). Sync
-  Correlation stays bipolar (`-1..1`) even when Normalize is on. The right metric
-  column uses a compact `Normalize` switch: off = raw, on = normalize. It
-  defaults on. The former Calibrate / fixed-range preset UI has been removed for
-  now to keep rehearsal controls simpler.
-- **OSC prefix.** The Prefix field can be blank. Blank sends root-level OSC
-  addresses like `/energy`; non-empty values still normalize to `/prefix/...`.
-- **Input UI.** The rehearsal UI is camera-only, fixed to the highest quality
-  preset (1920x1080 capture, 20fps target, 10fps analysis). The old video upload
-  and quality selector are hidden for now. Live detection now streams raw camera
-  frames immediately while the pose engine loads in the background, so the first
-  Enter should not sit on a black frame while MediaPipe warms up. Live/preview
-  stream exits release the shared camera in `finally` so reconnects do not leave
-  the webcam stuck.
+- **Input UI:** camera-only. The old video upload and quality selector are hidden.
+- **Quality:** fixed to the highest preset: 1920x1080 capture, 20fps stream target, 10fps analysis target.
+- **Enter flow:** first screen is a pure camera input menu. Pressing Enter opens the camera and detection together.
+- **Warmup behavior:** live detection streams raw camera frames while MediaPipe loads, so the first Enter should not sit on a black frame.
+- **Camera recovery:** live/preview stream cleanup releases the shared camera. If OpenCV drops frames repeatedly, the stream attempts to release/reopen the camera instead of freezing on the last frame.
+- **Change Input:** returns to the pure input menu state.
+- **RTMPose:** hidden from the dropdown. The UI exposes only MediaPipe.
+- **Calibration:** calibration/fixed-range preset UI is removed for now.
 
-## Pending / TODO
+## Smoothing Model
 
-- [ ] **Live camera check** — eyeball the viewer with a real camera: skeleton
-      tracks correctly, metrics move, and tune the Smoothness sliders for feel.
-      (Verified end-to-end on a recorded clip; not yet eyeballed live.)
-- [ ] **Re-export the ai-motion culture map** before relying on morrisness
-      (because of the H36M mapping fix above).
-- [ ] Multi-person: parked on `feat/multi-person` if/when needed.
+There are two smoothing stages with different jobs.
 
-## Verification done
+1. **Joint layer:** One-Euro smoothing on the skeleton before metrics are calculated. This is controlled by the `Joint smoothness` switch and defaults on. It uses `min_cutoff=0.3`.
+2. **Output layer:** per-metric EMA smoothing on each enabled OSC channel. Every metric card has its own `Smoothness` slider. These sliders default to 30%, snap in 5% steps, and map to `alpha=0.706`.
 
-End-to-end on a test clip, both backends produce metrics; One-Euro cuts jerk
-std ~82–88%. Unit tests: `cd backend && python -m unittest discover -s tests`
-(50 green, 1 skipped). Server starts and the UI renders.
+The old global OSC alpha is kept internally at `1.0` for compatibility, but it is no longer shown in the viewer.
+
+## Metric Output
+
+- Each of the 9 metric cards has a checkbox. Checked metrics are shown and sent over OSC. Unchecked metrics remain visible as disabled cards but are omitted from OSC, Output values, fullscreen overlay, and `/charts`.
+- Metric cards keep labels compact; hover the card/name for a fuller explanation.
+- `Open live charts` is below the metric cards. `/charts` shows enabled metrics, polling `/api/metrics`; bold = OSC value after output smoothing, faint = pre-output value.
+
+## Normalize / OSC
+
+- Normalize defaults on.
+- Raw mode sends physical metric units.
+- Normalize mode maps most active metrics into adaptive 0..1 ranges. These ranges are useful for visual/audio mapping but are not comparable across long periods because the adaptive reference drifts.
+- `Sync Correlation` stays bipolar (`-1..1`) even when Normalize is on.
+- `Sync Correlation` means left-right timing match, not movement size: `+1` same rhythm, `0` no clear timing link, `-1` alternating/opposite timing.
+- Prefix defaults to `/field`, but can be blank. Blank sends root-level addresses such as `/energy`; non-empty values normalize to `/prefix/...`.
+
+Default OSC addresses:
+
+```text
+/field/energy      /field/sync_vel    /field/sync_corr
+/field/expansion   /field/curvature   /field/height
+/field/sway        /field/torque      /field/jerk
+```
+
+## Technical Notes
+
+- **H36M mapping fix:** upstream NCKU realtime-dance-analysis placed wrists on H36M indices 12/15 instead of standard 13/16, shifting head/shoulders and affecting energy/curvature. `keypoint_mapping.py` uses the standard layout. Metric magnitudes now differ from the old/NCKU behavior, intentionally.
+- **CultureScore / morrisness:** the culture map in the sibling `ai-motion` repo was exported with the old mapping and must be re-exported before relying on morrisness.
+- **RTMPose3D scaling:** RTMW3D x/y are model-input pixels and z is dimensionless depth. `pose_sources.py` scales z into x/y units, applies `RTM_POSE_SCALE = 3.0`, then root-centers on the pelvis to land in MediaPipe's magnitude band.
+
+## Pending
+
+- [ ] Visual live-camera check in the rehearsal space: skeleton tracks correctly, metrics move, and Smoothness feel is appropriate.
+- [ ] Re-export the `ai-motion` culture map before relying on morrisness.
+- [ ] Multi-person remains parked on `feat/multi-person` until needed.
+
+## Verification Done
+
+- `cd backend && python -m unittest discover -s tests` -> 50 passed, 1 skipped.
+- Latest live-stream probe saw 355 frames over 20 seconds with no backend error, around 20fps stream and 7-8fps analysis.
+- Server starts and the UI renders at `http://127.0.0.1:9100`.
