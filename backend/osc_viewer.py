@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
+from calibration import CalibrationCollector, load_presets, save_presets
 from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
 from pose_engine import PoseEngine, VALID_BACKENDS
@@ -25,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 UPLOAD_DIR = BASE_DIR / "viewer_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+CALIBRATION_PRESETS_PATH = BASE_DIR / "calibration_presets.json"
 
 pose_engine: Optional[PoseEngine] = None
 pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
@@ -38,13 +40,21 @@ osc_sender = OSCSender(
     host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
     port=int(os.getenv("FIELD_OSC_PORT", "9000")),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
-    mode=os.getenv("FIELD_OSC_MODE", "normalize"),
+    mode=os.getenv("FIELD_OSC_MODE", "raw"),
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
     namespace=os.getenv("FIELD_OSC_NAMESPACE", "/field"),
 )
 
 # Optional: offline culture centroids enable the /field/morrisness output.
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
+calibration_collector = CalibrationCollector()
+calibration_presets = load_presets(CALIBRATION_PRESETS_PATH)
+calibration_state = {
+    "active": False,
+    "started_at": None,
+    "sample_count": 0,
+    "applied_preset": None,
+}
 
 PERFORMANCE_PRESETS = {
     "fast": {"width": 854, "height": 480, "target_fps": 24.0, "analysis_fps": 12.0, "jpeg_quality": 60},
@@ -218,11 +228,30 @@ def state_payload() -> dict:
         "source": dict(source_state),
         "processing": dict(processing_state),
         "osc": osc_sender.get_status(),
+        "calibration": calibration_payload(),
         "addresses": [osc_sender.metric_address(name) for name in METRIC_NAMES if name in active_metrics],
         "pose_backends": backends,
     }
     payload["source"]["video_path"] = None
     return payload
+
+
+def calibration_payload() -> dict:
+    return {
+        **calibration_state,
+        "presets": sorted(calibration_presets.keys()),
+        "ranges": {
+            name: {metric: [float(lo), float(hi)] for metric, (lo, hi) in ranges.items()}
+            for name, ranges in calibration_presets.items()
+        },
+    }
+
+
+def refresh_prepared_metrics() -> None:
+    raw_metrics = processing_state.get("latest_raw_metrics") or {}
+    if raw_metrics:
+        osc_sender.send_metrics(raw_metrics, send_keys=set())
+        processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
 
 
 def active_metric_names() -> list[str]:
@@ -484,6 +513,12 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
+    if (
+        calibration_state["active"]
+        and (metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0)
+    ):
+        calibration_collector.add(metrics)
+        calibration_state["sample_count"] = calibration_collector.count()
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
@@ -832,7 +867,7 @@ async def apply_osc_config(
     osc_port: int = Form(9000),
     osc_targets: str = Form(""),
     osc_enabled: bool = Form(True),
-    osc_mode: str = Form("normalize"),
+    osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form(""),
 ):
@@ -846,14 +881,14 @@ async def apply_osc_config(
         alpha=osc_alpha,
         namespace=osc_namespace,
     )
+    if osc_sender.mode != "fixed":
+        osc_sender.clear_metric_ranges()
+        calibration_state["applied_preset"] = None
     try:
         osc_sender.configure_targets(targets)
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}
-    raw_metrics = processing_state.get("latest_raw_metrics") or {}
-    if raw_metrics:
-        osc_sender.send_metrics(raw_metrics, send_keys=set())
-        processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
+    refresh_prepared_metrics()
 
     return {"status": "applied", **state_payload()}
 
@@ -899,6 +934,56 @@ async def apply_metric_enabled(metric: str = Form(...), enabled: bool = Form(Tru
     return {"status": "applied", **state_payload()}
 
 
+@app.post("/api/calibration/start")
+async def calibration_start():
+    calibration_collector.reset()
+    calibration_state["active"] = True
+    calibration_state["started_at"] = time.time()
+    calibration_state["sample_count"] = 0
+    return {"status": "started", **state_payload()}
+
+
+@app.post("/api/calibration/stop")
+async def calibration_stop(name: str = Form(...)):
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return {"status": "error", "error": "profile name is required"}
+    ranges = calibration_collector.ranges(min_samples=10)
+    calibration_state["active"] = False
+    calibration_state["started_at"] = None
+    calibration_state["sample_count"] = calibration_collector.count()
+    if not ranges:
+        return {"status": "error", "error": "not enough valid calibration samples"}
+    calibration_presets[clean_name] = ranges
+    save_presets(CALIBRATION_PRESETS_PATH, calibration_presets)
+    return {"status": "saved", "profile": clean_name, **state_payload()}
+
+
+@app.post("/api/calibration/apply")
+async def calibration_apply(name: str = Form(...)):
+    clean_name = str(name or "").strip()
+    ranges = calibration_presets.get(clean_name)
+    if not ranges:
+        return {"status": "error", "error": "unknown calibration profile"}
+    osc_sender.clear_metric_ranges()
+    osc_sender.set_metric_ranges(ranges)
+    osc_sender.configure(mode="fixed")
+    osc_sender.reset_state()
+    calibration_state["applied_preset"] = clean_name
+    refresh_prepared_metrics()
+    return {"status": "applied", "profile": clean_name, **state_payload()}
+
+
+@app.post("/api/calibration/clear")
+async def calibration_clear():
+    osc_sender.clear_metric_ranges()
+    if osc_sender.mode == "fixed":
+        osc_sender.configure(mode="raw")
+    calibration_state["applied_preset"] = None
+    refresh_prepared_metrics()
+    return {"status": "cleared", **state_payload()}
+
+
 @app.post("/api/apply")
 async def apply_input(
     source: str = Form("live"),
@@ -910,7 +995,7 @@ async def apply_input(
     osc_port: int = Form(9000),
     osc_targets: str = Form(""),
     osc_enabled: bool = Form(True),
-    osc_mode: str = Form("normalize"),
+    osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form(""),
     performance: str = Form(DEFAULT_PERFORMANCE),
@@ -932,6 +1017,9 @@ async def apply_input(
         alpha=osc_alpha,
         namespace=osc_namespace,
     )
+    if osc_sender.mode != "fixed":
+        osc_sender.clear_metric_ranges()
+        calibration_state["applied_preset"] = None
     try:
         osc_sender.configure_targets(targets)
     except ValueError as exc:
@@ -1004,6 +1092,8 @@ async def apply_input(
     processing_state["morrisness"] = None
     processing_state["error"] = None
     osc_sender.reset_state()
+    if calibration_state.get("applied_preset") in calibration_presets:
+        osc_sender.set_metric_ranges(calibration_presets[calibration_state["applied_preset"]])
     if culture_score is not None:
         culture_score.reset()
     return {"status": "applied", **state_payload()}
@@ -1292,10 +1382,52 @@ VIEWER_HTML = """
     .ctrl-btn.off { color: var(--muted); }
     .ctrl-btn.off .slash { display: block; }
     #detectButton:not(.off) { color: var(--amber); border-color: #6b543f; }
-    .enter-button {
+    .input-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .enter-button,
+    .calibrate-enter-button {
       width: auto;
       min-width: 96px;
-      justify-self: end;
+    }
+    .calibrate-enter-button {
+      background: rgba(84, 179, 168, .18);
+      border-color: rgba(84, 179, 168, .68);
+      color: var(--teal);
+    }
+    .calibrate-enter-button:hover { background: rgba(84, 179, 168, .28); }
+    .calibration-overlay {
+      position: absolute;
+      left: 50%;
+      top: 16px;
+      transform: translateX(-50%);
+      z-index: 4;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 14px;
+      border: 1px solid rgba(217, 139, 95, .72);
+      border-radius: 999px;
+      background: rgba(20, 17, 14, .82);
+      color: var(--amber);
+      font: 13px ui-monospace, monospace;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      pointer-events: none;
+      box-shadow: 0 10px 30px rgba(0,0,0,.36);
+      backdrop-filter: blur(4px);
+    }
+    .calibration-overlay::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--amber);
+      box-shadow: 0 0 0 5px rgba(217, 139, 95, .14);
+      animation: pulse 1.4s ease-in-out infinite;
     }
     .change-input {
       position: absolute;
@@ -1372,7 +1504,7 @@ VIEWER_HTML = """
     .meta div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .metric-osc-controls {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 1fr;
       gap: 12px;
       align-items: center;
       padding: 12px;
@@ -1401,7 +1533,60 @@ VIEWER_HTML = """
       min-height: 34px;
       white-space: nowrap;
     }
-    .metric-osc-controls .switch-row:last-child { justify-content: flex-end; }
+    .calibration-panel {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #171411;
+    }
+    .calibration-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .calibration-head .section-title { margin: 0; }
+    .calibration-status {
+      color: var(--muted);
+      font: 12px ui-monospace, monospace;
+      text-align: right;
+      min-width: 92px;
+    }
+    .calibration-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 88px;
+      gap: 8px;
+      align-items: end;
+    }
+    .calibration-row button {
+      min-height: 38px;
+      padding: 7px 9px;
+      font-size: 11px;
+    }
+    .calibration-row button.secondary {
+      background: rgba(29, 26, 23, .84);
+      color: var(--text);
+      border-color: var(--line);
+    }
+    .calibration-row button.secondary:hover { background: rgba(54, 47, 40, .92); }
+    .calibration-row button.recording {
+      background: rgba(217, 139, 95, .22);
+      border-color: rgba(217, 139, 95, .72);
+      color: var(--amber);
+    }
+    .calibration-row input,
+    .calibration-row select {
+      min-height: 38px;
+      padding: 8px 9px;
+    }
+    .normalize-profile-row {
+      display: grid;
+      grid-column: 1 / -1;
+      grid-template-columns: 1fr;
+      gap: 6px;
+      padding-top: 2px;
+    }
     .switch-row input {
       position: absolute;
       opacity: 0;
@@ -1677,10 +1862,9 @@ VIEWER_HTML = """
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-settings, .osc-target-row, .input-source-toggle, .metric-osc-controls, .meta, .output-header { grid-template-columns: 1fr; }
+      .controls-grid, .osc-settings, .osc-target-row, .input-source-toggle, .metric-osc-controls, .calibration-row, .meta, .output-header { grid-template-columns: 1fr; }
       .osc-remove { width: 100%; }
       .switch-row { justify-content: flex-start; }
-      .metric-osc-controls .switch-row:last-child { justify-content: flex-start; }
       .metric { grid-template-columns: 28px minmax(0, 1fr); align-items: start; }
       .metric-smooth-row { grid-column: 1 / -1; justify-self: stretch; width: 100%; }
       .metric-readout { grid-column: 1 / -1; }
@@ -1744,11 +1928,15 @@ VIEWER_HTML = """
                   <option value="mediapipe">MediaPipe</option>
                 </select>
               </label>
-              <button id="enterInputButton" class="enter-button" type="button">Enter</button>
+              <div class="input-actions">
+                <button id="enterInputButton" class="enter-button" type="button">Enter</button>
+                <button id="enterCalibrationButton" class="calibrate-enter-button" type="button">Calibrate</button>
+              </div>
             </div>
           </div>
           <div id="emptyState" class="empty hidden"></div>
           <div id="metricOverlay" class="metric-overlay"></div>
+          <div id="calibrationOverlay" class="calibration-overlay hidden">Calibrating 0</div>
           <button id="changeInputButton" class="change-input hidden" type="button">Change Input</button>
           <div id="controlBar" class="control-bar hidden">
             <button id="cameraButton" class="ctrl-btn off" type="button" title="Turn camera on">
@@ -1819,11 +2007,24 @@ VIEWER_HTML = """
             <input id="jointSmoothEnabled" type="checkbox" checked />
             <span class="switch-track"></span>
           </label>
-          <label class="switch-row" data-tooltip-title="Normalize Output" data-tooltip-body="Off keeps raw metric units. On maps most active metrics into an adaptive 0-1 range for easier visual and audio mapping. Sync Correlation stays -1 to 1.">
-            <span>Normalize</span>
-            <input id="normalizeOutput" type="checkbox" checked />
-            <span class="switch-track"></span>
-          </label>
+        </div>
+        <div class="calibration-panel">
+          <div class="calibration-head">
+            <p class="section-title">Calibration</p>
+            <span id="calibrationStatus" class="calibration-status">idle</span>
+          </div>
+          <div class="calibration-row">
+            <label>Profile
+              <input id="calibrationName" type="text" placeholder="stage-a" autocomplete="off" />
+            </label>
+            <button id="calibrationStart" type="button">Start</button>
+          </div>
+          <div class="calibration-row">
+            <label class="normalize-profile-row" data-tooltip-title="Normalize Profile" data-tooltip-body="None sends raw metric values. Dynamic uses adaptive live normalization. Saved calibration profiles use fixed ranges from raw calibration samples.">
+              Normalize profile
+              <select id="normalizeProfile"></select>
+            </label>
+          </div>
         </div>
         <div id="metrics" class="metric-grid"></div>
         <div class="charts-link" style="padding:0 14px 12px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">Open live charts &#8599;</a></div>
@@ -2104,6 +2305,7 @@ VIEWER_HTML = """
       data.set('loop', document.getElementById('loopVideo').checked ? 'true' : 'false');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('osc_mode', selectedOscMode());
       data.set('smooth_enabled', document.getElementById('jointSmoothEnabled').checked ? 'true' : 'false');
       data.set('smooth_min_cutoff', '0.3');
       if (document.getElementById('source').value === 'live') {
@@ -2122,6 +2324,13 @@ VIEWER_HTML = """
       return payload;
     }
 
+    function selectedOscMode() {
+      const selected = normalizeProfileSelect.value || 'none';
+      if (selected === 'none') return 'raw';
+      if (selected.startsWith('profile:')) return 'fixed';
+      return 'normalize';
+    }
+
     function buildOscFormData() {
       const data = new FormData();
       const targets = readOscTargets();
@@ -2131,7 +2340,7 @@ VIEWER_HTML = """
       data.set('osc_port', String(primary.port || 9000));
       data.set('osc_targets', JSON.stringify(targets));
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
-      data.set('osc_mode', document.getElementById('normalizeOutput').checked ? 'normalize' : 'raw');
+      data.set('osc_mode', selectedOscMode());
       data.set('osc_alpha', '1');
       data.set('osc_namespace', document.getElementById('oscNamespace').value);
       return data;
@@ -2191,6 +2400,11 @@ VIEWER_HTML = """
     const inputOverlay = document.getElementById('inputOverlay');
     const changeInputButton = document.getElementById('changeInputButton');
     const controlBar = document.getElementById('controlBar');
+    const calibrationOverlayEl = document.getElementById('calibrationOverlay');
+    const calibrationNameInput = document.getElementById('calibrationName');
+    const normalizeProfileSelect = document.getElementById('normalizeProfile');
+    const calibrationStatusEl = document.getElementById('calibrationStatus');
+    const calibrationStartButton = document.getElementById('calibrationStart');
 
     let isDetecting = false;
     let cameraOn = false;
@@ -2298,6 +2512,22 @@ VIEWER_HTML = """
       try { await fetch('/api/camera/release', { method: 'POST' }); } catch (e) {}
     }
 
+    async function ensureDetectionStream() {
+      if (isDetecting) {
+        showActiveInput();
+        setCameraButton(true);
+        showDetectionStream();
+        return true;
+      }
+      const payload = await applySettings(true);
+      if (!payload || payload.status !== 'applied') return false;
+      setDetectButton(true);
+      showActiveInput();
+      setCameraButton(true);
+      showDetectionStream();
+      return true;
+    }
+
     cameraSourceButton.addEventListener('click', () => {
       inputDirty = true;
       setSourceMode('live');
@@ -2374,12 +2604,10 @@ VIEWER_HTML = """
       document.getElementById('stoppedOverlay').classList.remove('hidden');
     });
     document.getElementById('enterInputButton').addEventListener('click', async () => {
-      const payload = await applySettings(true);
-      if (!payload || payload.status !== 'applied') return;
-      setDetectButton(true);
-      showActiveInput();
-      setCameraButton(true);
-      showDetectionStream();
+      await ensureDetectionStream();
+    });
+    document.getElementById('enterCalibrationButton').addEventListener('click', async () => {
+      await beginCalibration();
     });
     cameraButton.addEventListener('click', async () => {
       if (cameraOn) {
@@ -2425,6 +2653,70 @@ VIEWER_HTML = """
       try { await fetch('/api/smoothing', { method: 'POST', body: data }); } catch (e) {}
     }
     jointSmoothEnabledEl.addEventListener('change', applyJointSmoothing);
+
+    async function startCalibration() {
+      try {
+        const res = await fetch('/api/calibration/start', { method: 'POST' });
+        update(await res.json());
+      } catch (error) {
+        console.warn('Calibration start failed', error);
+      }
+    }
+
+    async function beginCalibration() {
+      if (!calibrationNameInput.value.trim()) calibrationNameInput.value = defaultCalibrationName();
+      if (!await ensureDetectionStream()) return;
+      await startCalibration();
+    }
+
+    async function stopCalibration() {
+      const name = calibrationNameInput.value.trim() || defaultCalibrationName();
+      calibrationNameInput.value = name;
+      const data = new FormData();
+      data.set('name', name);
+      try {
+        calibrationStartButton.disabled = true;
+        const res = await fetch('/api/calibration/stop', { method: 'POST', body: data });
+        const payload = await res.json();
+        if (payload.status === 'error') alert(payload.error || 'Calibration save failed');
+        update(payload);
+      } catch (error) {
+        console.warn('Calibration save failed', error);
+      } finally {
+        calibrationStartButton.disabled = false;
+      }
+    }
+
+    async function toggleCalibration() {
+      if (lastPayload?.calibration?.active) {
+        await stopCalibration();
+      } else {
+        await beginCalibration();
+      }
+    }
+
+    calibrationStartButton.addEventListener('click', toggleCalibration);
+
+    async function applyNormalizeProfile() {
+      const selected = normalizeProfileSelect.value || 'none';
+      if (!selected.startsWith('profile:')) {
+        await applyOscSettings();
+        return;
+      }
+      const name = selected.slice('profile:'.length);
+      const data = new FormData();
+      data.set('name', name);
+      try {
+        const res = await fetch('/api/calibration/apply', { method: 'POST', body: data });
+        const payload = await res.json();
+        if (payload.status === 'error') alert(payload.error || 'Calibration apply failed');
+        update(payload);
+      } catch (error) {
+        console.warn('Calibration apply failed', error);
+      }
+    }
+
+    normalizeProfileSelect.addEventListener('change', applyNormalizeProfile);
 
     function normalizePrefix(prefix) {
       let value = (prefix || '').trim().replace(/\\/+$/, '');
@@ -2514,6 +2806,62 @@ VIEWER_HTML = """
       select.value = payload?.source?.pose_backend || 'mediapipe';
     }
 
+    function defaultCalibrationName() {
+      return `profile-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}`;
+    }
+
+    function syncCalibration(payload) {
+      const calibration = payload?.calibration || {};
+      const presets = Array.isArray(calibration.presets) ? calibration.presets : [];
+      const signature = presets.join('|');
+      const previous = normalizeProfileSelect.value || 'none';
+      if (normalizeProfileSelect.dataset.signature !== signature) {
+        normalizeProfileSelect.innerHTML = '';
+        const noneOption = document.createElement('option');
+        noneOption.value = 'none';
+        noneOption.textContent = 'None - raw';
+        normalizeProfileSelect.appendChild(noneOption);
+        const dynamicOption = document.createElement('option');
+        dynamicOption.value = 'dynamic';
+        dynamicOption.textContent = 'Dynamic';
+        normalizeProfileSelect.appendChild(dynamicOption);
+        for (const name of presets) {
+          const option = document.createElement('option');
+          option.value = `profile:${name}`;
+          option.textContent = name;
+          normalizeProfileSelect.appendChild(option);
+        }
+        normalizeProfileSelect.dataset.signature = signature;
+      }
+
+      const applied = calibration.applied_preset || '';
+      const oscMode = payload?.osc?.mode || 'raw';
+      let desired = 'none';
+      if (oscMode === 'raw') desired = 'none';
+      if (oscMode === 'normalize') desired = 'dynamic';
+      if (oscMode === 'fixed' && applied) desired = `profile:${applied}`;
+      if (previous && previous !== desired && document.activeElement === normalizeProfileSelect) desired = previous;
+      if (Array.from(normalizeProfileSelect.options).some(option => option.value === desired)) {
+        normalizeProfileSelect.value = desired;
+      }
+
+      const sampleCount = Number(calibration.sample_count || 0);
+      if (calibration.active) {
+        calibrationStatusEl.textContent = `recording ${sampleCount}`;
+        calibrationOverlayEl.textContent = `Calibrating ${sampleCount}`;
+        calibrationOverlayEl.classList.remove('hidden');
+      } else if (applied) {
+        calibrationStatusEl.textContent = `fixed ${applied}`;
+        calibrationOverlayEl.classList.add('hidden');
+      } else {
+        calibrationStatusEl.textContent = sampleCount ? `${sampleCount} samples` : 'idle';
+        calibrationOverlayEl.classList.add('hidden');
+      }
+      calibrationStartButton.disabled = false;
+      calibrationStartButton.textContent = calibration.active ? 'Stop' : 'Start';
+      calibrationStartButton.classList.toggle('recording', Boolean(calibration.active));
+    }
+
     function update(payload) {
       lastPayload = payload;
       const source = payload.source || {};
@@ -2524,6 +2872,7 @@ VIEWER_HTML = """
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
       syncPoseBackends(payload);
       syncInitialMetricSmoothness(osc);
+      syncCalibration(payload);
       if (!inputDirty) {
         setSourceMode(source.source === 'video' ? 'video' : 'live');
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
@@ -2539,7 +2888,6 @@ VIEWER_HTML = """
       if (!oscDirty && !oscControlsHaveFocus()) {
         document.getElementById('oscNamespace').value =
           (osc.namespace === undefined || osc.namespace === null) ? '/field' : osc.namespace;
-        document.getElementById('normalizeOutput').checked = (osc.mode || 'normalize') === 'normalize';
         document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
         renderOscTargets(osc.targets || [{
           id: 'default',
@@ -2552,8 +2900,9 @@ VIEWER_HTML = """
       }
 
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
+      const calibrationActive = Boolean(payload?.calibration?.active);
       document.getElementById('status').textContent =
-        processing.error || (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off');
+        processing.error || (calibrationActive ? 'calibrating' : (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off'));
       document.getElementById('metaA').textContent = `source: ${source.source || '-'}`;
       document.getElementById('metaB').textContent =
         `fps: ${Number(processing.fps || 0).toFixed(1)} / pose: ${Number(processing.analysis_fps || 0).toFixed(1)}`;
@@ -2627,7 +2976,7 @@ VIEWER_HTML = """
       }, delay);
     }
 
-    ['normalizeOutput', 'oscEnabled'].forEach(id => {
+    ['oscEnabled'].forEach(id => {
       const input = document.getElementById(id);
       input.addEventListener('input', () => {
         scheduleOscApply();
@@ -2795,7 +3144,7 @@ def main():
     parser.add_argument("--web-port", type=int, default=9100)
     parser.add_argument("--osc-host", default=os.getenv("FIELD_OSC_HOST", "127.0.0.1"))
     parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
-    parser.add_argument("--osc-mode", choices=["raw", "normalize"], default=os.getenv("FIELD_OSC_MODE", "normalize"))
+    parser.add_argument("--osc-mode", choices=["raw", "normalize", "fixed"], default=os.getenv("FIELD_OSC_MODE", "raw"))
     parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
     parser.add_argument(

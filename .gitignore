@@ -14,6 +14,7 @@ env/
 # Video / Data Storage
 backend/recordings/
 backend/viewer_uploads/
+backend/calibration_presets.json
 qa_screenshots/
 
 # OS / IDE

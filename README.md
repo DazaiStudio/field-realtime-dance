@@ -62,8 +62,8 @@ Default output `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
 
 Outputs, prefix, normalize mode, metric toggles, per-metric smoothing, and enable are all changeable at runtime in the viewer - no restart needed.
 
-- **Normalize off:** raw metric values.
-- **Normalize on:** most metrics map into adaptive 0..1 ranges; `sync_corr` stays `-1..1`.
+- **Normalize profile:** defaults to `None - raw` for raw metric values. Choose `Dynamic` for adaptive 0..1 ranges, or a saved calibration profile for fixed profile ranges. The selected option becomes active immediately.
+- **Calibration presets:** use the input-screen `Calibrate` button, or `Calibration -> Start`, run a short compact/open movement range, then press `Stop` to save the profile. Profiles are stored locally in `backend/calibration_presets.json`.
 - **Outputs:** use `Add Output` for extra OSC receivers. Each row has a name, target host/IP, and port. Broadcast is automatic for `.255` broadcast addresses.
 - **Joint smoothness:** One-Euro smoothing before metrics, default on.
 - **Per-metric Smoothness:** each output channel defaults to 30%, snaps in 5% steps, and can be tuned independently.
