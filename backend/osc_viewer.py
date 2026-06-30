@@ -1225,7 +1225,33 @@ VIEWER_HTML = """
       border-radius: 8px;
     }
     .input-row { display: grid; grid-template-columns: 1fr; gap: 12px; align-items: start; }
+    .input-source-toggle {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .source-choice {
+      min-height: 36px;
+      background: rgba(12, 11, 9, .72);
+      border-color: var(--line);
+      color: var(--muted);
+    }
+    .source-choice.active {
+      background: rgba(52, 211, 192, .16);
+      border-color: rgba(52, 211, 192, .65);
+      color: var(--teal);
+    }
+    .input-source-panel.hidden { display: none; }
     .camera-row { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: end; }
+    .video-row { display: grid; grid-template-columns: 1fr; gap: 8px; align-items: end; }
+    .file-name {
+      min-height: 18px;
+      color: var(--muted);
+      font: 12px ui-monospace, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .mirror-row {
       display: flex;
       align-items: center;
@@ -1651,7 +1677,7 @@ VIEWER_HTML = """
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-settings, .osc-target-row, .metric-osc-controls, .meta, .output-header { grid-template-columns: 1fr; }
+      .controls-grid, .osc-settings, .osc-target-row, .input-source-toggle, .metric-osc-controls, .meta, .output-header { grid-template-columns: 1fr; }
       .osc-remove { width: 100%; }
       .switch-row { justify-content: flex-start; }
       .metric-osc-controls .switch-row:last-child { justify-content: flex-start; }
@@ -1693,12 +1719,23 @@ VIEWER_HTML = """
             <div class="input-card">
               <p class="section-title">Input</p>
               <div class="input-row">
-                <label>Camera
+                <div class="input-source-toggle" role="group" aria-label="Input source">
+                  <button id="cameraSourceButton" class="source-choice active" type="button">Camera</button>
+                  <button id="videoSourceButton" class="source-choice" type="button">Video</button>
+                </div>
+                <label id="cameraInputPanel" class="input-source-panel">Camera
                   <div class="camera-row">
                     <select id="camera" name="camera_index">
                       <option value="0">0 - Camera 0</option>
                     </select>
                     <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" checked /> Mirror camera</span>
+                  </div>
+                </label>
+                <label id="videoInputPanel" class="input-source-panel hidden">Video
+                  <div class="video-row">
+                    <input id="videoFile" name="video" type="file" accept="video/*" />
+                    <span id="videoFileName" class="file-name">No video selected</span>
+                    <span class="mirror-row"><input id="loopVideo" type="checkbox" checked /> Loop video</span>
                   </div>
                 </label>
               </div>
@@ -2064,7 +2101,7 @@ VIEWER_HTML = """
       const form = document.getElementById('form');
       syncOscTargetsInput();
       const data = new FormData(form);
-      data.set('loop', 'true');
+      data.set('loop', document.getElementById('loopVideo').checked ? 'true' : 'false');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
       data.set('smooth_enabled', document.getElementById('jointSmoothEnabled').checked ? 'true' : 'false');
@@ -2142,6 +2179,13 @@ VIEWER_HTML = """
     const detectInput = document.getElementById('detectEnabled');
     const streamImage = document.getElementById('stream');
     const previewVideo = document.getElementById('previewVideo');
+    const cameraSourceButton = document.getElementById('cameraSourceButton');
+    const videoSourceButton = document.getElementById('videoSourceButton');
+    const cameraInputPanel = document.getElementById('cameraInputPanel');
+    const videoInputPanel = document.getElementById('videoInputPanel');
+    const videoFileInput = document.getElementById('videoFile');
+    const loopVideoInput = document.getElementById('loopVideo');
+    const videoFileNameEl = document.getElementById('videoFileName');
     const detectButton = document.getElementById('detectButton');
     const cameraButton = document.getElementById('cameraButton');
     const inputOverlay = document.getElementById('inputOverlay');
@@ -2154,6 +2198,42 @@ VIEWER_HTML = """
     let inputDirty = false;
     let oscDirty = false;
     let oscApplyTimer = null;
+    let videoObjectUrl = null;
+
+    function currentSource() {
+      return sourceInput.value === 'video' ? 'video' : 'live';
+    }
+
+    function setSourceMode(mode) {
+      const isVideo = mode === 'video';
+      sourceInput.value = isVideo ? 'video' : 'live';
+      cameraSourceButton.classList.toggle('active', !isVideo);
+      videoSourceButton.classList.toggle('active', isVideo);
+      cameraInputPanel.classList.toggle('hidden', isVideo);
+      videoInputPanel.classList.toggle('hidden', !isVideo);
+      if (!isVideo) {
+        previewVideo.pause();
+        previewVideo.classList.add('hidden');
+      }
+      setCameraButton(cameraOn);
+    }
+
+    function setVideoPreview(file) {
+      if (videoObjectUrl) {
+        URL.revokeObjectURL(videoObjectUrl);
+        videoObjectUrl = null;
+      }
+      if (!file) {
+        previewVideo.removeAttribute('src');
+        videoFileNameEl.textContent = 'No video selected';
+        return;
+      }
+      videoObjectUrl = URL.createObjectURL(file);
+      previewVideo.src = videoObjectUrl;
+      previewVideo.loop = loopVideoInput.checked;
+      previewVideo.muted = true;
+      videoFileNameEl.textContent = file.name;
+    }
 
     function setInputControlsVisible(visible) {
       changeInputButton.classList.toggle('hidden', !visible);
@@ -2172,6 +2252,16 @@ VIEWER_HTML = """
     }
 
     function showPreview() {
+      if (currentSource() === 'video') {
+        streamImage.removeAttribute('src');
+        streamImage.classList.add('hidden');
+        if (previewVideo.getAttribute('src')) {
+          previewVideo.loop = loopVideoInput.checked;
+          previewVideo.classList.remove('hidden');
+          previewVideo.play().catch(() => {});
+        }
+        return;
+      }
       streamImage.classList.add('hidden');
       previewVideo.classList.add('hidden');
       streamImage.classList.remove('hidden');
@@ -2195,7 +2285,9 @@ VIEWER_HTML = """
     function setCameraButton(on) {
       cameraOn = on;
       cameraButton.classList.toggle('off', !on);
-      cameraButton.title = on ? 'Turn camera off' : 'Turn camera on';
+      const noun = currentSource() === 'video' ? 'video' : 'camera';
+      cameraButton.title = on ? `Turn ${noun} off` : `Turn ${noun} on`;
+      document.getElementById('emptyState').textContent = currentSource() === 'video' ? 'video off' : 'camera off';
       document.getElementById('emptyState').classList.toggle('hidden', on);
     }
 
@@ -2207,14 +2299,33 @@ VIEWER_HTML = """
       try { await fetch('/api/camera/release', { method: 'POST' }); } catch (e) {}
     }
 
+    cameraSourceButton.addEventListener('click', () => {
+      inputDirty = true;
+      setSourceMode('live');
+    });
+    videoSourceButton.addEventListener('click', () => {
+      inputDirty = true;
+      setSourceMode('video');
+      showPreview();
+    });
     document.getElementById('camera').addEventListener('change', () => {
       inputDirty = true;
-      sourceInput.value = 'live';
-      previewVideo.removeAttribute('src');
+      setSourceMode('live');
     });
     document.getElementById('mirrorLive').addEventListener('change', () => {
       inputDirty = true;
-      sourceInput.value = 'live';
+      setSourceMode('live');
+    });
+    videoFileInput.addEventListener('change', () => {
+      inputDirty = true;
+      setSourceMode('video');
+      setVideoPreview(videoFileInput.files?.[0]);
+      showPreview();
+    });
+    loopVideoInput.addEventListener('change', () => {
+      inputDirty = true;
+      setSourceMode('video');
+      previewVideo.loop = loopVideoInput.checked;
     });
     changeInputButton.addEventListener('click', async () => {
       setDetectButton(false);
@@ -2415,7 +2526,10 @@ VIEWER_HTML = """
       syncPoseBackends(payload);
       syncInitialMetricSmoothness(osc);
       if (!inputDirty) {
+        setSourceMode(source.source === 'video' ? 'video' : 'live');
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
+        loopVideoInput.checked = Boolean(source.loop ?? true);
+        previewVideo.loop = loopVideoInput.checked;
         document.getElementById('jointSmoothEnabled').checked = Boolean(source.smooth_enabled ?? true);
         const cameraSelect = document.getElementById('camera');
         const cameraValue = String(source.camera_index ?? '0');
