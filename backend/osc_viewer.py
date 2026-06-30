@@ -1747,7 +1747,7 @@ VIEWER_HTML = """
               <button id="enterInputButton" class="enter-button" type="button">Enter</button>
             </div>
           </div>
-          <div id="emptyState" class="empty hidden">camera off</div>
+          <div id="emptyState" class="empty hidden"></div>
           <div id="metricOverlay" class="metric-overlay"></div>
           <button id="changeInputButton" class="change-input hidden" type="button">Change Input</button>
           <div id="controlBar" class="control-bar hidden">
@@ -2287,8 +2287,7 @@ VIEWER_HTML = """
       cameraButton.classList.toggle('off', !on);
       const noun = currentSource() === 'video' ? 'video' : 'camera';
       cameraButton.title = on ? `Turn ${noun} off` : `Turn ${noun} on`;
-      document.getElementById('emptyState').textContent = currentSource() === 'video' ? 'video off' : 'camera off';
-      document.getElementById('emptyState').classList.toggle('hidden', on);
+      document.getElementById('emptyState').classList.add('hidden');
     }
 
     async function stopStream() {
