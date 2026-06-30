@@ -1,5 +1,6 @@
 import math
 import time
+from dataclasses import dataclass, field
 from typing import Dict, Mapping, Optional
 
 from pythonosc.udp_client import SimpleUDPClient
@@ -31,10 +32,48 @@ UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
 
 # Per-message decay applied to the adaptive range so stale extremes fade.
 RANGE_DECAY = 0.001
+DEFAULT_TARGET_ID = "default"
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+@dataclass
+class OSCTarget:
+    id: str
+    name: str
+    host: str
+    port: int
+    enabled: bool = True
+    broadcast: bool = False
+    client: SimpleUDPClient = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id or DEFAULT_TARGET_ID).strip() or DEFAULT_TARGET_ID
+        self.name = str(self.name or self.id).strip() or self.id
+        self.host = str(self.host or "127.0.0.1").strip() or "127.0.0.1"
+        self.port = int(self.port)
+        if self.port < 1 or self.port > 65535:
+            raise ValueError("OSC target port must be 1-65535")
+        self.enabled = bool(self.enabled)
+        self.broadcast = bool(self.broadcast)
+        self.client = SimpleUDPClient(self.host, self.port, allow_broadcast=self.broadcast)
+
+    def to_status(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "host": self.host,
+            "port": self.port,
+            "enabled": self.enabled,
+            "broadcast": self.broadcast,
+        }
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if close is not None:
+            close()
 
 
 class OSCSender:
@@ -55,7 +94,15 @@ class OSCSender:
         self.enabled = bool(enabled)
         self.mode = self._validate_mode(mode)
         self.alpha = self._validate_alpha(alpha)
-        self.client = SimpleUDPClient(self.host, self.port)
+        self.targets = [
+            OSCTarget(
+                id=DEFAULT_TARGET_ID,
+                name="Output 1",
+                host=self.host,
+                port=self.port,
+                enabled=True,
+            )
+        ]
         self._smoothed: Dict[str, float] = {}
         # Per-metric output smoothing override; falls back to self.alpha (the
         # global slider) for any metric without its own value. 1.0 = off.
@@ -77,14 +124,27 @@ class OSCSender:
         alpha: Optional[float] = None,
         namespace: Optional[str] = None,
     ) -> None:
-        client_changed = False
-
-        if host is not None and host != self.host:
-            self.host = host
-            client_changed = True
-        if port is not None and int(port) != self.port:
-            self.port = int(port)
-            client_changed = True
+        if host is not None or port is not None:
+            primary = self.targets[0] if self.targets else OSCTarget(
+                id=DEFAULT_TARGET_ID,
+                name="Output 1",
+                host=self.host,
+                port=self.port,
+                enabled=True,
+            )
+            self.targets = [
+                OSCTarget(
+                    id=primary.id,
+                    name=primary.name,
+                    host=host if host is not None else primary.host,
+                    port=port if port is not None else primary.port,
+                    enabled=primary.enabled,
+                    broadcast=primary.broadcast,
+                ),
+                *self.targets[1:],
+            ]
+            primary.close()
+            self._sync_primary_target()
         if namespace is not None:
             self.namespace = self._normalize_namespace(namespace)
         if enabled is not None:
@@ -97,14 +157,56 @@ class OSCSender:
         if alpha is not None:
             self.alpha = self._validate_alpha(alpha)
 
-        if client_changed:
-            self.client = SimpleUDPClient(self.host, self.port)
+    def configure_targets(self, targets: list[dict]) -> None:
+        parsed = []
+        used_ids = set()
+        for index, target in enumerate(targets or []):
+            target_id = str(target.get("id") or f"output-{index + 1}").strip()
+            if not target_id:
+                target_id = f"output-{index + 1}"
+            base_id = target_id
+            suffix = 2
+            while target_id in used_ids:
+                target_id = f"{base_id}-{suffix}"
+                suffix += 1
+            used_ids.add(target_id)
+            parsed.append(OSCTarget(
+                id=target_id,
+                name=target.get("name") or f"Output {index + 1}",
+                host=target.get("host") or "127.0.0.1",
+                port=int(target.get("port") or 9000),
+                enabled=target.get("enabled", True),
+                broadcast=target.get("broadcast", False),
+            ))
+
+        old_targets = self.targets
+        self.targets = parsed
+        for target in old_targets:
+            target.close()
+        self._sync_primary_target()
+
+    def _sync_primary_target(self) -> None:
+        if not self.targets:
+            return
+        primary = self.targets[0]
+        self.host = primary.host
+        self.port = primary.port
 
     def reset_state(self) -> None:
         self._smoothed.clear()
         self._peaks.clear()
         self._ranges.clear()
         self.last_prepared_metrics.clear()
+
+    def close(self) -> None:
+        for target in self.targets:
+            target.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def get_status(self) -> dict:
         return {
@@ -114,6 +216,7 @@ class OSCSender:
             "namespace": self.namespace,
             "mode": self.mode,
             "alpha": self.alpha,
+            "targets": [target.to_status() for target in self.targets],
             "metric_alphas": dict(self.metric_alphas),
             "metric_ranges": {k: list(v) for k, v in self.metric_ranges.items()},
             "last_sent_at": self.last_sent_at,
@@ -135,8 +238,8 @@ class OSCSender:
             if not self.enabled:
                 continue
             address = self.metric_address(key)
-            self._send_message(address, value)
-            sent.append({"address": address, "value": value})
+            for target_id in self._send_message(address, value):
+                sent.append({"address": address, "value": value, "target": target_id})
 
         if sent:
             self.last_sent_at = time.time()
@@ -227,16 +330,25 @@ class OSCSender:
         self.metric_ranges.clear()
 
     def _send_message(self, address: str, value: object) -> None:
-        try:
-            self.client.send_message(address, value)
-        except Exception as exc:
-            print(f"OSC send failed for {address}: {exc}")
+        sent_targets = []
+        if not self.enabled:
+            return sent_targets
+        for target in self.targets:
+            if not target.enabled:
+                continue
+            try:
+                target.client.send_message(address, value)
+                sent_targets.append(target.id)
+            except Exception as exc:
+                print(f"OSC send failed for {target.name} {address}: {exc}")
+        return sent_targets
 
     def send_named(self, name: str, value: float) -> None:
         """Send one extra value under the namespace (derived metrics etc.)."""
         if not self.enabled:
             return
-        self._send_message(self._address(name), float(value))
+        if self._send_message(self._address(name), float(value)):
+            self.last_sent_at = time.time()
 
     def metric_address(self, key: str) -> str:
         return self._address(OSC_ADDRESS_NAMES.get(key, key))

@@ -126,6 +126,45 @@ class TestSendMetrics(unittest.TestCase):
         sender.send_metrics({"energy": 1.0, "bogus": 2.0})
         self.assertEqual(set(sender.last_prepared_metrics), {"energy"})
 
+    def test_multiple_targets_receive_same_metric_value(self):
+        sender = make_sender(enabled=True, mode="raw")
+        sender.configure_targets([
+            {"id": "sound", "name": "Sound", "host": "127.0.0.1", "port": 9000, "enabled": True},
+            {"id": "visuals", "name": "Visuals", "host": "127.0.0.1", "port": 9001, "enabled": True},
+            {"id": "off", "name": "Off", "host": "127.0.0.1", "port": 9002, "enabled": False},
+        ])
+
+        sent_by_target = {}
+
+        class FakeClient:
+            def __init__(self, target_id):
+                self.target_id = target_id
+
+            def send_message(self, address, value):
+                sent_by_target.setdefault(self.target_id, []).append((address, value))
+
+        for target in sender.targets:
+            target.client.close()
+            target.client = FakeClient(target.id)
+
+        sent = sender.send_metrics({"energy": 2.5}, send_keys={"energy"})
+        self.assertEqual({item["target"] for item in sent}, {"sound", "visuals"})
+        self.assertEqual(sent_by_target["sound"], [("/field/energy", 2.5)])
+        self.assertEqual(sent_by_target["visuals"], [("/field/energy", 2.5)])
+        self.assertNotIn("off", sent_by_target)
+
+    def test_status_exposes_osc_targets(self):
+        sender = make_sender()
+        sender.configure_targets([
+            {"id": "sound", "name": "Sound", "host": "192.168.1.21", "port": 9000, "enabled": True},
+            {"id": "broadcast", "name": "Broadcast", "host": "192.168.1.255", "port": 9000, "enabled": False, "broadcast": True},
+        ])
+        status = sender.get_status()
+        self.assertEqual(status["host"], "192.168.1.21")
+        self.assertEqual(status["port"], 9000)
+        self.assertEqual([target["id"] for target in status["targets"]], ["sound", "broadcast"])
+        self.assertTrue(status["targets"][1]["broadcast"])
+
 
 if __name__ == "__main__":
     unittest.main()

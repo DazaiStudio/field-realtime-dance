@@ -48,10 +48,11 @@ python backend/osc_viewer.py
 3. `Change Input` reopens the input card.
 
 Only one app can own a camera at a time - close other camera apps if the feed is black.
+Camera choices are shown as stable OpenCV indices (`Camera 0`, `Camera 1`, ...). On macOS and Windows, system camera-name order can differ from the index order that OpenCV actually opens, so the preview is the source of truth.
 
 ## OSC
 
-Default target `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
+Default output `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
 
 ```text
 /field/energy      /field/sync_vel    /field/sync_corr
@@ -59,10 +60,11 @@ Default target `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
 /field/sway        /field/torque      /field/jerk
 ```
 
-Host, port, prefix, normalize mode, metric toggles, per-metric smoothing, and enable are all changeable at runtime in the viewer - no restart needed.
+Outputs, prefix, normalize mode, metric toggles, per-metric smoothing, and enable are all changeable at runtime in the viewer - no restart needed.
 
 - **Normalize off:** raw metric values.
 - **Normalize on:** most metrics map into adaptive 0..1 ranges; `sync_corr` stays `-1..1`.
+- **Outputs:** use `Add Output` for extra OSC receivers. Each row has a name, target host/IP, and port. Broadcast is automatic for `.255` broadcast addresses.
 - **Joint smoothness:** One-Euro smoothing before metrics, default on.
 - **Per-metric Smoothness:** each output channel defaults to 30%, snaps in 5% steps, and can be tuned independently.
 - **Prefix:** defaults to `/field`; blank prefix sends root-level addresses such as `/energy`.

@@ -54,6 +54,7 @@ PERFORMANCE_PRESETS = {
 DEFAULT_PERFORMANCE = "quality"
 DEFAULT_METRIC_SMOOTHNESS = 30.0
 DEFAULT_METRIC_ALPHA = 1.0 - ((DEFAULT_METRIC_SMOOTHNESS / 100.0) * 0.98)
+CAMERA_SCAN_MAX_INDEX = int(os.getenv("FIELD_CAMERA_SCAN_MAX_INDEX", "8"))
 
 for metric_name in METRIC_NAMES:
     osc_sender.set_metric_alpha(metric_name, DEFAULT_METRIC_ALPHA)
@@ -166,6 +167,14 @@ def release_camera(owner: Optional[int] = None, force: bool = False) -> None:
     cap.release()
 
 
+def camera_backend():
+    if os.name == "nt":
+        return cv2.CAP_DSHOW
+    if sys.platform == "darwin":
+        return getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY)
+    return cv2.CAP_ANY
+
+
 def open_camera(index: int, owner: Optional[int] = None):
     global camera, camera_owner, camera_index_opened
     with camera_lock:
@@ -177,8 +186,7 @@ def open_camera(index: int, owner: Optional[int] = None):
             camera_owner = None
             camera_index_opened = None
 
-        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-        cap = cv2.VideoCapture(index, backend)
+        cap = cv2.VideoCapture(index, camera_backend())
         if os.name == "nt":
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -229,6 +237,52 @@ def active_metric_set() -> set[str]:
 def filter_active_metrics(metrics: dict) -> dict:
     active = active_metric_set()
     return {k: v for k, v in (metrics or {}).items() if k in active}
+
+
+def is_broadcast_host(host: str) -> bool:
+    value = str(host or "").strip()
+    return value == "255.255.255.255" or value.endswith(".255")
+
+
+def parse_osc_targets(raw: str, fallback_host: str, fallback_port: int) -> list[dict]:
+    if not raw:
+        return [{
+            "id": "default",
+            "name": "Output 1",
+            "host": fallback_host,
+            "port": int(fallback_port),
+            "enabled": True,
+            "broadcast": is_broadcast_host(fallback_host),
+        }]
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid osc_targets JSON: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ValueError("osc_targets must be a list")
+
+    targets = []
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise ValueError("each OSC target must be an object")
+        host = str(item.get("host") or "").strip()
+        if not host:
+            raise ValueError("OSC target host is required")
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OSC target port must be a number") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("OSC target port must be 1-65535")
+        targets.append({
+            "id": str(item.get("id") or f"output-{index + 1}").strip(),
+            "name": str(item.get("name") or f"Output {index + 1}").strip(),
+            "host": host,
+            "port": port,
+            "enabled": bool(item.get("enabled", True)),
+            "broadcast": bool(item.get("broadcast", False)) or is_broadcast_host(host),
+        })
+    return targets
 
 
 def rtmpose3d_selectable() -> bool:
@@ -312,36 +366,35 @@ def get_macos_camera_names() -> list[str]:
     return names
 
 
-def list_cameras(max_index: int = 4) -> list[dict]:
+def list_cameras(max_index: int = CAMERA_SCAN_MAX_INDEX) -> list[dict]:
     if time.time() - camera_cache["updated_at"] < 10 and camera_cache["cameras"]:
         return camera_cache["cameras"]
 
-    directshow_names = get_directshow_camera_names()
-    if directshow_names:
-        cameras = [
-            {
-                "index": index,
-                "name": name,
-                "label": f"{index} - {name}",
-                "source": "DirectShow",
-            }
-            for index, name in enumerate(directshow_names)
-        ]
-        camera_cache["updated_at"] = time.time()
-        camera_cache["cameras"] = cameras
-        return cameras
+    # OpenCV camera indices are the only reliable values the stream can open.
+    # OS/DirectShow/macOS device-name order is not guaranteed to match OpenCV
+    # indices, especially with multiple USB or virtual cameras, so the UI uses
+    # stable index labels instead of potentially wrong device names.
+    with camera_lock:
+        active_index = camera_index_opened if camera is not None else None
+    selected_index = int(source_state.get("camera_index", 0))
+    scan_limit = max(max_index, selected_index + 1, (active_index + 1) if active_index is not None else 0)
 
-    names = get_macos_camera_names() or get_windows_camera_names()
     cameras = []
-    for index in range(max_index):
-        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-        cap = cv2.VideoCapture(index, backend)
-        available = cap.isOpened()
-        cap.release()
+    for index in range(scan_limit):
+        if active_index == index:
+            available = True
+        else:
+            cap = cv2.VideoCapture(index, camera_backend())
+            available = cap.isOpened()
+            cap.release()
         if not available:
             continue
-        name = names[len(cameras)] if len(cameras) < len(names) else f"Camera {index}"
-        cameras.append({"index": index, "name": name, "label": f"{index} - {name}", "source": "OpenCV"})
+        cameras.append({
+            "index": index,
+            "name": f"Camera {index}",
+            "label": f"Camera {index}",
+            "source": "OpenCV",
+        })
     if not cameras:
         cameras.append({"index": 0, "name": "Camera 0", "label": "0 - Camera 0", "source": "Fallback"})
     camera_cache["updated_at"] = time.time()
@@ -350,8 +403,7 @@ def list_cameras(max_index: int = 4) -> list[dict]:
 
 
 def test_camera_signal(index: int) -> dict:
-    backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(index, backend)
+    cap = cv2.VideoCapture(index, camera_backend())
     opened = cap.isOpened()
     ok = False
     mean = None
@@ -778,19 +830,26 @@ async def api_camera_scan():
 async def apply_osc_config(
     osc_host: str = Form("127.0.0.1"),
     osc_port: int = Form(9000),
+    osc_targets: str = Form(""),
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("normalize"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form(""),
 ):
+    try:
+        targets = parse_osc_targets(osc_targets, osc_host, osc_port)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
     osc_sender.configure(
-        host=osc_host,
-        port=osc_port,
         enabled=osc_enabled,
         mode=osc_mode,
         alpha=osc_alpha,
         namespace=osc_namespace,
     )
+    try:
+        osc_sender.configure_targets(targets)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
     raw_metrics = processing_state.get("latest_raw_metrics") or {}
     if raw_metrics:
         osc_sender.send_metrics(raw_metrics, send_keys=set())
@@ -849,6 +908,7 @@ async def apply_input(
     detect_enabled: bool = Form(False),
     osc_host: str = Form("127.0.0.1"),
     osc_port: int = Form(9000),
+    osc_targets: str = Form(""),
     osc_enabled: bool = Form(True),
     osc_mode: str = Form("normalize"),
     osc_alpha: float = Form(1.0),
@@ -862,14 +922,20 @@ async def apply_input(
     if source not in {"live", "video"}:
         return {"status": "error", "error": "source must be live or video"}
 
+    try:
+        targets = parse_osc_targets(osc_targets, osc_host, osc_port)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
     osc_sender.configure(
-        host=osc_host,
-        port=osc_port,
         enabled=osc_enabled,
         mode=osc_mode,
         alpha=osc_alpha,
         namespace=osc_namespace,
     )
+    try:
+        osc_sender.configure_targets(targets)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
 
     available_backend_ids = {item["id"] for item in available_pose_backends()}
     source_state["pose_backend"] = pose_backend if pose_backend in available_backend_ids else "mediapipe"
@@ -1527,10 +1593,45 @@ VIEWER_HTML = """
     .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
     .osc-settings {
       display: grid;
-      grid-template-columns: 150px 88px 160px 130px;
+      grid-template-columns: minmax(140px, 1fr) 130px;
       gap: 10px;
       align-items: end;
     }
+    .osc-target-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 12px 0 8px;
+    }
+    .osc-target-header .section-title { margin: 0; }
+    .add-osc-target {
+      width: auto;
+      min-height: 32px;
+      padding: 6px 10px;
+      font-size: 11px;
+    }
+    .osc-targets { display: grid; gap: 8px; }
+    .osc-target-row {
+      display: grid;
+      grid-template-columns: minmax(88px, .8fr) minmax(118px, 1fr) 82px 42px;
+      gap: 8px;
+      align-items: end;
+    }
+    .osc-target-row label { min-width: 0; }
+    .osc-target-row input { min-width: 0; }
+    .osc-remove {
+      width: 42px;
+      min-height: 42px;
+      padding: 0;
+      align-self: end;
+      background: rgba(29, 26, 23, .84);
+      color: var(--muted);
+      border-color: var(--line);
+      font-size: 18px;
+      line-height: 1;
+    }
+    .osc-remove:hover { color: var(--red); border-color: rgba(232, 112, 91, .7); background: rgba(60, 20, 16, .35); }
     .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
     .output-header {
       display: grid;
@@ -1550,7 +1651,8 @@ VIEWER_HTML = """
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-settings, .metric-osc-controls, .meta, .output-header { grid-template-columns: 1fr; }
+      .controls-grid, .osc-settings, .osc-target-row, .metric-osc-controls, .meta, .output-header { grid-template-columns: 1fr; }
+      .osc-remove { width: 100%; }
       .switch-row { justify-content: flex-start; }
       .metric-osc-controls .switch-row:last-child { justify-content: flex-start; }
       .metric { grid-template-columns: 28px minmax(0, 1fr); align-items: start; }
@@ -1653,17 +1755,17 @@ VIEWER_HTML = """
         <div class="address-panel">
           <p class="section-title">OSC</p>
           <div class="osc-settings">
-            <label>Host
-              <input id="oscHost" name="osc_host" value="127.0.0.1" />
-            </label>
-            <label>Port
-              <input id="oscPort" name="osc_port" type="number" min="1" max="65535" value="9000" />
-            </label>
             <label>Prefix
               <input id="oscNamespace" name="osc_namespace" value="/field" />
             </label>
             <label class="osc-toggle-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enable OSC</label>
           </div>
+          <div class="osc-target-header">
+            <p class="section-title">Outputs</p>
+            <button id="addOscTarget" class="add-osc-target" type="button">Add Output</button>
+          </div>
+          <div id="oscTargets" class="osc-targets"></div>
+          <input id="oscTargetsInput" name="osc_targets" type="hidden" value="" />
         </div>
         <div class="metric-address-panel">
           <div class="output-header">
@@ -1710,6 +1812,7 @@ VIEWER_HTML = """
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
     const defaultMetricSmoothness = %DEFAULT_METRIC_SMOOTHNESS%;
     const metricsEl = document.getElementById('metrics');
+    const oscTargetsEl = document.getElementById('oscTargets');
     const tooltipEl = document.getElementById('customTooltip');
     const maxSeen = {};
     let metricSmoothnessInitialized = false;
@@ -1809,6 +1912,96 @@ VIEWER_HTML = """
       return snapSmoothness(((1 - numeric) / 0.98) * 100);
     }
 
+    function makeOscTargetId() {
+      if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+      return `target-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    function defaultOscTarget(index = 0) {
+      return {
+        id: makeOscTargetId(),
+        name: `Output ${index + 1}`,
+        host: '127.0.0.1',
+        port: 9000,
+        enabled: true,
+        broadcast: false,
+      };
+    }
+
+    function isBroadcastHost(host) {
+      const value = String(host || '').trim();
+      return value === '255.255.255.255' || value.endsWith('.255');
+    }
+
+    function readOscTargets() {
+      return Array.from(oscTargetsEl.querySelectorAll('.osc-target-row')).map((row, index) => ({
+        id: row.dataset.id || makeOscTargetId(),
+        name: row.querySelector('.osc-target-name').value.trim() || `Output ${index + 1}`,
+        host: row.querySelector('.osc-target-host').value.trim(),
+        port: Number(row.querySelector('.osc-target-port').value || 9000),
+        enabled: true,
+        broadcast: isBroadcastHost(row.querySelector('.osc-target-host').value),
+      }));
+    }
+
+    function syncOscTargetsInput() {
+      document.getElementById('oscTargetsInput').value = JSON.stringify(readOscTargets());
+    }
+
+    function oscControlsHaveFocus() {
+      const active = document.activeElement;
+      if (!active) return false;
+      return oscTargetsEl.contains(active) || active.id === 'oscNamespace';
+    }
+
+    function addOscTargetRow(target = null) {
+      const index = oscTargetsEl.children.length;
+      const config = target || defaultOscTarget(index);
+      const row = document.createElement('div');
+      row.className = 'osc-target-row';
+      row.dataset.id = config.id || makeOscTargetId();
+      row.innerHTML = `
+        <label>Name
+          <input class="osc-target-name" value="" placeholder="Sound" />
+        </label>
+        <label>Target
+          <input class="osc-target-host" value="" placeholder="192.168.1.21" />
+        </label>
+        <label>Port
+          <input class="osc-target-port" type="number" min="1" max="65535" value="9000" />
+        </label>
+        <button class="osc-remove" type="button" title="Remove output">&times;</button>
+      `;
+      row.querySelector('.osc-target-name').value = config.name || `Output ${index + 1}`;
+      row.querySelector('.osc-target-host').value = config.host || '';
+      row.querySelector('.osc-target-port').value = Number(config.port || 9000);
+      row.querySelectorAll('input').forEach(input => {
+        input.addEventListener('input', () => {
+          syncOscTargetsInput();
+          scheduleOscApply();
+        });
+        input.addEventListener('change', () => {
+          syncOscTargetsInput();
+          scheduleOscApply(0);
+        });
+      });
+      row.querySelector('.osc-remove').addEventListener('click', () => {
+        row.remove();
+        if (!oscTargetsEl.children.length) addOscTargetRow(defaultOscTarget(0));
+        syncOscTargetsInput();
+        scheduleOscApply(0);
+      });
+      oscTargetsEl.appendChild(row);
+      syncOscTargetsInput();
+    }
+
+    function renderOscTargets(targets) {
+      oscTargetsEl.innerHTML = '';
+      const list = Array.isArray(targets) && targets.length ? targets : [defaultOscTarget(0)];
+      for (const target of list) addOscTargetRow(target);
+      syncOscTargetsInput();
+    }
+
     for (const name of metricNames) {
       maxSeen[name] = 1;
       const row = document.createElement('div');
@@ -1869,6 +2062,7 @@ VIEWER_HTML = """
 
     async function applySettings(detectEnabled) {
       const form = document.getElementById('form');
+      syncOscTargetsInput();
       const data = new FormData(form);
       data.set('loop', 'true');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
@@ -1893,8 +2087,12 @@ VIEWER_HTML = """
 
     function buildOscFormData() {
       const data = new FormData();
-      data.set('osc_host', document.getElementById('oscHost').value);
-      data.set('osc_port', document.getElementById('oscPort').value);
+      const targets = readOscTargets();
+      const primary = targets[0] || defaultOscTarget(0);
+      syncOscTargetsInput();
+      data.set('osc_host', primary.host || '127.0.0.1');
+      data.set('osc_port', String(primary.port || 9000));
+      data.set('osc_targets', JSON.stringify(targets));
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
       data.set('osc_mode', document.getElementById('normalizeOutput').checked ? 'normalize' : 'raw');
       data.set('osc_alpha', '1');
@@ -1909,7 +2107,7 @@ VIEWER_HTML = """
         console.warn('OSC config failed', payload.error || payload);
         return payload;
       }
-      oscDirty = false;
+      oscDirty = oscControlsHaveFocus();
       update(payload);
       return payload;
     }
@@ -1923,12 +2121,17 @@ VIEWER_HTML = """
         const res = await fetch('/api/cameras');
         const payload = await res.json();
         const select = document.getElementById('camera');
+        const currentValue = select.value;
         select.innerHTML = '';
         for (const camera of payload.cameras || []) {
           const option = document.createElement('option');
           option.value = camera.index;
           option.textContent = camera.label;
           select.appendChild(option);
+        }
+        const preferredValue = String(lastPayload?.source?.camera_index ?? currentValue ?? '0');
+        if (Array.from(select.options).some(option => option.value === preferredValue)) {
+          select.value = preferredValue;
         }
       } catch (error) {
         console.warn('Camera list unavailable', error);
@@ -2214,14 +2417,25 @@ VIEWER_HTML = """
       if (!inputDirty) {
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
         document.getElementById('jointSmoothEnabled').checked = Boolean(source.smooth_enabled ?? true);
+        const cameraSelect = document.getElementById('camera');
+        const cameraValue = String(source.camera_index ?? '0');
+        if (Array.from(cameraSelect.options).some(option => option.value === cameraValue)) {
+          cameraSelect.value = cameraValue;
+        }
       }
-      if (!oscDirty) {
-        document.getElementById('oscHost').value = osc.host || '127.0.0.1';
-        document.getElementById('oscPort').value = osc.port || 9000;
+      if (!oscDirty && !oscControlsHaveFocus()) {
         document.getElementById('oscNamespace').value =
           (osc.namespace === undefined || osc.namespace === null) ? '/field' : osc.namespace;
         document.getElementById('normalizeOutput').checked = (osc.mode || 'normalize') === 'normalize';
         document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
+        renderOscTargets(osc.targets || [{
+          id: 'default',
+          name: 'Output 1',
+          host: osc.host || '127.0.0.1',
+          port: osc.port || 9000,
+          enabled: true,
+          broadcast: false,
+        }]);
       }
 
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
@@ -2235,10 +2449,15 @@ VIEWER_HTML = """
         document.getElementById('metaD').textContent = `file: ${source.video_name || '-'} / loop ${source.loop ? 'on' : 'off'}`;
       } else {
         const cameraSelect = document.getElementById('camera');
-        const cameraLabel = cameraSelect.options[cameraSelect.selectedIndex]?.textContent || source.camera_index || '-';
+        const cameraValue = String(source.camera_index ?? '');
+        const cameraOption = Array.from(cameraSelect.options).find(option => option.value === cameraValue);
+        const cameraLabel = cameraOption?.textContent || (cameraValue ? `Camera ${cameraValue}` : '-');
+        const targets = Array.isArray(osc.targets) ? osc.targets : [];
+        const enabledTargets = targets.filter(target => target.enabled).length;
+        const oscTargetText = osc.enabled ? `${enabledTargets}/${targets.length || 1} outputs` : 'off';
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
         document.getElementById('metaD').textContent =
-          `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / osc: ${osc.enabled ? 'on' : 'off'} ${osc.host || '-'}:${osc.port || '-'}`;
+          `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / osc: ${oscTargetText}`;
       }
       updateAddresses(payload);
 
@@ -2295,17 +2514,33 @@ VIEWER_HTML = """
       }, delay);
     }
 
-    ['oscHost', 'oscPort', 'normalizeOutput', 'oscEnabled'].forEach(id => {
+    ['normalizeOutput', 'oscEnabled'].forEach(id => {
       const input = document.getElementById(id);
       input.addEventListener('input', () => {
         scheduleOscApply();
       });
       input.addEventListener('change', () => scheduleOscApply(0));
     });
+    oscTargetsEl.addEventListener('focusin', () => {
+      markOscDirty();
+    });
+    oscTargetsEl.addEventListener('focusout', () => {
+      window.setTimeout(() => {
+        if (!oscControlsHaveFocus()) {
+          oscDirty = false;
+          if (lastPayload) update(lastPayload);
+        }
+      }, 0);
+    });
+    document.getElementById('addOscTarget').addEventListener('click', () => {
+      addOscTargetRow(defaultOscTarget(oscTargetsEl.children.length));
+      scheduleOscApply(0);
+    });
     document.getElementById('oscNamespace').addEventListener('input', () => {
       scheduleOscApply();
       updateAddresses();
     });
+    renderOscTargets([{ id: 'default', name: 'Output 1', host: '127.0.0.1', port: 9000, enabled: true, broadcast: false }]);
     loadCameras();
 
     const ws = new WebSocket(`ws://${location.host}/ws`);
