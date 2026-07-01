@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -896,6 +897,19 @@ async def api_camera_release():
     return {"status": "released", **state_payload()}
 
 
+def request_process_shutdown(delay: float = 0.25) -> None:
+    def _shutdown():
+        time.sleep(delay)
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.75)
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_shutdown, daemon=True).start()
+
+
 @app.post("/api/shutdown")
 async def api_shutdown():
     """Stop streams, release the camera, then exit the process (UI Quit button)."""
@@ -905,8 +919,7 @@ async def api_shutdown():
         await asyncio.to_thread(release_camera, None, True)
     except Exception:
         pass
-    # Delay the hard exit so the HTTP response reaches the browser first.
-    threading.Timer(0.5, lambda: os._exit(0)).start()
+    request_process_shutdown()
     return {"status": "stopping"}
 
 
@@ -2274,7 +2287,7 @@ VIEWER_HTML = """
       sync_correlation: 'Left-right timing match, not movement size. +1 means both sides move in the same rhythm, 0 means no clear timing link, -1 means they alternate or move opposite each other.',
       expansion: 'How much space the body occupies. Higher means open or spread-out shapes; lower means compact or closed shapes.',
       curvature: 'How rounded the hand and foot paths are. Higher means curved/circular paths; lower means straighter paths.',
-      height: 'Body center height relative to the hips. Lower values usually mean crouching, folding, or dropping the torso.',
+      height: 'Body center height above the foot base. Lower values usually mean crouching, folding, or dropping the torso.',
       sway: 'Horizontal drift of the body center away from the feet. Higher means leaning, traveling, or less steady balance.',
       torque: 'How strongly movement changes speed around the joints. Higher means sharper accents or more forceful changes.',
       jerk: 'Abruptness of acceleration changes. Higher means jagged or twitchy motion; lower means smoother, more continuous flow.',
@@ -2945,8 +2958,8 @@ VIEWER_HTML = """
       window.clearTimeout(quitTimer);
       quitArmed = false;
       quitLabel.textContent = 'Stopping...';
-      try { await fetch('/api/shutdown', { method: 'POST' }); } catch (e) {}
       document.getElementById('stoppedOverlay').classList.remove('hidden');
+      try { fetch('/api/shutdown', { method: 'POST', keepalive: true }); } catch (e) {}
     });
     document.getElementById('enterInputButton').addEventListener('click', async () => {
       await ensureDetectionStream();
@@ -3425,7 +3438,7 @@ CHARTS_HTML = """<!doctype html>
   .panel .val { color:var(--teal); font-variant-numeric:tabular-nums; }
   canvas { width:100%; height:120px; display:block; }
   .legend { color:var(--muted); font-size:11px; padding:0 18px 18px; }
-  .legend b { color:var(--teal); } .legend i { color:#8c8070; font-style:normal; }
+  .legend b { color:var(--teal); }
 </style>
 </head>
 <body>
@@ -3435,7 +3448,7 @@ CHARTS_HTML = """<!doctype html>
   <a href="/">back to viewer</a>
 </header>
 <div class="grid" id="grid"></div>
-<div class="legend">Per chart: <b>bold = value sent to OSC after Smoothness(EMA)</b>, <i>faint = pre-output metric value</i>. Window approx last 30s. Start detection in the viewer, then watch here. Toggle/drag the Smoothness(EMA) frame sliders in the viewer and watch the curves change.</div>
+<div class="legend">Per chart: <b>value sent to OSC after Smoothness(EMA) and normalize profile</b>. Window approx last 30s.</div>
 <script>
 const METRICS = [
   {key:'energy', name:'Energy'},
@@ -3452,7 +3465,7 @@ const WINDOW = 300, POLL_MS = 100;
 const buffers = {}, canvases = {}, valEls = {};
 const grid = document.getElementById('grid');
 for (const m of METRICS) {
-  buffers[m.key] = { raw: [], smooth: [] };
+  buffers[m.key] = [];
   const panel = document.createElement('div');
   panel.className = 'panel';
   panel.innerHTML = '<div class="head"><span class="name">' + m.name + '</span><span class="val" id="val-' + m.key + '">-</span></div><canvas></canvas>';
@@ -3490,15 +3503,14 @@ function draw() {
     const w = c.width, h = c.height;
     g.clearRect(0, 0, w, h);
     const b = buffers[m.key];
-    const all = b.raw.concat(b.smooth).filter(v => v != null);
+    const all = b.filter(v => v != null);
     g.strokeStyle = 'rgba(255,255,255,0.05)'; g.lineWidth = 1;
     g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
     if (all.length === 0) continue;
     let lo = Math.min.apply(null, all), hi = Math.max.apply(null, all);
     if (lo === hi) { lo -= 1; hi += 1; }
-    series(g, w, h, b.raw, lo, hi, 'rgba(140,128,112,0.5)', 1 * dpr);
-    series(g, w, h, b.smooth, lo, hi, '#34d3c0', 1.8 * dpr);
-    const last = b.smooth.filter(v => v != null).slice(-1)[0];
+    series(g, w, h, b, lo, hi, '#34d3c0', 1.8 * dpr);
+    const last = b.filter(v => v != null).slice(-1)[0];
     if (last != null) valEls[m.key].textContent = last.toFixed(3);
   }
 }
@@ -3508,8 +3520,8 @@ async function poll() {
     const res = await fetch('/api/metrics', { cache: 'no-store' });
     const d = await res.json();
     running = !!d.running;
-    const raw = d.raw || {}, sm = d.smoothed || {};
-    for (const m of METRICS) { pushVal(buffers[m.key].raw, raw[m.key]); pushVal(buffers[m.key].smooth, sm[m.key]); }
+    const values = d.smoothed || {};
+    for (const m of METRICS) pushVal(buffers[m.key], values[m.key]);
   } catch (e) { running = false; }
   document.getElementById('dot').className = 'dot' + (running ? ' on' : '');
   document.getElementById('statusText').textContent = running ? 'streaming' : 'no stream - start detection in the viewer';

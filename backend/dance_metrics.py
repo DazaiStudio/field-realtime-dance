@@ -199,18 +199,20 @@ class DanceMetricsEngine:
         com = np.zeros(3)
         for i in range(17):
             com += positions[i] * MASS_WEIGHTS[i]
-            
-        # Z axis is height. But often Y is height in image space.
-        # In H36M from our conversion, Y is actually pointing down typically, 
-        # or Z is depth depending on how it's defined. Let's use Y for height 
-        # (normalized to screen) for simplicity, or just Euclidean distance from floor.
-        # Let's use raw Y for now, and Sway is XZ plane distance.
-        height_val = -com[1]  # Normally Y is down in image coordinates, negate it for "height"
-        
+
         bos = (positions[L_ANKLE] + positions[R_ANKLE]) / 2.0
-        
+        # Project CoM onto the foot-to-upper-body axis so crouching lowers
+        # height regardless of whether the source Y axis points up or down.
+        upper_body = (positions[SPINE] * 0.25) + (positions[THORAX] * 0.5) + (positions[HEAD] * 0.25)
+        up_axis = upper_body - bos
+        up_norm = np.linalg.norm(up_axis)
+        if up_norm > 1e-6:
+            height_val = max(0.0, float(np.dot(com - bos, up_axis / up_norm)))
+        else:
+            height_val = abs(float(com[1] - bos[1]))
+
         sway_val = np.sqrt((com[0] - bos[0])**2 + (com[2] - bos[2])**2)
-        
+
         return height_val / 1000.0, sway_val / 1000.0 # scale from mm to m
 
     def _calculate_transition(self, omegas):

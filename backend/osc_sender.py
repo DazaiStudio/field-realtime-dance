@@ -24,8 +24,8 @@ OSC_ADDRESS_NAMES = {
 }
 
 BOUNDED_METRICS = {"sync_velocity"}
-# height is -com_y in metres around the hip origin (often negative) and sway
-# is a small metre-scale offset; clamping them to 0..1 flattens both to ~0.
+# height is CoM above the foot base in metres and sway is a small metre-scale
+# offset; clamping them to 0..1 flattens both to ~0.
 # Track an adaptive min/max range instead so normalize mode stays expressive.
 ADAPTIVE_RANGE_METRICS = {"height", "sway"}
 UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
