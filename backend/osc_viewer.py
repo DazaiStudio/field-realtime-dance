@@ -1549,6 +1549,39 @@ VIEWER_HTML = """
       box-shadow: 0 0 0 5px rgba(217, 139, 95, .14);
       animation: pulse 1.4s ease-in-out infinite;
     }
+    .calibration-overlay.countdown {
+      top: 50%;
+      transform: translate(-50%, -50%);
+      min-width: 170px;
+      padding: 18px 24px 20px;
+      flex-direction: column;
+      gap: 8px;
+      border-radius: 8px;
+      background: rgba(20, 17, 14, .74);
+      color: var(--text);
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .calibration-overlay.countdown::before { display: none; }
+    .countdown-label {
+      color: var(--amber);
+      font-size: 12px;
+      line-height: 1;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .countdown-number {
+      color: var(--text);
+      font-size: 92px;
+      font-weight: 800;
+      line-height: .86;
+      letter-spacing: 0;
+      text-shadow: 0 8px 30px rgba(0,0,0,.56);
+    }
+    @media (max-width: 640px) {
+      .countdown-number { font-size: 68px; }
+      .calibration-overlay.countdown { min-width: 142px; }
+    }
     .change-input {
       position: absolute;
       left: 14px;
@@ -3037,17 +3070,21 @@ VIEWER_HTML = """
       const poseValid = Boolean(payload?.processing?.pose_valid);
       if (calibration.active && countdown > 0) {
         calibrationStatusEl.textContent = `starting ${countdown}`;
-        calibrationOverlayEl.textContent = `Calibration starts ${countdown}`;
+        calibrationOverlayEl.classList.add('countdown');
+        calibrationOverlayEl.innerHTML = `<span class="countdown-label">Calibration starts</span><span class="countdown-number">${countdown}</span>`;
         calibrationOverlayEl.classList.remove('hidden');
       } else if (calibration.active) {
         calibrationStatusEl.textContent = poseValid || sampleCount > 0 ? `recording ${sampleCount}` : 'waiting skeleton';
+        calibrationOverlayEl.classList.remove('countdown');
         calibrationOverlayEl.textContent = poseValid || sampleCount > 0 ? `Calibrating ${sampleCount}` : 'Waiting skeleton';
         calibrationOverlayEl.classList.remove('hidden');
       } else if (applied) {
         calibrationStatusEl.textContent = `fixed ${applied}`;
+        calibrationOverlayEl.classList.remove('countdown');
         calibrationOverlayEl.classList.add('hidden');
       } else {
         calibrationStatusEl.textContent = sampleCount ? `${sampleCount} samples` : 'idle';
+        calibrationOverlayEl.classList.remove('countdown');
         calibrationOverlayEl.classList.add('hidden');
       }
       calibrationStartButton.disabled = false;
