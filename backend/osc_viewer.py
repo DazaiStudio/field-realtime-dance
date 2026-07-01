@@ -2287,6 +2287,7 @@ VIEWER_HTML = """
       el.dataset.tooltipBody = body || '';
     }
     function tooltipTargetFrom(eventTarget) {
+      if (eventTarget?.closest?.('.metric-drag')) return null;
       return eventTarget?.closest?.('[data-tooltip-title], [data-tooltip-body]');
     }
     function setTooltipPosition(event) {
@@ -2527,9 +2528,8 @@ VIEWER_HTML = """
       row.className = 'metric';
       row.id = `metric-${name}`;
       setTooltipTarget(row, labelForMetric(name), metricDescriptions[name] || '');
-      row.draggable = true;
       row.innerHTML = `
-        <button class="metric-drag" type="button" title="Drag to reorder" aria-label="Drag ${labelForMetric(name)}"></button>
+        <span class="metric-drag" draggable="true" aria-label="Drag ${labelForMetric(name)}"></span>
         <label class="metric-enable" data-tooltip-title="Output ${labelForMetric(name)}" data-tooltip-body="Checked metrics are included in OSC output, Output values, overlays, and live charts."><input class="metric-toggle" type="checkbox" checked /></label>
         <div class="metric-label" data-tooltip-title="${labelForMetric(name)}" data-tooltip-body="${metricDescriptions[name] || ''}">
           <div class="name">${labelForMetric(name)}</div>
@@ -2546,19 +2546,16 @@ VIEWER_HTML = """
       `;
       metricsEl.appendChild(row);
       const toggle = row.querySelector('.metric-toggle');
+      const dragHandle = row.querySelector('.metric-drag');
       const msInput = row.querySelector('.metric-smooth');
       const msVal = row.querySelector('.ms-val');
       setRangeFill(msInput, defaultMetricEmaFrames);
-      row.addEventListener('dragstart', event => {
-        if (!event.target.closest('.metric-drag')) {
-          event.preventDefault();
-          return;
-        }
+      dragHandle.addEventListener('dragstart', event => {
         row.classList.add('dragging');
         event.dataTransfer.effectAllowed = 'move';
         event.dataTransfer.setData('text/plain', name);
       });
-      row.addEventListener('dragend', () => {
+      dragHandle.addEventListener('dragend', () => {
         row.classList.remove('dragging');
         document.querySelectorAll('.metric.drag-over').forEach(item => item.classList.remove('drag-over'));
       });

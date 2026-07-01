@@ -18,6 +18,9 @@ import numpy as np
 
 from keypoint_mapping import mp33_to_h36m17, coco17_to_h36m17_3d
 
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 # ---------------------------------------------------------------------------
 # MediaPipe drawing (33-landmark skeleton), kept identical to the original UI.
 # ---------------------------------------------------------------------------
@@ -70,6 +73,14 @@ def _register_torch_cuda_dlls() -> None:
         torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
         if os.path.isdir(torch_lib):
             os.add_dll_directory(torch_lib)
+    except Exception:
+        pass
+
+
+def _quiet_absl_logs() -> None:
+    try:
+        from absl import logging as absl_logging
+        absl_logging.set_verbosity(absl_logging.ERROR)
     except Exception:
         pass
 
@@ -167,6 +178,7 @@ class MediaPipePoseSource:
     """Single-person MediaPipe Pose (world landmarks -> H36M-17). Default backend."""
 
     def __init__(self, model_path: str = "pose_landmarker_full.task"):
+        _quiet_absl_logs()
         import mediapipe as mp
         self._mp = mp
         self.model_path = model_path
