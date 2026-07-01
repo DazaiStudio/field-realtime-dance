@@ -170,10 +170,10 @@ def release_camera(owner: Optional[int] = None, force: bool = False) -> None:
 
     Stream cleanup passes its session id as owner, so an old stream cannot
     release a newer stream's camera after /api/apply has already restarted it.
-    Explicit UI/server release calls use force=True.
+    Explicit server shutdown/restart paths use force=True; regular UI camera-off
+    invalidates the stream first, then releases only that old session owner.
     """
     global camera, camera_owner, camera_index_opened
-    cap = None
     with camera_lock:
         if camera is None:
             return
@@ -183,7 +183,19 @@ def release_camera(owner: Optional[int] = None, force: bool = False) -> None:
         camera = None
         camera_owner = None
         camera_index_opened = None
-    cap.release()
+        cap.release()
+
+
+def read_camera_frame(cap, owner: Optional[int]):
+    """Read a frame while holding the same lock used for release/open.
+
+    OpenCV's AVFoundation backend can segfault if VideoCapture.release() races
+    with VideoCapture.read() on another thread.
+    """
+    with camera_lock:
+        if camera is not cap or camera_owner != owner:
+            return False, None
+        return cap.read()
 
 
 def camera_backend():
@@ -651,7 +663,7 @@ async def stream_live():
             and source_state["detect_enabled"]
         ):
             started = time.time()
-            ok, frame = await asyncio.to_thread(cap.read)
+            ok, frame = await asyncio.to_thread(read_camera_frame, cap, session_id)
             if not ok:
                 missed_frames += 1
                 if missed_frames >= 5:
@@ -740,7 +752,7 @@ async def stream_live_preview():
             and not source_state["detect_enabled"]
         ):
             started = time.time()
-            ok, frame = await asyncio.to_thread(cap.read)
+            ok, frame = await asyncio.to_thread(read_camera_frame, cap, session_id)
             if not ok:
                 missed_frames += 1
                 if missed_frames >= 5:
@@ -895,9 +907,11 @@ async def api_state():
 @app.post("/api/camera/release")
 async def api_camera_release():
     """Stop any running stream and release the camera (UI camera-off)."""
+    old_session_id = source_state["session_id"]
     source_state["session_id"] += 1
     source_state["detect_enabled"] = False
-    await asyncio.to_thread(release_camera, None, True)
+    await asyncio.sleep(0.25)
+    await asyncio.to_thread(release_camera, old_session_id)
     processing_state["error"] = None
     return {"status": "released", **state_payload()}
 
