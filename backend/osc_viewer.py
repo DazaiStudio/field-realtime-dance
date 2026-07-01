@@ -2527,6 +2527,9 @@ VIEWER_HTML = """
           scheduleOscApply(0);
         });
       });
+      row.querySelector('.osc-remove').addEventListener('pointerdown', () => {
+        markOscDirty();
+      });
       row.querySelector('.osc-remove').addEventListener('click', () => {
         markOscDirty();
         row.remove();
@@ -2696,15 +2699,20 @@ VIEWER_HTML = """
     }
 
     async function applyOscSettings() {
-      const res = await fetch('/api/osc/config', { method: 'POST', body: buildOscFormData() });
-      const payload = await res.json();
-      if (payload.status !== 'applied') {
-        console.warn('OSC config failed', payload.error || payload);
+      oscApplyInFlight = true;
+      try {
+        const res = await fetch('/api/osc/config', { method: 'POST', body: buildOscFormData() });
+        const payload = await res.json();
+        if (payload.status !== 'applied') {
+          console.warn('OSC config failed', payload.error || payload);
+          return payload;
+        }
+        oscDirty = false;
+        update(payload);
         return payload;
+      } finally {
+        oscApplyInFlight = false;
       }
-      oscDirty = oscControlsHaveFocus();
-      update(payload);
-      return payload;
     }
 
     document.getElementById('form').addEventListener('submit', async (event) => {
@@ -2764,6 +2772,7 @@ VIEWER_HTML = """
     let inputDirty = false;
     let oscDirty = false;
     let oscApplyTimer = null;
+    let oscApplyInFlight = false;
     let videoObjectUrl = null;
     let activeStreamKind = null;
 
@@ -3369,16 +3378,14 @@ VIEWER_HTML = """
       markOscDirty();
       window.clearTimeout(oscApplyTimer);
       oscApplyTimer = window.setTimeout(() => {
+        oscApplyTimer = null;
         applyOscSettings().catch(error => console.warn('OSC config failed', error));
       }, delay);
     }
 
-    oscTargetsEl.addEventListener('focusin', () => {
-      markOscDirty();
-    });
     oscTargetsEl.addEventListener('focusout', () => {
       window.setTimeout(() => {
-        if (!oscControlsHaveFocus()) {
+        if (!oscControlsHaveFocus() && !oscApplyTimer && !oscApplyInFlight && !oscDirty) {
           oscDirty = false;
           if (lastPayload) update(lastPayload);
         }

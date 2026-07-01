@@ -91,6 +91,14 @@ class TestFixedNormalize(unittest.TestCase):
         osc.send_metrics({"energy": 999.0}, send_keys=set())
         self.assertAlmostEqual(osc.last_prepared_metrics["energy"], 1.0)
 
+    def test_fixed_jerk_uses_log_range(self):
+        osc = self._sender()
+        osc.set_metric_ranges({"jerk": (10.0, 100000.0)})
+        osc.send_metrics({"jerk": 1000.0}, send_keys=set())
+        value = osc.last_prepared_metrics["jerk"]
+        self.assertGreater(value, 0.2)
+        self.assertLess(value, 0.6)
+
     def test_metric_without_range_falls_back_to_adaptive(self):
         osc = self._sender()  # no ranges set
         osc.send_metrics({"expansion": 5.0}, send_keys=set())

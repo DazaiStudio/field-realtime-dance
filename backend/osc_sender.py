@@ -29,6 +29,7 @@ BOUNDED_METRICS = {"sync_velocity"}
 # Track an adaptive min/max range instead so normalize mode stays expressive.
 ADAPTIVE_RANGE_METRICS = {"height", "sway"}
 UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
+LOG_FIXED_RANGE_METRICS = {"jerk"}
 
 # Per-message decay applied to the adaptive range so stale extremes fade.
 RANGE_DECAY = 0.001
@@ -273,6 +274,10 @@ class OSCSender:
         # adaptive logic below, so "fixed" degrades gracefully.
         if self.mode == "fixed" and key in self.metric_ranges:
             lo, hi = self.metric_ranges[key]
+            if key in LOG_FIXED_RANGE_METRICS:
+                value = math.log1p(max(0.0, value))
+                lo = math.log1p(max(0.0, lo))
+                hi = math.log1p(max(0.0, hi))
             span = hi - lo
             if span < 1e-9:
                 return 0.5
