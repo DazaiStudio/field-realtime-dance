@@ -1688,16 +1688,6 @@ VIEWER_HTML = """
       border-bottom: 1px solid var(--line);
       background: #171411;
     }
-    .osc-toggle-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 42px;
-      color: var(--muted);
-      font-size: 13px;
-      text-transform: uppercase;
-      letter-spacing: .06em;
-    }
     .switch-row {
       position: relative;
       display: flex;
@@ -2019,27 +2009,35 @@ VIEWER_HTML = """
       font-variant-numeric: tabular-nums;
     }
     .address-panel { border-top: 1px solid var(--line); padding: 14px; background: #171411; }
-    .osc-settings {
+    .osc-toolbar {
       display: grid;
-      grid-template-columns: minmax(140px, 1fr) 130px;
+      grid-template-columns: max-content minmax(130px, 220px) max-content;
       gap: 10px;
-      align-items: end;
-    }
-    .osc-target-header {
-      display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin: 12px 0 8px;
+      justify-content: start;
     }
-    .osc-target-header .section-title { margin: 0; }
+    .osc-toolbar .section-title { margin: 0; }
+    .osc-prefix {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .osc-prefix input { min-height: 34px; padding: 6px 10px; }
     .add-osc-target {
       width: auto;
       min-height: 32px;
       padding: 6px 10px;
       font-size: 11px;
     }
-    .osc-targets { display: grid; gap: 8px; }
+    .osc-targets { display: grid; gap: 8px; margin-top: 10px; }
+    .osc-empty {
+      margin-top: 9px;
+      color: var(--muted);
+      font: 12px ui-monospace, monospace;
+    }
     .osc-target-row {
       display: grid;
       grid-template-columns: minmax(88px, .8fr) minmax(118px, 1fr) 82px 42px;
@@ -2074,12 +2072,12 @@ VIEWER_HTML = """
     .address-list div { overflow-wrap: anywhere; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
-      .controls-grid, .osc-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .apply-row { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-settings, .osc-target-row, .input-source-toggle, .metric-osc-controls, .calibration-row, .meta, .output-header { grid-template-columns: 1fr; }
+      .controls-grid, .osc-toolbar, .osc-prefix, .osc-target-row, .input-source-toggle, .metric-osc-controls, .calibration-row, .meta, .output-header { grid-template-columns: 1fr; }
       .osc-remove { width: 100%; }
       .switch-row { justify-content: flex-start; }
       .metric { grid-template-columns: 22px 28px minmax(0, 1fr); align-items: start; }
@@ -2195,18 +2193,15 @@ VIEWER_HTML = """
           <div id="metaD">osc: -</div>
         </div>
         <div class="address-panel">
-          <p class="section-title">OSC</p>
-          <div class="osc-settings">
-            <label>Prefix
+          <div class="osc-toolbar">
+            <p class="section-title">OSC</p>
+            <label class="osc-prefix">Prefix
               <input id="oscNamespace" name="osc_namespace" value="/field" />
             </label>
-            <label class="osc-toggle-row"><input id="oscEnabled" name="osc_enabled" type="checkbox" checked /> Enable OSC</label>
-          </div>
-          <div class="osc-target-header">
-            <p class="section-title">Outputs</p>
             <button id="addOscTarget" class="add-osc-target" type="button">Add Output</button>
           </div>
           <div id="oscTargets" class="osc-targets"></div>
+          <div id="oscTargetsEmpty" class="osc-empty hidden">No OSC outputs</div>
           <input id="oscTargetsInput" name="osc_targets" type="hidden" value="" />
         </div>
         <div class="metric-address-panel">
@@ -2491,6 +2486,10 @@ VIEWER_HTML = """
       document.getElementById('oscTargetsInput').value = JSON.stringify(readOscTargets());
     }
 
+    function updateOscEmptyState() {
+      document.getElementById('oscTargetsEmpty').classList.toggle('hidden', oscTargetsEl.children.length > 0);
+    }
+
     function oscControlsHaveFocus() {
       const active = document.activeElement;
       if (!active) return false;
@@ -2529,20 +2528,23 @@ VIEWER_HTML = """
         });
       });
       row.querySelector('.osc-remove').addEventListener('click', () => {
+        markOscDirty();
         row.remove();
-        if (!oscTargetsEl.children.length) addOscTargetRow(defaultOscTarget(0));
         syncOscTargetsInput();
+        updateOscEmptyState();
         scheduleOscApply(0);
       });
       oscTargetsEl.appendChild(row);
       syncOscTargetsInput();
+      updateOscEmptyState();
     }
 
     function renderOscTargets(targets) {
       oscTargetsEl.innerHTML = '';
-      const list = Array.isArray(targets) && targets.length ? targets : [defaultOscTarget(0)];
+      const list = Array.isArray(targets) ? targets : [defaultOscTarget(0)];
       for (const target of list) addOscTargetRow(target);
       syncOscTargetsInput();
+      updateOscEmptyState();
     }
 
     for (const name of metricNames) {
@@ -2651,7 +2653,7 @@ VIEWER_HTML = """
       const data = new FormData(form);
       data.set('loop', document.getElementById('loopVideo').checked ? 'true' : 'false');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
-      data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('osc_enabled', 'true');
       data.set('osc_mode', selectedOscMode());
       data.set('smooth_enabled', 'false');
       data.set('smooth_min_cutoff', '0.3');
@@ -2686,7 +2688,7 @@ VIEWER_HTML = """
       data.set('osc_host', primary.host || '127.0.0.1');
       data.set('osc_port', String(primary.port || 9000));
       data.set('osc_targets', JSON.stringify(targets));
-      data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
+      data.set('osc_enabled', 'true');
       data.set('osc_mode', selectedOscMode());
       data.set('osc_alpha', '1');
       data.set('osc_namespace', document.getElementById('oscNamespace').value);
@@ -3284,8 +3286,7 @@ VIEWER_HTML = """
       if (!oscDirty && !oscControlsHaveFocus()) {
         document.getElementById('oscNamespace').value =
           (osc.namespace === undefined || osc.namespace === null) ? '/field' : osc.namespace;
-        document.getElementById('oscEnabled').checked = Boolean(osc.enabled);
-        renderOscTargets(osc.targets || [{
+        renderOscTargets(Array.isArray(osc.targets) ? osc.targets : [{
           id: 'default',
           name: 'Output 1',
           host: osc.host || '127.0.0.1',
@@ -3312,8 +3313,7 @@ VIEWER_HTML = """
         const cameraOption = Array.from(cameraSelect.options).find(option => option.value === cameraValue);
         const cameraLabel = cameraOption?.textContent || (cameraValue ? `Camera ${cameraValue}` : '-');
         const targets = Array.isArray(osc.targets) ? osc.targets : [];
-        const enabledTargets = targets.filter(target => target.enabled).length;
-        const oscTargetText = osc.enabled ? `${enabledTargets}/${targets.length || 1} outputs` : 'off';
+        const oscTargetText = `${targets.length} output${targets.length === 1 ? '' : 's'}`;
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
         document.getElementById('metaD').textContent =
           `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / osc: ${oscTargetText}`;
@@ -3373,13 +3373,6 @@ VIEWER_HTML = """
       }, delay);
     }
 
-    ['oscEnabled'].forEach(id => {
-      const input = document.getElementById(id);
-      input.addEventListener('input', () => {
-        scheduleOscApply();
-      });
-      input.addEventListener('change', () => scheduleOscApply(0));
-    });
     oscTargetsEl.addEventListener('focusin', () => {
       markOscDirty();
     });
