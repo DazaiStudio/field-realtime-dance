@@ -29,6 +29,11 @@ REPO_ROOT = BASE_DIR.parent
 UPLOAD_DIR = BASE_DIR / "viewer_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 CALIBRATION_PRESETS_PATH = BASE_DIR / "calibration_presets.json"
+PROJECT_DEFAULT_CALIBRATION_PRESETS_PATH = BASE_DIR / "project_default_calibration_presets.json"
+PROJECT_DEFAULT_CALIBRATION_PRESET = os.getenv(
+    "FIELD_DEFAULT_CALIBRATION_PRESET",
+    "Rebecca_Clibrate_001_0630",
+)
 
 pose_engine: Optional[PoseEngine] = None
 pose_model_path = REPO_ROOT / "pose_landmarker_lite.task"
@@ -50,7 +55,10 @@ osc_sender = OSCSender(
 # Optional: offline culture centroids enable the /field/morrisness output.
 culture_score = CultureScore.try_load(BASE_DIR / "culture_map.json")
 calibration_collector = CalibrationCollector()
-calibration_presets = load_presets(CALIBRATION_PRESETS_PATH)
+calibration_presets = {
+    **load_presets(PROJECT_DEFAULT_CALIBRATION_PRESETS_PATH),
+    **load_presets(CALIBRATION_PRESETS_PATH),
+}
 calibration_state = {
     "active": False,
     "started_at": None,
@@ -305,6 +313,20 @@ def refresh_prepared_metrics() -> None:
 def reset_pose_metric_history() -> None:
     if pose_engine is not None:
         pose_engine.reset_metrics()
+
+
+def apply_calibration_profile(name: str) -> bool:
+    clean_name = str(name or "").strip()
+    ranges = calibration_presets.get(clean_name)
+    if not ranges:
+        return False
+    osc_sender.clear_metric_ranges()
+    osc_sender.set_metric_ranges(ranges)
+    osc_sender.configure(mode="fixed")
+    osc_sender.reset_state()
+    reset_pose_metric_history()
+    calibration_state["applied_preset"] = clean_name
+    return True
 
 
 def active_metric_names() -> list[str]:
@@ -1067,15 +1089,8 @@ async def calibration_stop(name: str = Form(...)):
 @app.post("/api/calibration/apply")
 async def calibration_apply(name: str = Form(...)):
     clean_name = str(name or "").strip()
-    ranges = calibration_presets.get(clean_name)
-    if not ranges:
+    if not apply_calibration_profile(clean_name):
         return {"status": "error", "error": "unknown calibration profile"}
-    osc_sender.clear_metric_ranges()
-    osc_sender.set_metric_ranges(ranges)
-    osc_sender.configure(mode="fixed")
-    osc_sender.reset_state()
-    reset_pose_metric_history()
-    calibration_state["applied_preset"] = clean_name
     refresh_prepared_metrics()
     return {"status": "applied", "profile": clean_name, **state_payload()}
 
@@ -3618,11 +3633,18 @@ def main():
         alpha=args.osc_alpha,
         namespace=args.osc_namespace,
     )
+    default_preset_applied = False
+    if PROJECT_DEFAULT_CALIBRATION_PRESET:
+        default_preset_applied = apply_calibration_profile(PROJECT_DEFAULT_CALIBRATION_PRESET)
     print(f"FIELD input viewer: http://{args.web_host}:{args.web_port}")
     print(
         f"OSC output: udp://{args.osc_host}:{args.osc_port} "
-        f"prefix={args.osc_namespace} mode={args.osc_mode} alpha={args.osc_alpha}"
+        f"prefix={osc_sender.namespace} mode={osc_sender.mode} alpha={args.osc_alpha}"
     )
+    if default_preset_applied:
+        print(f"Default normalize profile: {PROJECT_DEFAULT_CALIBRATION_PRESET}")
+    elif PROJECT_DEFAULT_CALIBRATION_PRESET:
+        print(f"Default normalize profile not found: {PROJECT_DEFAULT_CALIBRATION_PRESET}")
     print(f"Pose model: {args.pose_model} ({pose_model_path})")
     uvicorn.run(app, host=args.web_host, port=args.web_port)
 
