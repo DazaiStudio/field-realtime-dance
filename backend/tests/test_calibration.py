@@ -81,9 +81,17 @@ class TestFixedNormalize(unittest.TestCase):
 
     def test_fixed_range_maps_to_0_1(self):
         osc = self._sender()
+        osc.set_metric_ranges({"expansion": (0.0, 100.0)})
+        osc.send_metrics({"expansion": 50.0}, send_keys=set())
+        self.assertAlmostEqual(osc.last_prepared_metrics["expansion"], 0.5)
+
+    def test_fixed_energy_lifts_mid_range_response(self):
+        osc = self._sender()
         osc.set_metric_ranges({"energy": (0.0, 100.0)})
-        osc.send_metrics({"energy": 50.0}, send_keys=set())
-        self.assertAlmostEqual(osc.last_prepared_metrics["energy"], 0.5)
+        osc.send_metrics({"energy": 25.0}, send_keys=set())
+        value = osc.last_prepared_metrics["energy"]
+        self.assertGreater(value, 0.49)
+        self.assertLess(value, 0.51)
 
     def test_fixed_clamps_out_of_range(self):
         osc = self._sender()
@@ -96,8 +104,8 @@ class TestFixedNormalize(unittest.TestCase):
         osc.set_metric_ranges({"jerk": (10.0, 100000.0)})
         osc.send_metrics({"jerk": 1000.0}, send_keys=set())
         value = osc.last_prepared_metrics["jerk"]
-        self.assertGreater(value, 0.2)
-        self.assertLess(value, 0.6)
+        self.assertGreater(value, 0.7)
+        self.assertLess(value, 0.85)
 
     def test_metric_without_range_falls_back_to_adaptive(self):
         osc = self._sender()  # no ranges set

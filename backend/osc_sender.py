@@ -30,6 +30,10 @@ BOUNDED_METRICS = {"sync_velocity"}
 ADAPTIVE_RANGE_METRICS = {"height", "sway"}
 UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
 LOG_FIXED_RANGE_METRICS = {"jerk"}
+FIXED_RESPONSE_GAMMA = {
+    "energy": 0.5,
+    "jerk": 0.4,
+}
 
 # Per-message decay applied to the adaptive range so stale extremes fade.
 RANGE_DECAY = 0.001
@@ -281,7 +285,11 @@ class OSCSender:
             span = hi - lo
             if span < 1e-9:
                 return 0.5
-            return _clamp((value - lo) / span)
+            normalized = _clamp((value - lo) / span)
+            gamma = FIXED_RESPONSE_GAMMA.get(key)
+            if gamma is not None:
+                normalized = normalized ** gamma
+            return normalized
         if key in ADAPTIVE_RANGE_METRICS:
             return self._normalize_range(key, value)
         if key in UNBOUNDED_METRICS:
