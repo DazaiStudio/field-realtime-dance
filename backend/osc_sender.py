@@ -32,7 +32,7 @@ UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
 LOG_FIXED_RANGE_METRICS = {"jerk"}
 FIXED_RESPONSE_GAMMA = {
     "energy": 0.5,
-    "jerk": 0.4,
+    "jerk": 0.6,
 }
 
 # Per-message decay applied to the adaptive range so stale extremes fade.
