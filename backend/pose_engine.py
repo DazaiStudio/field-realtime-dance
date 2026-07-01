@@ -24,6 +24,7 @@ class PoseEngine:
         self.smoother = JointSmoother(min_cutoff=smooth_min_cutoff, beta=smooth_beta)
         self.smoothing_enabled = bool(smoothing_enabled)
         self.last_pose_valid = False
+        self.last_pose_quality = 0.0
         self.source = self._make_source(self.backend_name)
 
     # --- source / backend management ---------------------------------------
@@ -71,8 +72,12 @@ class PoseEngine:
     def process_frame(self, frame, timestamp_ms, draw_overlay: bool = True):
         frame, h36m = self.source.estimate(frame, timestamp_ms, draw_overlay)
         metrics = self.metrics_engine.get_empty_metrics()
-        self.last_pose_valid = self._pose_is_complete(h36m)
-        if self.last_pose_valid:
+        pose_complete = self._pose_is_complete(h36m)
+        self.last_pose_quality = 0.0
+        self.last_pose_valid = False
+        if pose_complete:
+            self.last_pose_quality = self._clamp_quality(getattr(self.source, "last_pose_quality", 1.0))
+            self.last_pose_valid = bool(getattr(self.source, "last_pose_valid", True))
             if self.smoothing_enabled:
                 h36m = self.smoother.filter(h36m, timestamp_ms)
             metrics = self.metrics_engine.update(h36m)
@@ -84,6 +89,16 @@ class PoseEngine:
             return False
         arr = np.asarray(h36m, dtype=float)
         return arr.shape == (17, 3) and bool(np.isfinite(arr).all())
+
+    @staticmethod
+    def _clamp_quality(value) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(numeric):
+            return 0.0
+        return float(np.clip(numeric, 0.0, 1.0))
 
     def close(self):
         try:

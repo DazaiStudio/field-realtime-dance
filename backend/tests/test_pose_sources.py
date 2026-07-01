@@ -4,8 +4,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pose_sources import (
-    rtmw3d_primary_h36m, _largest_person, _fit_affine_xy, _apply_affine_xy,
+    rtmw3d_primary_h36m, mediapipe_pose_quality, _largest_person, _fit_affine_xy, _apply_affine_xy,
 )
+
+
+class FakeLandmark:
+    def __init__(self, visibility=1.0, presence=1.0):
+        self.visibility = visibility
+        self.presence = presence
 
 
 def _two_people():
@@ -18,6 +24,39 @@ def _two_people():
     kp2[0, :17, :] = kp[0, :17, :2]
     kp2[1, :17, :] = kp[1, :17, :2]
     return kp, kp2
+
+
+def _mp_landmarks(default=1.0):
+    return [FakeLandmark(default, default) for _ in range(33)]
+
+
+class TestMediaPipePoseQuality(unittest.TestCase):
+    def test_accepts_one_missing_end_effector(self):
+        landmarks = _mp_landmarks()
+        landmarks[15] = FakeLandmark(0.0, 0.0)
+        quality, valid = mediapipe_pose_quality(landmarks)
+        self.assertTrue(valid)
+        self.assertGreaterEqual(quality, 0.75)
+
+    def test_visibility_takes_priority_over_presence(self):
+        landmarks = _mp_landmarks()
+        landmarks[23] = FakeLandmark(1.0, 0.0)
+        quality, valid = mediapipe_pose_quality(landmarks)
+        self.assertTrue(valid)
+        self.assertGreaterEqual(quality, 0.75)
+
+    def test_rejects_two_missing_end_effectors(self):
+        landmarks = _mp_landmarks()
+        landmarks[15] = FakeLandmark(0.0, 0.0)
+        landmarks[28] = FakeLandmark(0.0, 0.0)
+        _quality, valid = mediapipe_pose_quality(landmarks)
+        self.assertFalse(valid)
+
+    def test_rejects_unreliable_core(self):
+        landmarks = _mp_landmarks()
+        landmarks[23] = FakeLandmark(0.2, 0.2)
+        _quality, valid = mediapipe_pose_quality(landmarks)
+        self.assertFalse(valid)
 
 
 class TestRtmw3dPrimary(unittest.TestCase):

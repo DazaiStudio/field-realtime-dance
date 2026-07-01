@@ -28,6 +28,18 @@ _MP_CONNECTIONS = [
     (23, 25), (25, 27), (27, 29), (29, 31), (31, 27),
     (24, 26), (26, 28), (28, 30), (30, 32), (32, 28),
 ]
+_MP_QUALITY_WEIGHTS = {
+    0: 0.5,    # nose/head matters less for these metrics
+    11: 1.3, 12: 1.3, 23: 1.3, 24: 1.3,  # shoulders + hips
+    13: 1.1, 14: 1.1, 25: 1.1, 26: 1.1,  # elbows + knees
+    15: 1.4, 16: 1.4, 27: 1.4, 28: 1.4,  # wrists + ankles
+}
+_MP_CORE_LANDMARKS = (11, 12, 23, 24)
+_MP_END_EFFECTORS = (15, 16, 27, 28)
+POSE_QUALITY_MIN = 0.75
+POSE_CORE_MIN = 0.45
+POSE_EFFECTOR_MIN = 0.35
+POSE_MIN_EFFECTORS = 3
 
 POSE_MODEL_URLS = {
     "pose_landmarker_lite.task": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
@@ -97,6 +109,32 @@ def _apply_affine_xy(crop, xform):
     return pts
 
 
+def _landmark_confidence(landmark) -> float:
+    for attr in ("visibility", "presence"):
+        if hasattr(landmark, attr):
+            try:
+                value = float(getattr(landmark, attr))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return float(np.clip(value, 0.0, 1.0))
+    return 1.0
+
+
+def mediapipe_pose_quality(landmarks) -> tuple[float, bool]:
+    """Weighted calibration-quality gate from MediaPipe landmark confidence."""
+    if landmarks is None or len(landmarks) <= max(_MP_QUALITY_WEIGHTS):
+        return 0.0, False
+
+    confidences = {i: _landmark_confidence(landmarks[i]) for i in _MP_QUALITY_WEIGHTS}
+    total_weight = sum(_MP_QUALITY_WEIGHTS.values())
+    quality = sum(confidences[i] * weight for i, weight in _MP_QUALITY_WEIGHTS.items()) / total_weight
+    core_ok = all(confidences[i] >= POSE_CORE_MIN for i in _MP_CORE_LANDMARKS)
+    end_count = sum(1 for i in _MP_END_EFFECTORS if confidences[i] >= POSE_EFFECTOR_MIN)
+    valid = core_ok and end_count >= POSE_MIN_EFFECTORS and quality >= POSE_QUALITY_MIN
+    return float(quality), bool(valid)
+
+
 def rtmw3d_primary_h36m(keypoints, keypoints_2d=None, scale: float = RTM_POSE_SCALE):
     """Pure helper: from RTMW3D output pick the primary (largest) person and
     return (h36m17 (17,3) | None, overlay_pts2d (17,2) | None).
@@ -144,6 +182,8 @@ class MediaPipePoseSource:
             )
         )
         self.last_pose_landmarks = None
+        self.last_pose_quality = 0.0
+        self.last_pose_valid = False
 
     def _ensure_model(self):
         if not os.path.exists(self.model_path):
@@ -180,12 +220,18 @@ class MediaPipePoseSource:
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
         result = self.landmarker.detect_for_video(mp_image, int(timestamp_ms))
         h36m = None
+        self.last_pose_quality = 0.0
+        self.last_pose_valid = False
         if result.pose_landmarks:
             self.last_pose_landmarks = result.pose_landmarks
+            self.last_pose_quality, self.last_pose_valid = mediapipe_pose_quality(result.pose_landmarks[0])
             if draw:
                 self.draw_cached_overlay(frame)
         if result.pose_world_landmarks:
             h36m = mp33_to_h36m17(result.pose_world_landmarks[0])
+            if not result.pose_landmarks:
+                self.last_pose_quality = 1.0
+                self.last_pose_valid = True
         return frame, h36m
 
     def close(self):
@@ -205,6 +251,8 @@ class RTMPose3DPoseSource:
         self._last_kpts2d = None
         self._last_overlay_pts = None
         self._xform = None  # cached crop->full-frame transform for the overlay
+        self.last_pose_quality = 0.0
+        self.last_pose_valid = False
 
     def _draw(self, frame, pts2d):
         pts = {i: (int(pts2d[i][0]), int(pts2d[i][1])) for i in range(len(pts2d))}
@@ -221,6 +269,8 @@ class RTMPose3DPoseSource:
 
     def estimate(self, frame, timestamp_ms: float, draw: bool = True):
         result = self.tracker(frame)
+        self.last_pose_quality = 0.0
+        self.last_pose_valid = False
         if result is None or len(result) < 2:
             return frame, None
         keypoints = np.asarray(result[0], dtype=float)
@@ -228,6 +278,9 @@ class RTMPose3DPoseSource:
 
         # Metrics: tested helper (picks the largest person, builds H36M-17).
         h36m, _ = rtmw3d_primary_h36m(keypoints, kpts2d_full, RTM_POSE_SCALE)
+        if h36m is not None:
+            self.last_pose_quality = 1.0
+            self.last_pose_valid = True
 
         # Overlay in full-frame pixels that tracks EVERY frame. Detection frames
         # give full-frame keypoints_2d directly and refresh the crop->full

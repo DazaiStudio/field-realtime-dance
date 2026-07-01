@@ -112,6 +112,7 @@ processing_state = {
     "latest_raw_metrics": {},
     "latest_timestamp_ms": None,
     "pose_valid": False,
+    "pose_quality": 0.0,
     "last_frame_at": None,
     "signal_mean": None,
     "morrisness": None,
@@ -547,12 +548,19 @@ def set_stream_frame(frame=None, encode_ms: float = 0.0) -> None:
         processing_state["error"] = None
 
 
-def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0, pose_valid: bool = True) -> None:
+def set_analysis_result(
+    metrics: dict,
+    timestamp_ms: int,
+    pose_ms: float = 0.0,
+    pose_valid: bool = True,
+    pose_quality: Optional[float] = None,
+) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["pose_valid"] = bool(pose_valid)
+    processing_state["pose_quality"] = float(pose_quality) if pose_quality is not None else (1.0 if pose_valid else 0.0)
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
@@ -688,6 +696,7 @@ async def stream_live():
                         timestamp_ms,
                         pose_ms,
                         pose_valid=bool(getattr(engine, "last_pose_valid", False)),
+                        pose_quality=getattr(engine, "last_pose_quality", 0.0),
                     )
                     next_analysis_at = now + analysis_interval
                 elif source_state.get("overlay_enabled", True):
@@ -822,6 +831,7 @@ async def stream_video():
                     timestamp_ms,
                     pose_ms,
                     pose_valid=bool(getattr(engine, "last_pose_valid", False)),
+                    pose_quality=getattr(engine, "last_pose_quality", 0.0),
                 )
                 next_analysis_at = now + analysis_interval
             elif source_state.get("overlay_enabled", True):
@@ -1203,6 +1213,7 @@ async def apply_input(
     processing_state["latest_raw_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
     processing_state["pose_valid"] = False
+    processing_state["pose_quality"] = 0.0
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
     processing_state["morrisness"] = None
@@ -1864,7 +1875,7 @@ VIEWER_HTML = """
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 28px minmax(0, 1fr) minmax(230px, 250px);
+      grid-template-columns: 22px 28px minmax(0, 1fr) minmax(230px, 250px);
       align-items: center;
       gap: 10px;
       min-height: 52px;
@@ -1874,6 +1885,30 @@ VIEWER_HTML = """
       border-radius: 8px;
     }
     .metric.disabled { opacity: .45; }
+    .metric.dragging { opacity: .28; }
+    .metric.drag-over { border-color: rgba(84,179,168,.78); }
+    .metric-drag {
+      width: 22px;
+      min-height: 32px;
+      padding: 0;
+      display: grid;
+      place-items: center;
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      cursor: grab;
+    }
+    .metric-drag:active { cursor: grabbing; }
+    .metric-drag::before {
+      content: "";
+      width: 12px;
+      height: 16px;
+      opacity: .62;
+      background:
+        radial-gradient(circle, var(--muted) 1.2px, transparent 1.8px) 0 0 / 6px 6px,
+        radial-gradient(circle, var(--muted) 1.2px, transparent 1.8px) 6px 0 / 6px 6px;
+    }
+    .metric-drag:hover::before { opacity: .9; }
     .metric-enable { display: grid; place-items: center; }
     .metric-enable input { width: 16px; height: 16px; accent-color: var(--teal); }
     .metric-label { display: grid; gap: 3px; min-width: 0; }
@@ -2034,7 +2069,7 @@ VIEWER_HTML = """
       .controls-grid, .osc-settings, .osc-target-row, .input-source-toggle, .metric-osc-controls, .calibration-row, .meta, .output-header { grid-template-columns: 1fr; }
       .osc-remove { width: 100%; }
       .switch-row { justify-content: flex-start; }
-      .metric { grid-template-columns: 28px minmax(0, 1fr); align-items: start; }
+      .metric { grid-template-columns: 22px 28px minmax(0, 1fr); align-items: start; }
       .metric-smooth-row { grid-column: 1 / -1; justify-self: stretch; width: 100%; }
       .metric-readout { grid-column: 1 / -1; }
     }
@@ -2217,6 +2252,7 @@ VIEWER_HTML = """
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
     const defaultMetricEmaFrames = %DEFAULT_METRIC_EMA_FRAMES%;
     const metricsEl = document.getElementById('metrics');
+    const metricOrderStorageKey = 'field.metricOrder.v1';
     const oscTargetsEl = document.getElementById('oscTargets');
     const tooltipEl = document.getElementById('customTooltip');
     const maxSeen = {};
@@ -2323,6 +2359,69 @@ VIEWER_HTML = """
     function formatEmaFrames(frames) {
       return `${snapEmaFrames(frames)}f`;
     }
+
+    function normalizeMetricOrder(order = metricNames) {
+      const seen = new Set();
+      const clean = [];
+      for (const name of order || []) {
+        if (metricNames.includes(name) && !seen.has(name)) {
+          clean.push(name);
+          seen.add(name);
+        }
+      }
+      for (const name of metricNames) {
+        if (!seen.has(name)) clean.push(name);
+      }
+      return clean;
+    }
+
+    function loadMetricOrder() {
+      try {
+        return normalizeMetricOrder(JSON.parse(localStorage.getItem(metricOrderStorageKey) || '[]'));
+      } catch (error) {
+        return normalizeMetricOrder();
+      }
+    }
+
+    function saveMetricOrder() {
+      try {
+        localStorage.setItem(metricOrderStorageKey, JSON.stringify(metricOrder));
+      } catch (error) {}
+    }
+
+    function orderedMetricNames(activeSet = null) {
+      const order = normalizeMetricOrder(metricOrder);
+      metricOrder = order;
+      if (!activeSet) return order;
+      return [
+        ...order.filter(name => activeSet.has(name)),
+        ...order.filter(name => !activeSet.has(name)),
+      ];
+    }
+
+    function applyMetricOrder(activeSet = null) {
+      for (const name of orderedMetricNames(activeSet)) {
+        const row = document.getElementById(`metric-${name}`);
+        if (row) metricsEl.appendChild(row);
+        const overlayRow = document.getElementById(`ov-row-${name}`);
+        if (overlayRow) metricOverlayEl.appendChild(overlayRow);
+      }
+    }
+
+    function moveMetricBeforeOrAfter(dragName, targetName, afterTarget) {
+      if (!dragName || !targetName || dragName === targetName) return;
+      const next = normalizeMetricOrder(metricOrder).filter(name => name !== dragName);
+      const targetIndex = next.indexOf(targetName);
+      if (targetIndex < 0) return;
+      next.splice(targetIndex + (afterTarget ? 1 : 0), 0, dragName);
+      metricOrder = normalizeMetricOrder(next);
+      saveMetricOrder();
+      const activeSet = new Set(lastPayload?.source?.osc_metrics || metricNames);
+      applyMetricOrder(activeSet);
+    }
+
+    let metricOrder = loadMetricOrder();
+
     function refreshEmaFrameLabels() {
       for (const row of document.querySelectorAll('.metric')) {
         const smooth = row.querySelector('.metric-smooth');
@@ -2428,7 +2527,9 @@ VIEWER_HTML = """
       row.className = 'metric';
       row.id = `metric-${name}`;
       setTooltipTarget(row, labelForMetric(name), metricDescriptions[name] || '');
+      row.draggable = true;
       row.innerHTML = `
+        <button class="metric-drag" type="button" title="Drag to reorder" aria-label="Drag ${labelForMetric(name)}"></button>
         <label class="metric-enable" data-tooltip-title="Output ${labelForMetric(name)}" data-tooltip-body="Checked metrics are included in OSC output, Output values, overlays, and live charts."><input class="metric-toggle" type="checkbox" checked /></label>
         <div class="metric-label" data-tooltip-title="${labelForMetric(name)}" data-tooltip-body="${metricDescriptions[name] || ''}">
           <div class="name">${labelForMetric(name)}</div>
@@ -2448,6 +2549,19 @@ VIEWER_HTML = """
       const msInput = row.querySelector('.metric-smooth');
       const msVal = row.querySelector('.ms-val');
       setRangeFill(msInput, defaultMetricEmaFrames);
+      row.addEventListener('dragstart', event => {
+        if (!event.target.closest('.metric-drag')) {
+          event.preventDefault();
+          return;
+        }
+        row.classList.add('dragging');
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', name);
+      });
+      row.addEventListener('dragend', () => {
+        row.classList.remove('dragging');
+        document.querySelectorAll('.metric.drag-over').forEach(item => item.classList.remove('drag-over'));
+      });
       toggle.addEventListener('change', async () => {
         const data = new FormData();
         data.set('metric', name);
@@ -2479,6 +2593,37 @@ VIEWER_HTML = """
       ovRow.innerHTML = `<span class="ov-name">${labelForMetric(name)}</span><span class="ov-val" id="ov-${name}">0.00</span>`;
       metricOverlayEl.appendChild(ovRow);
     }
+    applyMetricOrder(new Set(metricNames));
+
+    metricsEl.addEventListener('dragover', event => {
+      const dragging = document.querySelector('.metric.dragging');
+      const target = event.target.closest('.metric');
+      if (!dragging || !target || !metricsEl.contains(target) || target === dragging) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      document.querySelectorAll('.metric.drag-over').forEach(item => {
+        if (item !== target) item.classList.remove('drag-over');
+      });
+      target.classList.add('drag-over');
+    });
+
+    metricsEl.addEventListener('dragleave', event => {
+      const target = event.target.closest('.metric');
+      if (target && !target.contains(event.relatedTarget)) target.classList.remove('drag-over');
+    });
+
+    metricsEl.addEventListener('drop', event => {
+      const target = event.target.closest('.metric');
+      if (!target || !metricsEl.contains(target)) return;
+      event.preventDefault();
+      const dragging = document.querySelector('.metric.dragging');
+      const dragName = event.dataTransfer.getData('text/plain') || dragging?.id?.replace(/^metric-/, '');
+      const targetName = target.id.replace(/^metric-/, '');
+      const rect = target.getBoundingClientRect();
+      const afterTarget = event.clientY > rect.top + (rect.height / 2);
+      target.classList.remove('drag-over');
+      moveMetricBeforeOrAfter(dragName, targetName, afterTarget);
+    });
 
     async function applySettings(detectEnabled) {
       const form = document.getElementById('form');
@@ -2959,7 +3104,7 @@ VIEWER_HTML = """
       const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
       const container = document.getElementById('addresses');
       container.innerHTML = '';
-      for (const name of metricNames) {
+      for (const name of orderedMetricNames(active)) {
         if (!active.has(name)) continue;
         const row = document.createElement('div');
         const value = Number(metrics[name] ?? 0);
@@ -3074,9 +3219,9 @@ VIEWER_HTML = """
         calibrationOverlayEl.innerHTML = `<span class="countdown-label">Calibration starts</span><span class="countdown-number">${countdown}</span>`;
         calibrationOverlayEl.classList.remove('hidden');
       } else if (calibration.active) {
-        calibrationStatusEl.textContent = poseValid || sampleCount > 0 ? `recording ${sampleCount}` : 'waiting skeleton';
+        calibrationStatusEl.textContent = poseValid || sampleCount > 0 ? `recording ${sampleCount}` : 'waiting clean pose';
         calibrationOverlayEl.classList.remove('countdown');
-        calibrationOverlayEl.textContent = poseValid || sampleCount > 0 ? `Calibrating ${sampleCount}` : 'Waiting skeleton';
+        calibrationOverlayEl.textContent = poseValid || sampleCount > 0 ? `Calibrating ${sampleCount}` : 'Waiting clean pose';
         calibrationOverlayEl.classList.remove('hidden');
       } else if (applied) {
         calibrationStatusEl.textContent = `fixed ${applied}`;
@@ -3104,6 +3249,7 @@ VIEWER_HTML = """
       syncInitialMetricSmoothness(osc);
       refreshEmaFrameLabels();
       syncCalibration(payload);
+      applyMetricOrder(active);
       if (!inputDirty) {
         setSourceMode(source.source === 'video' ? 'video' : 'live');
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
@@ -3154,7 +3300,7 @@ VIEWER_HTML = """
       }
       updateAddresses(payload);
 
-      for (const name of metricNames) {
+      for (const name of orderedMetricNames(active)) {
         const enabled = active.has(name);
         const row = document.getElementById(`metric-${name}`);
         const toggle = row?.querySelector('.metric-toggle');
