@@ -3,7 +3,7 @@ short guided routine, then derive fixed [lo, hi] ranges (percentiles) for the
 OSC sender's "fixed" normalize mode.
 
 Why percentiles instead of min/max: a single bad detection frame can spike a
-metric, and min/max would bake that outlier into the range. The 2nd/98th
+metric, and min/max would bake that outlier into the range. The 1st/99th
 percentiles give a robust working range fitted to the actual dancer + camera
 and the Smoothness(EMA) settings used during calibration.
 
@@ -78,7 +78,7 @@ class CalibrationCollector:
             return len(self._samples.get(metric, []))
         return min((len(s) for s in self._samples.values()), default=0)
 
-    def ranges(self, lo_pct: float = 2.0, hi_pct: float = 98.0,
+    def ranges(self, lo_pct: float = 1.0, hi_pct: float = 99.0,
                min_samples: int = 10) -> dict:
         """Per-metric (lo, hi) from the lo/hi percentiles. Metrics with fewer
         than min_samples are skipped (not enough data to trust)."""

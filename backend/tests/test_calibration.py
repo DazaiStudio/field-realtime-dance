@@ -13,11 +13,11 @@ class TestCalibrationCollector(unittest.TestCase):
         c = CalibrationCollector()
         for v in range(0, 101):  # 0..100 inclusive
             c.add({"energy": float(v)})
-        rng = c.ranges(lo_pct=2.0, hi_pct=98.0)
+        rng = c.ranges()
         self.assertIn("energy", rng)
         lo, hi = rng["energy"]
-        self.assertAlmostEqual(lo, 2.0, delta=1.0)   # ~2nd percentile, not 0
-        self.assertAlmostEqual(hi, 98.0, delta=1.0)  # ~98th percentile, not 100
+        self.assertAlmostEqual(lo, 1.0, delta=1.0)   # ~1st percentile, not 0
+        self.assertAlmostEqual(hi, 99.0, delta=1.0)  # ~99th percentile, not 100
 
     def test_min_samples_gate(self):
         c = CalibrationCollector()
