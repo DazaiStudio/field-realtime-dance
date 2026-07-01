@@ -60,12 +60,12 @@ Default output `udp://127.0.0.1:9000`, prefix `/field`, one float per metric:
 /field/sway        /field/torque      /field/jerk
 ```
 
-Outputs, prefix, normalize mode, metric toggles, per-metric smoothing, and enable are all changeable at runtime in the viewer - no restart needed.
+Outputs, prefix, normalize profile, metric toggles, per-metric smoothing, and enable are all changeable at runtime in the viewer - no restart needed.
 
-- **Normalize profile:** defaults to `None - raw` for raw metric values. Choose `Dynamic` for adaptive 0..1 ranges, or a saved calibration profile for fixed profile ranges. The selected option becomes active immediately.
-- **Calibration presets:** use the input-screen `Calibrate` button, or `Calibration -> Start`, run a short compact/open movement range, then press `Stop` to save the profile. Profiles are stored locally in `backend/calibration_presets.json`.
+- **Normalize profile:** defaults to `None - raw` for raw metric values. Choose a saved calibration profile for fixed profile ranges. The selected option becomes active immediately.
+- **Calibration presets:** use the input-screen `Calibrate` button, or `Calibration -> Start`, run a short compact/open movement range, then press `Stop` to save the profile. Profiles are built from Smoothness(EMA) output samples and stored locally in `backend/calibration_presets.json`.
 - **Outputs:** use `Add Output` for extra OSC receivers. Each row has a name, target host/IP, and port. Broadcast is automatic for `.255` broadcast addresses.
-- **Joint smoothness:** One-Euro smoothing before metrics, default on.
-- **Per-metric Smoothness:** each output channel defaults to 30%, snaps in 5% steps, and can be tuned independently.
+- **Joint smoothness:** disabled in the viewer path so metrics are calculated from the detected skeleton directly.
+- **Per-metric Smoothness(EMA):** each output channel uses a 0f-10f EMA frame slider. 0f is off; the default is 3f, except `Sync Correlation`, which defaults to 0f.
 - **Prefix:** defaults to `/field`; blank prefix sends root-level addresses such as `/energy`.
 - The on-screen values always match what is sent over OSC.

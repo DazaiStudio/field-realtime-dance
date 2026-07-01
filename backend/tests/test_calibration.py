@@ -3,7 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration import (
-    CalibrationCollector, save_profile, load_profile, save_presets, load_presets,
+    CalibrationCollector, load_profile, load_presets, normalize_presets, save_profile, save_presets,
 )
 from osc_sender import OSCSender
 
@@ -54,6 +54,26 @@ class TestCalibrationCollector(unittest.TestCase):
             self.assertEqual(loaded["Dancer B"]["sway"], (0.0, 0.5))
         self.assertEqual(load_presets("/no/such.json"), {})
 
+    def test_normalize_presets_accepts_export_wrapper(self):
+        data = {
+            "version": 1,
+            "presets": {
+                "stage": {
+                    "energy": [1.0, 10.0],
+                    "bogus": [0.0, 1.0],
+                    "height": [5.0, 5.0],
+                }
+            },
+        }
+        presets = normalize_presets(data)
+        self.assertEqual(presets["stage"]["energy"], (1.0, 10.0))
+        self.assertNotIn("bogus", presets["stage"])
+        self.assertNotIn("height", presets["stage"])
+
+    def test_normalize_presets_accepts_single_profile_ranges(self):
+        presets = normalize_presets({"ranges": {"sway": [0.2, 0.8]}}, default_name="solo")
+        self.assertEqual(presets["solo"]["sway"], (0.2, 0.8))
+
 
 class TestFixedNormalize(unittest.TestCase):
     def _sender(self):
@@ -87,6 +107,45 @@ class TestFixedNormalize(unittest.TestCase):
     def test_fixed_is_valid_mode(self):
         osc = OSCSender(enabled=False, mode="fixed")
         self.assertEqual(osc.mode, "fixed")
+
+
+class TestViewerCalibrationFlow(unittest.TestCase):
+    def test_calibration_collects_output_ema_values(self):
+        import osc_viewer
+
+        original_state = dict(osc_viewer.calibration_state)
+        original_mode = osc_viewer.osc_sender.mode
+        original_alpha = osc_viewer.osc_sender.alpha
+        original_metric_alphas = dict(osc_viewer.osc_sender.metric_alphas)
+        try:
+            osc_viewer.calibration_collector.reset()
+            osc_viewer.osc_sender.configure(mode="raw", alpha=1.0)
+            osc_viewer.osc_sender.reset_state()
+            for name in osc_viewer.METRIC_NAMES:
+                osc_viewer.osc_sender.set_metric_alpha(name, 1.0)
+            osc_viewer.osc_sender.set_metric_alpha("energy", 0.5)
+            osc_viewer.calibration_state["active"] = True
+            osc_viewer.calibration_state["sample_count"] = 0
+
+            frame_a = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
+            frame_b = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
+            frame_a["energy"] = 100.0
+            frame_b["energy"] = 0.0
+
+            osc_viewer.set_analysis_result(frame_a, timestamp_ms=1000)
+            osc_viewer.set_analysis_result(frame_b, timestamp_ms=1100)
+
+            energy_samples = osc_viewer.calibration_collector._samples["energy"][-2:]
+            self.assertEqual(len(energy_samples), 2)
+            self.assertAlmostEqual(energy_samples[0], 100.0)
+            self.assertAlmostEqual(energy_samples[1], 50.0)
+        finally:
+            osc_viewer.calibration_state.update(original_state)
+            osc_viewer.calibration_collector.reset()
+            osc_viewer.osc_sender.metric_alphas.clear()
+            osc_viewer.osc_sender.metric_alphas.update(original_metric_alphas)
+            osc_viewer.osc_sender.configure(mode=original_mode, alpha=original_alpha)
+            osc_viewer.osc_sender.reset_state()
 
 
 if __name__ == "__main__":

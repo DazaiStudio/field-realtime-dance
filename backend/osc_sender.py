@@ -254,10 +254,14 @@ class OSCSender:
         if not math.isfinite(numeric):
             return None
 
+        # Keep calibration and runtime on the same signal path: Smoothness(EMA)
+        # first, then apply fixed/profile normalization to that smoothed value.
+        numeric = self._smooth(key, numeric)
+
         if self.mode in ("normalize", "fixed"):
             numeric = self._normalize(key, numeric)
 
-        return self._smooth(key, numeric)
+        return numeric
 
     def _normalize(self, key: str, value: float) -> float:
         if key == "sync_correlation":

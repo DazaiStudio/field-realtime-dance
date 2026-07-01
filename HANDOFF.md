@@ -4,7 +4,7 @@ Continuation notes for picking up development on another machine, including macO
 
 ## TL;DR
 
-- `master` is the current deliverable branch. It contains the clean single-person rehearsal viewer: MediaPipe-only in the UI, camera-only input, Normalize default-on, One-Euro joint smoothing default-on, and per-metric output Smoothness defaulting to 30%.
+- `master` is the current deliverable branch. It contains the clean single-person rehearsal viewer: MediaPipe-only in the UI, camera-only input, Normalize default-on, joint smoothing disabled in the viewer path, and per-metric Smoothness(EMA) defaulting to 3f except Sync Correlation at 0f.
 - `feat/rtmpose-backend` was fast-forward merged into `master` at `d8526ef`. The branch remains on origin as a backup/history branch, but new work should continue from `master`.
 - `feat/multi-person` is a shelved exploration for 4-dancer slots and per-slot OSC. Its `docs/superpowers/specs|plans/` keep the original RTMPose3D design/plan and multi-person spec.
 - The remote default branch is `master`: https://github.com/DazaiStudio/field-realtime-dance.
@@ -39,7 +39,7 @@ RTMPose3D is fully optional and lazy-imported. The rehearsal UI intentionally hi
 ## File Map
 
 - `backend/osc_viewer.py` - FastAPI app, camera streaming, web UI, OSC config, metric toggles, smoothing controls, `/charts`, `/api/apply`.
-- `backend/pose_engine.py` - selects the pose source, runs One-Euro over joints, feeds `DanceMetricsEngine`.
+- `backend/pose_engine.py` - selects the pose source, optionally runs One-Euro over joints for legacy/manual testing, feeds `DanceMetricsEngine`.
 - `backend/pose_sources.py` - `MediaPipePoseSource` and `RTMPose3DPoseSource`; single-person = largest detected person.
 - `backend/one_euro.py` - speed-adaptive One-Euro joint smoother over `(17, 3)`.
 - `backend/keypoint_mapping.py` - MediaPipe 33 and COCO/RTM 17 into standard H36M-17.
@@ -55,14 +55,14 @@ RTMPose3D is fully optional and lazy-imported. The rehearsal UI intentionally hi
 - **Camera recovery:** live/preview stream cleanup releases the shared camera. If OpenCV drops frames repeatedly, the stream attempts to release/reopen the camera instead of freezing on the last frame.
 - **Change Input:** returns to the pure input menu state.
 - **RTMPose:** hidden from the dropdown. The UI exposes only MediaPipe.
-- **Calibration:** calibration/fixed-range preset UI is removed for now.
+- **Calibration:** calibration/fixed-range preset UI is active. Calibration records Smoothness(EMA) output samples for the seven range metrics; `sync_velocity` and `sync_correlation` are not calibrated.
 
 ## Smoothing Model
 
-There are two smoothing stages with different jobs.
+The viewer's main path uses output smoothing only.
 
-1. **Joint layer:** One-Euro smoothing on the skeleton before metrics are calculated. This is controlled by the `Joint smoothness` switch and defaults on. It uses `min_cutoff=0.3`.
-2. **Output layer:** per-metric EMA smoothing on each enabled OSC channel. Every metric card has its own `Smoothness` slider. These sliders default to 30%, snap in 5% steps, and map to `alpha=0.706`.
+1. **Metric source:** joint smoothing is disabled by default, so metrics are calculated from the detected H36M skeleton directly. The One-Euro code and `/api/smoothing` endpoint remain only for compatibility/manual testing.
+2. **Output layer:** per-metric EMA smoothing on each enabled OSC channel. Every metric card has its own `Smoothness(EMA)` slider in pose-analysis frames. The range is 0f-10f, where 0f is off; the default is 3f except Sync Correlation at 0f.
 
 The old global OSC alpha is kept internally at `1.0` for compatibility, but it is no longer shown in the viewer.
 
@@ -76,7 +76,7 @@ The old global OSC alpha is kept internally at `1.0` for compatibility, but it i
 
 - Normalize defaults on.
 - Raw mode sends physical metric units.
-- Normalize mode maps most active metrics into adaptive 0..1 ranges. These ranges are useful for visual/audio mapping but are not comparable across long periods because the adaptive reference drifts.
+- The viewer exposes `None - raw` and saved calibration profiles. The old adaptive normalize mode remains in `OSCSender` for compatibility but is no longer offered in the UI.
 - `Sync Correlation` stays bipolar (`-1..1`) even when Normalize is on.
 - `Sync Correlation` means left-right timing match, not movement size: `+1` same rhythm, `0` no clear timing link, `-1` alternating/opposite timing.
 - Prefix defaults to `/field`, but can be blank. Blank sends root-level addresses such as `/energy`; non-empty values normalize to `/prefix/...`.
@@ -97,7 +97,7 @@ Default OSC addresses:
 
 ## Pending
 
-- [ ] Visual live-camera check in the rehearsal space: skeleton tracks correctly, metrics move, and Smoothness feel is appropriate.
+- [ ] Visual live-camera check in the rehearsal space: skeleton tracks correctly, metrics move, and Smoothness(EMA) feel is appropriate.
 - [ ] Re-export the `ai-motion` culture map before relying on morrisness.
 - [ ] Multi-person remains parked on `feat/multi-person` until needed.
 

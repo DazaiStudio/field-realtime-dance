@@ -38,6 +38,24 @@ class TestPerMetricSmoothing(unittest.TestCase):
         self.assertIn("metric_alphas", status)
         self.assertAlmostEqual(status["metric_alphas"]["jerk"], 0.1)
 
+    def test_fixed_ranges_apply_after_output_ema(self):
+        osc = OSCSender(enabled=False, alpha=1.0, mode="fixed")
+        osc.set_metric_ranges({"energy": (0.0, 100.0)})
+        osc.set_metric_alpha("energy", 0.5)
+
+        osc.send_metrics({"energy": 100.0}, send_keys=set())
+        self.assertAlmostEqual(osc.last_prepared_metrics["energy"], 1.0)
+
+        osc.send_metrics({"energy": 0.0}, send_keys=set())
+        self.assertAlmostEqual(osc.last_prepared_metrics["energy"], 0.5)
+
+    def test_viewer_defaults_do_not_smooth_sync_correlation(self):
+        import osc_viewer
+
+        alphas = osc_viewer.osc_sender.metric_alphas
+        self.assertAlmostEqual(alphas["sync_correlation"], 1.0)
+        self.assertAlmostEqual(alphas["energy"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

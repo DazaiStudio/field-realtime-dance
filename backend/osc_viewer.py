@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -16,7 +17,7 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import uvicorn
 
-from calibration import CalibrationCollector, load_presets, save_presets
+from calibration import CalibrationCollector, load_presets, normalize_presets, save_presets
 from culture_score import CultureScore
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
 from pose_engine import PoseEngine, VALID_BACKENDS
@@ -62,12 +63,14 @@ PERFORMANCE_PRESETS = {
     "quality": {"width": 1920, "height": 1080, "target_fps": 20.0, "analysis_fps": 10.0, "jpeg_quality": 72},
 }
 DEFAULT_PERFORMANCE = "quality"
-DEFAULT_METRIC_SMOOTHNESS = 30.0
-DEFAULT_METRIC_ALPHA = 1.0 - ((DEFAULT_METRIC_SMOOTHNESS / 100.0) * 0.98)
+DEFAULT_METRIC_EMA_FRAMES = 3.0
+DEFAULT_METRIC_ALPHA = 2.0 / (DEFAULT_METRIC_EMA_FRAMES + 1.0)
+NO_SMOOTHING_ALPHA = 1.0
 CAMERA_SCAN_MAX_INDEX = int(os.getenv("FIELD_CAMERA_SCAN_MAX_INDEX", "8"))
 
 for metric_name in METRIC_NAMES:
-    osc_sender.set_metric_alpha(metric_name, DEFAULT_METRIC_ALPHA)
+    alpha = NO_SMOOTHING_ALPHA if metric_name == "sync_correlation" else DEFAULT_METRIC_ALPHA
+    osc_sender.set_metric_alpha(metric_name, alpha)
 
 source_state = {
     "source": "live",
@@ -87,7 +90,7 @@ source_state = {
     "osc_metrics": list(METRIC_NAMES),
     "detect_enabled": False,
     "pose_backend": os.getenv("FIELD_POSE_BACKEND", "mediapipe"),
-    "smooth_enabled": True,
+    "smooth_enabled": False,
     "smooth_min_cutoff": 0.3,
     "applied_at": time.time(),
 }
@@ -132,7 +135,7 @@ def get_pose_engine() -> PoseEngine:
     desired = source_state.get("pose_backend", "mediapipe")
     if desired not in VALID_BACKENDS:
         desired = "mediapipe"
-    smooth_enabled = bool(source_state.get("smooth_enabled", True))
+    smooth_enabled = bool(source_state.get("smooth_enabled", False))
     min_cutoff = float(source_state.get("smooth_min_cutoff", 0.3))
 
     if pose_engine is None:
@@ -240,11 +243,20 @@ def calibration_payload() -> dict:
     return {
         **calibration_state,
         "presets": sorted(calibration_presets.keys()),
-        "ranges": {
-            name: {metric: [float(lo), float(hi)] for metric, (lo, hi) in ranges.items()}
-            for name, ranges in calibration_presets.items()
-        },
+        "ranges": serialize_calibration_presets(),
     }
+
+
+def serialize_calibration_presets() -> dict:
+    return {
+        name: {metric: [float(lo), float(hi)] for metric, (lo, hi) in ranges.items()}
+        for name, ranges in calibration_presets.items()
+    }
+
+
+def safe_download_stem(name: str, fallback: str = "profile") -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "").strip()).strip(".-")
+    return (stem or fallback)[:120]
 
 
 def refresh_prepared_metrics() -> None:
@@ -513,12 +525,6 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
-    if (
-        calibration_state["active"]
-        and (metrics.get("energy", 0.0) != 0.0 or metrics.get("expansion", 0.0) != 0.0)
-    ):
-        calibration_collector.add(metrics)
-        calibration_state["sample_count"] = calibration_collector.count()
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
@@ -526,6 +532,13 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
     active = active_metric_set()
     osc_sender.send_metrics(metrics, send_keys=active)
+    prepared_metrics = osc_sender.last_prepared_metrics
+    if (
+        calibration_state["active"]
+        and (prepared_metrics.get("energy", 0.0) != 0.0 or prepared_metrics.get("expansion", 0.0) != 0.0)
+    ):
+        calibration_collector.add(prepared_metrics)
+        calibration_state["sample_count"] = calibration_collector.count()
     processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
     if culture_score is not None:
         # All-zero metrics mean "no pose detected"; keep the previous score
@@ -895,18 +908,16 @@ async def apply_osc_config(
 
 @app.post("/api/smoothing")
 async def apply_smoothing(
-    smooth_enabled: bool = Form(True),
+    smooth_enabled: bool = Form(False),
     smooth_min_cutoff: float = Form(0.3),
 ):
-    """Live-tune the One-Euro joint smoothing WITHOUT restarting the stream.
-    Unlike /api/apply this does NOT bump session_id or reset state, so dragging
-    the slider does not kill the video feed."""
-    source_state["smooth_enabled"] = bool(smooth_enabled)
+    """Legacy endpoint kept for compatibility; viewer joint smoothing stays off."""
+    source_state["smooth_enabled"] = False
     source_state["smooth_min_cutoff"] = float(smooth_min_cutoff)
     if pose_engine is not None:
-        pose_engine.configure_smoothing(enabled=source_state["smooth_enabled"],
+        pose_engine.configure_smoothing(enabled=False,
                                         min_cutoff=source_state["smooth_min_cutoff"])
-    return {"status": "applied"}
+    return {"status": "disabled"}
 
 
 @app.post("/api/metric_smoothing")
@@ -937,9 +948,15 @@ async def apply_metric_enabled(metric: str = Form(...), enabled: bool = Form(Tru
 @app.post("/api/calibration/start")
 async def calibration_start():
     calibration_collector.reset()
+    osc_sender.clear_metric_ranges()
+    if osc_sender.mode != "raw":
+        osc_sender.configure(mode="raw")
+    osc_sender.reset_state()
     calibration_state["active"] = True
     calibration_state["started_at"] = time.time()
     calibration_state["sample_count"] = 0
+    calibration_state["applied_preset"] = None
+    processing_state["latest_metrics"] = {}
     return {"status": "started", **state_payload()}
 
 
@@ -984,6 +1001,62 @@ async def calibration_clear():
     return {"status": "cleared", **state_payload()}
 
 
+@app.get("/api/calibration/export")
+async def calibration_export(name: str = ""):
+    clean_name = str(name or "").strip()
+    presets = serialize_calibration_presets()
+    if clean_name:
+        ranges = presets.get(clean_name)
+        if not ranges:
+            body = json.dumps({"status": "error", "error": "unknown calibration profile"}, ensure_ascii=False)
+            return Response(content=body, media_type="application/json", status_code=404)
+        payload = {clean_name: ranges}
+        filename = f"field-calibration-{safe_download_stem(clean_name)}.json"
+    else:
+        payload = presets
+        filename = f"field-calibration-all-{time.strftime('%Y-%m-%d-%H-%M')}.json"
+
+    body = json.dumps(payload, indent=2, ensure_ascii=False)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/calibration/import")
+async def calibration_import(file: UploadFile = File(...)):
+    raw = await file.read()
+    if len(raw) > 2 * 1024 * 1024:
+        return {"status": "error", "error": "preset file is too large"}
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return {"status": "error", "error": "invalid preset JSON"}
+
+    fallback_name = Path(file.filename or "imported").stem or "imported"
+    imported = normalize_presets(data, default_name=fallback_name)
+    if not imported:
+        return {"status": "error", "error": "no valid calibration presets found"}
+
+    calibration_presets.update(imported)
+    save_presets(CALIBRATION_PRESETS_PATH, calibration_presets)
+
+    applied = calibration_state.get("applied_preset")
+    if applied in imported and osc_sender.mode == "fixed":
+        osc_sender.clear_metric_ranges()
+        osc_sender.set_metric_ranges(calibration_presets[applied])
+        osc_sender.reset_state()
+        refresh_prepared_metrics()
+
+    return {
+        "status": "imported",
+        "profiles": sorted(imported.keys()),
+        "count": len(imported),
+        **state_payload(),
+    }
+
+
 @app.post("/api/apply")
 async def apply_input(
     source: str = Form("live"),
@@ -1000,7 +1073,7 @@ async def apply_input(
     osc_namespace: str = Form(""),
     performance: str = Form(DEFAULT_PERFORMANCE),
     pose_backend: str = Form("mediapipe"),
-    smooth_enabled: bool = Form(True),
+    smooth_enabled: bool = Form(False),
     smooth_min_cutoff: float = Form(0.3),
     video: Optional[UploadFile] = File(None),
 ):
@@ -1027,7 +1100,7 @@ async def apply_input(
 
     available_backend_ids = {item["id"] for item in available_pose_backends()}
     source_state["pose_backend"] = pose_backend if pose_backend in available_backend_ids else "mediapipe"
-    source_state["smooth_enabled"] = bool(smooth_enabled)
+    source_state["smooth_enabled"] = False
     source_state["smooth_min_cutoff"] = float(smooth_min_cutoff)
     # Live-apply smoothing to the running engine (cheap). A backend SWAP is
     # deferred to get_pose_engine() on the next stream start, so it never races
@@ -1575,6 +1648,22 @@ VIEWER_HTML = """
       border-color: rgba(217, 139, 95, .72);
       color: var(--amber);
     }
+    .calibration-file-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .calibration-file-row button {
+      min-height: 34px;
+      padding: 7px 9px;
+      font-size: 11px;
+    }
+    .calibration-file-row button.secondary {
+      background: rgba(29, 26, 23, .84);
+      color: var(--text);
+      border-color: var(--line);
+    }
+    .calibration-file-row button.secondary:hover { background: rgba(54, 47, 40, .92); }
     .calibration-row input,
     .calibration-row select {
       min-height: 38px;
@@ -1695,7 +1784,7 @@ VIEWER_HTML = """
     .metric-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 12px; }
     .metric {
       display: grid;
-      grid-template-columns: 28px minmax(0, 1fr) 184px;
+      grid-template-columns: 28px minmax(0, 1fr) minmax(230px, 250px);
       align-items: center;
       gap: 10px;
       min-height: 52px;
@@ -1709,13 +1798,13 @@ VIEWER_HTML = """
     .metric-enable input { width: 16px; height: 16px; accent-color: var(--teal); }
     .metric-label { display: grid; gap: 3px; min-width: 0; }
     .name { color: var(--muted); font-size: 13px; letter-spacing: .02em; overflow-wrap: anywhere; }
-    .metric-smooth-row { display: flex; align-items: center; gap: 7px; justify-self: end; width: 184px; }
-    .metric-smooth-row .ms-label { color: #756b60; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .metric-smooth-row { display: flex; align-items: center; gap: 7px; justify-self: end; width: 250px; }
+    .metric-smooth-row .ms-label { color: #756b60; font-size: 10px; letter-spacing: 0; white-space: nowrap; }
     .metric-smooth-row input[type=range] {
       flex: 1;
       min-width: 0;
     }
-    .metric-smooth-row .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 32px; text-align: right; }
+    .metric-smooth-row .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 28px; text-align: right; white-space: nowrap; }
     .metric-readout {
       grid-column: 1 / -1;
       display: grid;
@@ -2001,13 +2090,6 @@ VIEWER_HTML = """
       </section>
 
       <aside class="panel">
-        <div class="metric-osc-controls">
-          <label class="switch-row" data-tooltip-title="Joint Smoothness" data-tooltip-body="One-Euro filter on the skeleton before metrics. When on, the source skeleton is smoothed before the metrics are calculated.">
-            <span>Joint smoothness</span>
-            <input id="jointSmoothEnabled" type="checkbox" checked />
-            <span class="switch-track"></span>
-          </label>
-        </div>
         <div class="calibration-panel">
           <div class="calibration-head">
             <p class="section-title">Calibration</p>
@@ -2020,10 +2102,15 @@ VIEWER_HTML = """
             <button id="calibrationStart" type="button">Start</button>
           </div>
           <div class="calibration-row">
-            <label class="normalize-profile-row" data-tooltip-title="Normalize Profile" data-tooltip-body="None sends raw metric values. Dynamic uses adaptive live normalization. Saved calibration profiles use fixed ranges from raw calibration samples.">
+            <label class="normalize-profile-row" data-tooltip-title="Normalize Profile" data-tooltip-body="None sends raw metric values. Saved calibration profiles use fixed ranges from Smoothness(EMA) output samples.">
               Normalize profile
               <select id="normalizeProfile"></select>
             </label>
+          </div>
+          <div class="calibration-file-row">
+            <button id="calibrationExport" class="secondary" type="button">Export</button>
+            <button id="calibrationLoad" class="secondary" type="button">Load</button>
+            <input id="calibrationPresetFile" class="hidden" type="file" accept=".json,application/json" />
           </div>
         </div>
         <div id="metrics" class="metric-grid"></div>
@@ -2048,12 +2135,12 @@ VIEWER_HTML = """
   <script>
     const metricNames = %METRICS%;
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
-    const defaultMetricSmoothness = %DEFAULT_METRIC_SMOOTHNESS%;
+    const defaultMetricEmaFrames = %DEFAULT_METRIC_EMA_FRAMES%;
     const metricsEl = document.getElementById('metrics');
     const oscTargetsEl = document.getElementById('oscTargets');
     const tooltipEl = document.getElementById('customTooltip');
     const maxSeen = {};
-    let metricSmoothnessInitialized = false;
+    let metricEmaInitialized = false;
     const metricLabels = {
       energy: 'Energy',
       sync_velocity: 'Sync Velocity',
@@ -2133,21 +2220,36 @@ VIEWER_HTML = """
     document.addEventListener('scroll', hideTooltip, true);
     const centeredMetrics = new Set(['sync_correlation']);
     const metricOverlayEl = document.getElementById('metricOverlay');
-    function clamp01(v) { return Math.max(0, Math.min(1, Number(v))); }
-    function snapSmoothness(value) {
-      return Math.round(Number(value) / 5) * 5;
+    function snapEmaFrames(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return defaultMetricEmaFrames;
+      return Math.max(0, Math.min(10, Math.round(numeric)));
     }
     function setRangeFill(input, value = input.value) {
-      const pct = Math.max(0, Math.min(100, Number(value) || 0));
+      const pct = snapEmaFrames(value) * 10;
       input.style.setProperty('--range-fill', `${pct}%`);
     }
-    function smoothnessToAlpha(smoothness) {
-      return 1 - (clamp01(snapSmoothness(smoothness) / 100) * 0.98);
+    function emaFramesToAlpha(frames) {
+      const count = snapEmaFrames(frames);
+      if (count <= 0) return 1;
+      return 2 / (count + 1);
     }
-    function alphaToSmoothness(alpha) {
+    function alphaToEmaFrames(alpha) {
       const numeric = Number(alpha);
-      if (!Number.isFinite(numeric)) return defaultMetricSmoothness;
-      return snapSmoothness(((1 - numeric) / 0.98) * 100);
+      if (!Number.isFinite(numeric)) return defaultMetricEmaFrames;
+      if (numeric >= 1) return 0;
+      return snapEmaFrames((2 / numeric) - 1);
+    }
+    function formatEmaFrames(frames) {
+      return `${snapEmaFrames(frames)}f`;
+    }
+    function refreshEmaFrameLabels() {
+      for (const row of document.querySelectorAll('.metric')) {
+        const smooth = row.querySelector('.metric-smooth');
+        const smoothValue = row.querySelector('.ms-val');
+        if (!smooth || !smoothValue) continue;
+        smoothValue.textContent = formatEmaFrames(smooth.value);
+      }
     }
 
     function makeOscTargetId() {
@@ -2252,9 +2354,9 @@ VIEWER_HTML = """
           <div class="name">${labelForMetric(name)}</div>
         </div>
         <div class="metric-smooth-row">
-          <span class="ms-label">smoothness</span>
-          <input class="metric-smooth thin-range" type="range" min="0" max="100" step="5" value="${defaultMetricSmoothness}" data-tooltip-title="${labelForMetric(name)} Smoothness" data-tooltip-body="Per-metric output smoothing. Higher values make this output channel smoother; 0% is off. This happens after the One-Euro joint smoothing." />
-          <span class="ms-val">${defaultMetricSmoothness}%</span>
+          <span class="ms-label">Smoothness(EMA)</span>
+          <input class="metric-smooth thin-range" type="range" min="0" max="10" step="1" value="${defaultMetricEmaFrames}" data-tooltip-title="${labelForMetric(name)} Smoothness(EMA)" data-tooltip-body="Per-metric output EMA after metrics are calculated. Value is pose analysis frames, not rendered camera frames. 0f is off; 10f is the strongest setting." />
+          <span class="ms-val">${formatEmaFrames(defaultMetricEmaFrames)}</span>
         </div>
         <div class="metric-readout">
           <div class="value" id="v-${name}">0.00</div>
@@ -2265,7 +2367,7 @@ VIEWER_HTML = """
       const toggle = row.querySelector('.metric-toggle');
       const msInput = row.querySelector('.metric-smooth');
       const msVal = row.querySelector('.ms-val');
-      setRangeFill(msInput, defaultMetricSmoothness);
+      setRangeFill(msInput, defaultMetricEmaFrames);
       toggle.addEventListener('change', async () => {
         const data = new FormData();
         data.set('metric', name);
@@ -2276,18 +2378,18 @@ VIEWER_HTML = """
         } catch (e) {}
       });
       msInput.addEventListener('input', () => {
-        const snapped = snapSmoothness(msInput.value);
+        const snapped = snapEmaFrames(msInput.value);
         setRangeFill(msInput, snapped);
-        msVal.textContent = `${snapped}%`;
+        msVal.textContent = formatEmaFrames(snapped);
       });
       msInput.addEventListener('change', async () => {
-        const snapped = snapSmoothness(msInput.value);
+        const snapped = snapEmaFrames(msInput.value);
         msInput.value = snapped;
         setRangeFill(msInput, snapped);
-        msVal.textContent = `${snapped}%`;
+        msVal.textContent = formatEmaFrames(snapped);
         const data = new FormData();
         data.set('metric', name);
-        data.set('alpha', String(smoothnessToAlpha(snapped)));
+        data.set('alpha', String(emaFramesToAlpha(snapped)));
         try { await fetch('/api/metric_smoothing', { method: 'POST', body: data }); } catch (e) {}
       });
 
@@ -2306,7 +2408,7 @@ VIEWER_HTML = """
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', document.getElementById('oscEnabled').checked ? 'true' : 'false');
       data.set('osc_mode', selectedOscMode());
-      data.set('smooth_enabled', document.getElementById('jointSmoothEnabled').checked ? 'true' : 'false');
+      data.set('smooth_enabled', 'false');
       data.set('smooth_min_cutoff', '0.3');
       if (document.getElementById('source').value === 'live') {
         data.delete('video');
@@ -2328,7 +2430,7 @@ VIEWER_HTML = """
       const selected = normalizeProfileSelect.value || 'none';
       if (selected === 'none') return 'raw';
       if (selected.startsWith('profile:')) return 'fixed';
-      return 'normalize';
+      return 'raw';
     }
 
     function buildOscFormData() {
@@ -2405,6 +2507,9 @@ VIEWER_HTML = """
     const normalizeProfileSelect = document.getElementById('normalizeProfile');
     const calibrationStatusEl = document.getElementById('calibrationStatus');
     const calibrationStartButton = document.getElementById('calibrationStart');
+    const calibrationExportButton = document.getElementById('calibrationExport');
+    const calibrationLoadButton = document.getElementById('calibrationLoad');
+    const calibrationPresetFileInput = document.getElementById('calibrationPresetFile');
 
     let isDetecting = false;
     let cameraOn = false;
@@ -2645,15 +2750,6 @@ VIEWER_HTML = """
         if (payload && payload.status === 'applied') showDetectionStream();
       }
     });
-    const jointSmoothEnabledEl = document.getElementById('jointSmoothEnabled');
-    async function applyJointSmoothing() {
-      const data = new FormData();
-      data.set('smooth_enabled', jointSmoothEnabledEl.checked ? 'true' : 'false');
-      data.set('smooth_min_cutoff', '0.3');
-      try { await fetch('/api/smoothing', { method: 'POST', body: data }); } catch (e) {}
-    }
-    jointSmoothEnabledEl.addEventListener('change', applyJointSmoothing);
-
     async function startCalibration() {
       try {
         const res = await fetch('/api/calibration/start', { method: 'POST' });
@@ -2665,6 +2761,7 @@ VIEWER_HTML = """
 
     async function beginCalibration() {
       if (!calibrationNameInput.value.trim()) calibrationNameInput.value = defaultCalibrationName();
+      normalizeProfileSelect.value = 'none';
       if (!await ensureDetectionStream()) return;
       await startCalibration();
     }
@@ -2696,6 +2793,43 @@ VIEWER_HTML = """
     }
 
     calibrationStartButton.addEventListener('click', toggleCalibration);
+
+    calibrationExportButton.addEventListener('click', () => {
+      const selected = normalizeProfileSelect.value || 'none';
+      if (selected.startsWith('profile:')) {
+        const name = selected.slice('profile:'.length);
+        window.location.href = `/api/calibration/export?name=${encodeURIComponent(name)}`;
+      } else {
+        window.location.href = '/api/calibration/export';
+      }
+    });
+
+    calibrationLoadButton.addEventListener('click', () => {
+      calibrationPresetFileInput.click();
+    });
+
+    calibrationPresetFileInput.addEventListener('change', async () => {
+      const file = calibrationPresetFileInput.files?.[0];
+      if (!file) return;
+      const data = new FormData();
+      data.set('file', file);
+      try {
+        calibrationLoadButton.disabled = true;
+        calibrationStatusEl.textContent = 'loading';
+        const res = await fetch('/api/calibration/import', { method: 'POST', body: data });
+        const payload = await res.json();
+        if (payload.status === 'error') {
+          alert(payload.error || 'Calibration load failed');
+          return;
+        }
+        update(payload);
+      } catch (error) {
+        console.warn('Calibration load failed', error);
+      } finally {
+        calibrationPresetFileInput.value = '';
+        calibrationLoadButton.disabled = false;
+      }
+    });
 
     async function applyNormalizeProfile() {
       const selected = normalizeProfileSelect.value || 'none';
@@ -2774,19 +2908,19 @@ VIEWER_HTML = """
     }
 
     function syncInitialMetricSmoothness(osc) {
-      if (metricSmoothnessInitialized) return;
+      if (metricEmaInitialized) return;
       const metricAlphas = osc?.metric_alphas || {};
       for (const name of metricNames) {
         const row = document.getElementById(`metric-${name}`);
         const smooth = row?.querySelector('.metric-smooth');
         const smoothValue = row?.querySelector('.ms-val');
         if (!smooth || !smoothValue) continue;
-        const percent = alphaToSmoothness(metricAlphas[name]);
-        smooth.value = percent;
-        smoothValue.textContent = `${percent}%`;
-        setRangeFill(smooth, percent);
+        const frames = alphaToEmaFrames(metricAlphas[name]);
+        smooth.value = frames;
+        smoothValue.textContent = formatEmaFrames(frames);
+        setRangeFill(smooth, frames);
       }
-      metricSmoothnessInitialized = true;
+      metricEmaInitialized = true;
     }
 
     function syncPoseBackends(payload) {
@@ -2807,7 +2941,9 @@ VIEWER_HTML = """
     }
 
     function defaultCalibrationName() {
-      return `profile-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}`;
+      const d = new Date();
+      const pad = value => String(value).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`;
     }
 
     function syncCalibration(payload) {
@@ -2821,10 +2957,6 @@ VIEWER_HTML = """
         noneOption.value = 'none';
         noneOption.textContent = 'None - raw';
         normalizeProfileSelect.appendChild(noneOption);
-        const dynamicOption = document.createElement('option');
-        dynamicOption.value = 'dynamic';
-        dynamicOption.textContent = 'Dynamic';
-        normalizeProfileSelect.appendChild(dynamicOption);
         for (const name of presets) {
           const option = document.createElement('option');
           option.value = `profile:${name}`;
@@ -2838,7 +2970,6 @@ VIEWER_HTML = """
       const oscMode = payload?.osc?.mode || 'raw';
       let desired = 'none';
       if (oscMode === 'raw') desired = 'none';
-      if (oscMode === 'normalize') desired = 'dynamic';
       if (oscMode === 'fixed' && applied) desired = `profile:${applied}`;
       if (previous && previous !== desired && document.activeElement === normalizeProfileSelect) desired = previous;
       if (Array.from(normalizeProfileSelect.options).some(option => option.value === desired)) {
@@ -2872,13 +3003,13 @@ VIEWER_HTML = """
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
       syncPoseBackends(payload);
       syncInitialMetricSmoothness(osc);
+      refreshEmaFrameLabels();
       syncCalibration(payload);
       if (!inputDirty) {
         setSourceMode(source.source === 'video' ? 'video' : 'live');
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
         loopVideoInput.checked = Boolean(source.loop ?? true);
         previewVideo.loop = loopVideoInput.checked;
-        document.getElementById('jointSmoothEnabled').checked = Boolean(source.smooth_enabled ?? true);
         const cameraSelect = document.getElementById('camera');
         const cameraValue = String(source.camera_index ?? '0');
         if (Array.from(cameraSelect.options).some(option => option.value === cameraValue)) {
@@ -3013,7 +3144,7 @@ VIEWER_HTML = """
 """.replace("%METRICS%", json.dumps(list(METRIC_NAMES))).replace(
     "%OSC_ADDRESS_NAMES%", json.dumps(OSC_ADDRESS_NAMES)
 ).replace(
-    "%DEFAULT_METRIC_SMOOTHNESS%", str(int(DEFAULT_METRIC_SMOOTHNESS))
+    "%DEFAULT_METRIC_EMA_FRAMES%", str(int(DEFAULT_METRIC_EMA_FRAMES))
 )
 
 
@@ -3051,7 +3182,7 @@ CHARTS_HTML = """<!doctype html>
   <a href="/">back to viewer</a>
 </header>
 <div class="grid" id="grid"></div>
-<div class="legend">Per chart: <b>bold = value sent to OSC (after per-metric output smoothing)</b>, <i>faint = pre-output value (already One-Euro smoothed at the joints)</i>. Window approx last 30s. Start detection in the viewer, then watch here. Toggle/drag the smoothing sliders in the viewer and watch the curves change.</div>
+<div class="legend">Per chart: <b>bold = value sent to OSC after Smoothness(EMA)</b>, <i>faint = pre-output metric value</i>. Window approx last 30s. Start detection in the viewer, then watch here. Toggle/drag the Smoothness(EMA) frame sliders in the viewer and watch the curves change.</div>
 <script>
 const METRICS = [
   {key:'energy', name:'Energy'},

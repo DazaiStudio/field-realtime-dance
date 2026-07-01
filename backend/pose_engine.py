@@ -1,5 +1,5 @@
-"""PoseEngine: orchestrates a selectable single-person pose source, One-Euro
-joint smoothing, and the DanceMetricsEngine.
+"""PoseEngine: orchestrates a selectable single-person pose source, optional
+One-Euro joint smoothing, and the DanceMetricsEngine.
 
 Public interface is unchanged from the original (process_frame / set_metrics_fps
 / draw_cached_overlay / close) so the viewer is agnostic to the backend. The
@@ -14,7 +14,7 @@ VALID_BACKENDS = ("mediapipe", "rtmpose3d")
 
 class PoseEngine:
     def __init__(self, model_path: str = "pose_landmarker_full.task",
-                 backend: str = "mediapipe", smoothing_enabled: bool = True,
+                 backend: str = "mediapipe", smoothing_enabled: bool = False,
                  smooth_min_cutoff: float = 1.5, smooth_beta: float = 0.0008):
         self.model_path = model_path
         self.backend_name = backend if backend in VALID_BACKENDS else "mediapipe"

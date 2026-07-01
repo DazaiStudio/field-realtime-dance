@@ -1,10 +1,11 @@
-"""Calibration ("sound-check"): collect per-metric samples during a short
-guided routine, then derive fixed [lo, hi] ranges (percentiles) for the OSC
-sender's "fixed" normalize mode.
+"""Calibration ("sound-check"): collect per-metric output-EMA samples during a
+short guided routine, then derive fixed [lo, hi] ranges (percentiles) for the
+OSC sender's "fixed" normalize mode.
 
-Why percentiles instead of raw min/max: a single bad detection frame can spike
-a metric, and raw min/max would bake that outlier into the range. The 2nd/98th
-percentiles give a robust working range fitted to the actual dancer + camera.
+Why percentiles instead of min/max: a single bad detection frame can spike a
+metric, and min/max would bake that outlier into the range. The 2nd/98th
+percentiles give a robust working range fitted to the actual dancer + camera
+and the Smoothness(EMA) settings used during calibration.
 
 Only the 7 unbounded metrics need a calibrated range. sync_velocity and
 sync_correlation are already bounded (0..1 / -1..1), so they are excluded.
@@ -15,6 +16,39 @@ import os
 import numpy as np
 
 RANGE_METRICS = ("energy", "torque", "jerk", "expansion", "curvature", "height", "sway")
+
+
+def normalize_presets(data, default_name="imported") -> dict:
+    """Return {name: {metric: (lo, hi)}} from supported preset JSON shapes."""
+    if not isinstance(data, dict):
+        return {}
+
+    if isinstance(data.get("presets"), dict):
+        source = data["presets"]
+    elif isinstance(data.get("ranges"), dict):
+        source = {str(default_name or "imported"): data["ranges"]}
+    else:
+        source = data
+
+    out = {}
+    for name, ranges in source.items():
+        clean_name = str(name or "").strip()
+        if not clean_name or not isinstance(ranges, dict):
+            continue
+        clean_ranges = {}
+        for metric, value in ranges.items():
+            if metric not in RANGE_METRICS:
+                continue
+            try:
+                lo = float(value[0])
+                hi = float(value[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                clean_ranges[metric] = (lo, hi)
+        if clean_ranges:
+            out[clean_name] = clean_ranges
+    return out
 
 
 class CalibrationCollector:
@@ -74,9 +108,8 @@ def load_profile(path) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {k: (float(v[0]), float(v[1]))
-                for k, v in data.get("ranges", {}).items()
-                if v and float(v[1]) > float(v[0])}
+        presets = normalize_presets(data, default_name="profile")
+        return next(iter(presets.values()), {})
     except Exception:
         return {}
 
@@ -90,12 +123,7 @@ def load_presets(path) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        out = {}
-        for name, rng in data.items():
-            out[name] = {k: (float(v[0]), float(v[1]))
-                         for k, v in rng.items()
-                         if v and float(v[1]) > float(v[0])}
-        return out
+        return normalize_presets(data)
     except Exception:
         return {}
 
