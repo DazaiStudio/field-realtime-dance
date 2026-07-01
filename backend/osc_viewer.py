@@ -440,7 +440,11 @@ def list_cameras(max_index: int = CAMERA_SCAN_MAX_INDEX) -> list[dict]:
     with camera_lock:
         active_index = camera_index_opened if camera is not None else None
     selected_index = int(source_state.get("camera_index", 0))
-    scan_limit = max(max_index, selected_index + 1, (active_index + 1) if active_index is not None else 0)
+    mac_names = get_macos_camera_names() if sys.platform == "darwin" else []
+    if sys.platform == "darwin":
+        scan_limit = max(1, len(mac_names), selected_index + 1, (active_index + 1) if active_index is not None else 0)
+    else:
+        scan_limit = max(max_index, selected_index + 1, (active_index + 1) if active_index is not None else 0)
 
     cameras = []
     for index in range(scan_limit):
@@ -452,10 +456,11 @@ def list_cameras(max_index: int = CAMERA_SCAN_MAX_INDEX) -> list[dict]:
             cap.release()
         if not available:
             continue
+        display_name = mac_names[index] if index < len(mac_names) else f"Camera {index}"
         cameras.append({
             "index": index,
-            "name": f"Camera {index}",
-            "label": f"Camera {index}",
+            "name": display_name,
+            "label": f"{index} - {display_name}",
             "source": "OpenCV",
         })
     if not cameras:
@@ -1214,6 +1219,7 @@ async def apply_input(
 async def stream():
     if not source_state["detect_enabled"]:
         return StreamingResponse(iter(()), media_type="multipart/x-mixed-replace; boundary=frame")
+    source_state["session_id"] += 1
     if source_state["source"] == "video":
         generator = stream_video()
     else:
@@ -1223,6 +1229,9 @@ async def stream():
 
 @app.get("/preview_stream")
 async def preview_stream():
+    if source_state["detect_enabled"]:
+        return StreamingResponse(iter(()), media_type="multipart/x-mixed-replace; boundary=frame")
+    source_state["session_id"] += 1
     return StreamingResponse(stream_live_preview(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -2556,6 +2565,7 @@ VIEWER_HTML = """
     let oscDirty = false;
     let oscApplyTimer = null;
     let videoObjectUrl = null;
+    let activeStreamKind = null;
 
     function currentSource() {
       return sourceInput.value === 'video' ? 'video' : 'live';
@@ -2611,6 +2621,7 @@ VIEWER_HTML = """
     function showPreview() {
       if (currentSource() === 'video') {
         streamImage.removeAttribute('src');
+        activeStreamKind = null;
         streamImage.classList.add('hidden');
         if (previewVideo.getAttribute('src')) {
           previewVideo.loop = loopVideoInput.checked;
@@ -2622,14 +2633,19 @@ VIEWER_HTML = """
       streamImage.classList.add('hidden');
       previewVideo.classList.add('hidden');
       streamImage.classList.remove('hidden');
-      streamImage.src = `/preview_stream?t=${Date.now()}`;
+      if (activeStreamKind !== 'preview' || !streamImage.getAttribute('src')) {
+        streamImage.src = `/preview_stream?t=${Date.now()}`;
+        activeStreamKind = 'preview';
+      }
     }
 
     function showDetectionStream() {
       previewVideo.pause();
       previewVideo.classList.add('hidden');
       streamImage.classList.remove('hidden');
+      if (activeStreamKind === 'detect' && streamImage.getAttribute('src')) return;
       streamImage.src = `/stream?t=${Date.now()}`;
+      activeStreamKind = 'detect';
     }
 
     function setDetectButton(enabled) {
@@ -2649,6 +2665,7 @@ VIEWER_HTML = """
 
     async function stopStream() {
       streamImage.removeAttribute('src');
+      activeStreamKind = null;
       streamImage.classList.add('hidden');
       previewVideo.pause();
       previewVideo.classList.add('hidden');
@@ -2776,6 +2793,7 @@ VIEWER_HTML = """
         showDetectionStream();
       } else {
         streamImage.removeAttribute('src');
+        activeStreamKind = null;
         showPreview();
       }
     });
