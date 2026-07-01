@@ -18,6 +18,15 @@ class DanceMetricsEngine:
         self.omega_l_history = []
         self.omega_r_history = []
 
+    def reset(self):
+        self.positions_history.clear()
+        self.velocities_history.clear()
+        self.accelerations_history.clear()
+        self.omega_l_history.clear()
+        self.omega_r_history.clear()
+        if hasattr(self, 'omega_history'):
+            self.omega_history.clear()
+
     def set_fps(self, fps):
         fps = max(float(fps), 1.0)
         self.fps = fps

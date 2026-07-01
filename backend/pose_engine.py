@@ -65,6 +65,10 @@ class PoseEngine:
     def set_metrics_fps(self, fps):
         self.metrics_engine.set_fps(fps)
 
+    def reset_metrics(self):
+        self.metrics_engine.reset()
+        self.smoother.reset()
+
     def draw_cached_overlay(self, frame):
         return self.source.draw_cached_overlay(frame)
 

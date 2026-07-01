@@ -69,6 +69,24 @@ class TestDanceMetricsStability(unittest.TestCase):
 
         self.assertAlmostEqual(height, mirrored_height, places=6)
 
+    def test_reset_clears_motion_history(self):
+        engine = DanceMetricsEngine()
+        engine.update(_pose(pelvis_y=900.0))
+        engine.update(_pose(pelvis_y=920.0))
+        engine._calculate_transition({
+            "Trunk": 1.0,
+            "L_Arm": 1.0,
+            "R_Arm": 1.0,
+            "L_Leg": 1.0,
+            "R_Leg": 1.0,
+        })
+
+        engine.reset()
+
+        self.assertEqual(engine.positions_history, [])
+        self.assertEqual(engine.omega_l_history, [])
+        self.assertEqual(getattr(engine, "omega_history", []), [])
+
 
 if __name__ == "__main__":
     unittest.main()

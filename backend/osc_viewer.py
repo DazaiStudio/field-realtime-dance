@@ -290,6 +290,11 @@ def refresh_prepared_metrics() -> None:
         processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
 
 
+def reset_pose_metric_history() -> None:
+    if pose_engine is not None:
+        pose_engine.reset_metrics()
+
+
 def active_metric_names() -> list[str]:
     selected = source_state.get("osc_metrics") or []
     return [name for name in METRIC_NAMES if name in selected]
@@ -1013,6 +1018,7 @@ async def calibration_start():
     if osc_sender.mode != "raw":
         osc_sender.configure(mode="raw")
     osc_sender.reset_state()
+    reset_pose_metric_history()
     now = time.time()
     calibration_state["active"] = True
     calibration_state["started_at"] = now
@@ -1038,6 +1044,9 @@ async def calibration_stop(name: str = Form(...)):
         return {"status": "error", "error": "not enough valid calibration samples"}
     calibration_presets[clean_name] = ranges
     save_presets(CALIBRATION_PRESETS_PATH, calibration_presets)
+    osc_sender.reset_state()
+    reset_pose_metric_history()
+    processing_state["latest_metrics"] = {}
     return {"status": "saved", "profile": clean_name, **state_payload()}
 
 
@@ -1051,6 +1060,7 @@ async def calibration_apply(name: str = Form(...)):
     osc_sender.set_metric_ranges(ranges)
     osc_sender.configure(mode="fixed")
     osc_sender.reset_state()
+    reset_pose_metric_history()
     calibration_state["applied_preset"] = clean_name
     refresh_prepared_metrics()
     return {"status": "applied", "profile": clean_name, **state_payload()}
@@ -1061,6 +1071,8 @@ async def calibration_clear():
     osc_sender.clear_metric_ranges()
     if osc_sender.mode == "fixed":
         osc_sender.configure(mode="raw")
+    osc_sender.reset_state()
+    reset_pose_metric_history()
     calibration_state["applied_preset"] = None
     refresh_prepared_metrics()
     return {"status": "cleared", **state_payload()}
@@ -1232,6 +1244,7 @@ async def apply_input(
     processing_state["morrisness"] = None
     processing_state["error"] = None
     osc_sender.reset_state()
+    reset_pose_metric_history()
     if calibration_state.get("applied_preset") in calibration_presets:
         osc_sender.set_metric_ranges(calibration_presets[calibration_state["applied_preset"]])
     if culture_score is not None:
@@ -2264,6 +2277,7 @@ VIEWER_HTML = """
     const oscTargetsEl = document.getElementById('oscTargets');
     const tooltipEl = document.getElementById('customTooltip');
     const maxSeen = {};
+    let lastMetricBarScaleMode = null;
     let metricEmaInitialized = false;
     const metricLabels = {
       energy: 'Energy',
@@ -2672,6 +2686,7 @@ VIEWER_HTML = """
       }
       inputDirty = false;
       oscDirty = false;
+      resetMetricBarRanges();
 
       return payload;
     }
@@ -3018,6 +3033,7 @@ VIEWER_HTML = """
     async function startCalibration() {
       try {
         const res = await fetch('/api/calibration/start', { method: 'POST' });
+        resetMetricBarRanges();
         update(await res.json());
       } catch (error) {
         console.warn('Calibration start failed', error);
@@ -3041,6 +3057,7 @@ VIEWER_HTML = """
         const res = await fetch('/api/calibration/stop', { method: 'POST', body: data });
         const payload = await res.json();
         if (payload.status === 'error') alert(payload.error || 'Calibration save failed');
+        if (payload.status === 'saved') resetMetricBarRanges();
         update(payload);
       } catch (error) {
         console.warn('Calibration save failed', error);
@@ -3099,6 +3116,7 @@ VIEWER_HTML = """
     async function applyNormalizeProfile() {
       const selected = normalizeProfileSelect.value || 'none';
       if (!selected.startsWith('profile:')) {
+        resetMetricBarRanges();
         await applyOscSettings();
         return;
       }
@@ -3109,6 +3127,7 @@ VIEWER_HTML = """
         const res = await fetch('/api/calibration/apply', { method: 'POST', body: data });
         const payload = await res.json();
         if (payload.status === 'error') alert(payload.error || 'Calibration apply failed');
+        if (payload.status === 'applied') resetMetricBarRanges();
         update(payload);
       } catch (error) {
         console.warn('Calibration apply failed', error);
@@ -3155,6 +3174,7 @@ VIEWER_HTML = """
       const bar = document.getElementById(`bar-${name}`);
       const fill = document.getElementById(`b-${name}`);
       if (!bar || !fill) return;
+      const normalizedMode = mode === 'fixed' || mode === 'normalize';
 
       if (centeredMetrics.has(name)) {
         bar.classList.add('centered');
@@ -3166,10 +3186,28 @@ VIEWER_HTML = """
       }
 
       bar.classList.remove('centered');
+      if (normalizedMode) {
+        maxSeen[name] = 1;
+        fill.style.left = '0%';
+        fill.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
+        return;
+      }
+
       maxSeen[name] = Math.max(maxSeen[name] * 0.995, Math.abs(value), 1);
       const width = Math.max(0, Math.min(100, Math.abs(value) / maxSeen[name] * 100));
       fill.style.left = '0%';
       fill.style.width = `${width}%`;
+    }
+
+    function resetMetricBarRanges() {
+      for (const name of metricNames) {
+        maxSeen[name] = 1;
+        const fill = document.getElementById(`b-${name}`);
+        if (fill) {
+          fill.style.left = '0%';
+          fill.style.width = '0%';
+        }
+      }
     }
 
     function syncInitialMetricSmoothness(osc) {
@@ -3275,6 +3313,11 @@ VIEWER_HTML = """
       const osc = payload.osc || {};
       const metrics = processing.latest_metrics || {};
       const active = new Set(source.osc_metrics || metricNames);
+      const barScaleMode = (osc.mode === 'fixed' || osc.mode === 'normalize') ? 'normalized' : 'raw';
+      if (barScaleMode !== lastMetricBarScaleMode) {
+        resetMetricBarRanges();
+        lastMetricBarScaleMode = barScaleMode;
+      }
       const age = processing.last_frame_at ? (Date.now() / 1000) - processing.last_frame_at : Infinity;
       syncPoseBackends(payload);
       syncInitialMetricSmoothness(osc);
