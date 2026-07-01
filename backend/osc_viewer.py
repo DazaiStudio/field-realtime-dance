@@ -53,7 +53,9 @@ calibration_presets = load_presets(CALIBRATION_PRESETS_PATH)
 calibration_state = {
     "active": False,
     "started_at": None,
+    "countdown_until": None,
     "sample_count": 0,
+    "skipped_frames": 0,
     "applied_preset": None,
 }
 
@@ -66,6 +68,7 @@ DEFAULT_PERFORMANCE = "quality"
 DEFAULT_METRIC_EMA_FRAMES = 3.0
 DEFAULT_METRIC_ALPHA = 2.0 / (DEFAULT_METRIC_EMA_FRAMES + 1.0)
 NO_SMOOTHING_ALPHA = 1.0
+CALIBRATION_COUNTDOWN_SECONDS = 3.0
 CAMERA_SCAN_MAX_INDEX = int(os.getenv("FIELD_CAMERA_SCAN_MAX_INDEX", "8"))
 
 for metric_name in METRIC_NAMES:
@@ -108,6 +111,7 @@ processing_state = {
     "latest_metrics": {},
     "latest_raw_metrics": {},
     "latest_timestamp_ms": None,
+    "pose_valid": False,
     "last_frame_at": None,
     "signal_mean": None,
     "morrisness": None,
@@ -240,11 +244,29 @@ def state_payload() -> dict:
 
 
 def calibration_payload() -> dict:
+    remaining = calibration_countdown_remaining()
     return {
         **calibration_state,
+        "countdown_remaining": remaining,
+        "collecting": bool(calibration_state.get("active")) and remaining <= 0.0,
         "presets": sorted(calibration_presets.keys()),
         "ranges": serialize_calibration_presets(),
     }
+
+
+def calibration_countdown_remaining(now: Optional[float] = None) -> float:
+    countdown_until = calibration_state.get("countdown_until")
+    if not calibration_state.get("active") or countdown_until is None:
+        return 0.0
+    current = time.time() if now is None else float(now)
+    return max(0.0, float(countdown_until) - current)
+
+
+def has_usable_calibration_metrics(metrics: dict) -> bool:
+    return bool(metrics) and (
+        float(metrics.get("energy", 0.0) or 0.0) != 0.0
+        or float(metrics.get("expansion", 0.0) or 0.0) != 0.0
+    )
 
 
 def serialize_calibration_presets() -> dict:
@@ -520,11 +542,12 @@ def set_stream_frame(frame=None, encode_ms: float = 0.0) -> None:
         processing_state["error"] = None
 
 
-def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) -> None:
+def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0, pose_valid: bool = True) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
     processing_state["latest_timestamp_ms"] = timestamp_ms
+    processing_state["pose_valid"] = bool(pose_valid)
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
@@ -533,12 +556,12 @@ def set_analysis_result(metrics: dict, timestamp_ms: int, pose_ms: float = 0.0) 
     active = active_metric_set()
     osc_sender.send_metrics(metrics, send_keys=active)
     prepared_metrics = osc_sender.last_prepared_metrics
-    if (
-        calibration_state["active"]
-        and (prepared_metrics.get("energy", 0.0) != 0.0 or prepared_metrics.get("expansion", 0.0) != 0.0)
-    ):
-        calibration_collector.add(prepared_metrics)
-        calibration_state["sample_count"] = calibration_collector.count()
+    if calibration_state["active"] and calibration_countdown_remaining() <= 0.0:
+        if pose_valid and has_usable_calibration_metrics(prepared_metrics):
+            calibration_collector.add(prepared_metrics)
+            calibration_state["sample_count"] = calibration_collector.count()
+        elif not pose_valid:
+            calibration_state["skipped_frames"] = int(calibration_state.get("skipped_frames") or 0) + 1
     processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
     if culture_score is not None:
         # All-zero metrics mean "no pose detected"; keep the previous score
@@ -655,7 +678,12 @@ async def stream_live():
                         draw_overlay=bool(source_state.get("overlay_enabled", True)),
                     )
                     pose_ms = (time.perf_counter() - pose_started) * 1000.0
-                    set_analysis_result(metrics, timestamp_ms, pose_ms)
+                    set_analysis_result(
+                        metrics,
+                        timestamp_ms,
+                        pose_ms,
+                        pose_valid=bool(getattr(engine, "last_pose_valid", False)),
+                    )
                     next_analysis_at = now + analysis_interval
                 elif source_state.get("overlay_enabled", True):
                     processed = engine.draw_cached_overlay(frame)
@@ -784,7 +812,12 @@ async def stream_video():
                     draw_overlay=bool(source_state.get("overlay_enabled", True)),
                 )
                 pose_ms = (time.perf_counter() - pose_started) * 1000.0
-                set_analysis_result(metrics, timestamp_ms, pose_ms)
+                set_analysis_result(
+                    metrics,
+                    timestamp_ms,
+                    pose_ms,
+                    pose_valid=bool(getattr(engine, "last_pose_valid", False)),
+                )
                 next_analysis_at = now + analysis_interval
             elif source_state.get("overlay_enabled", True):
                 processed = engine.draw_cached_overlay(frame)
@@ -952,9 +985,12 @@ async def calibration_start():
     if osc_sender.mode != "raw":
         osc_sender.configure(mode="raw")
     osc_sender.reset_state()
+    now = time.time()
     calibration_state["active"] = True
-    calibration_state["started_at"] = time.time()
+    calibration_state["started_at"] = now
+    calibration_state["countdown_until"] = now + CALIBRATION_COUNTDOWN_SECONDS
     calibration_state["sample_count"] = 0
+    calibration_state["skipped_frames"] = 0
     calibration_state["applied_preset"] = None
     processing_state["latest_metrics"] = {}
     return {"status": "started", **state_payload()}
@@ -968,6 +1004,7 @@ async def calibration_stop(name: str = Form(...)):
     ranges = calibration_collector.ranges(min_samples=10)
     calibration_state["active"] = False
     calibration_state["started_at"] = None
+    calibration_state["countdown_until"] = None
     calibration_state["sample_count"] = calibration_collector.count()
     if not ranges:
         return {"status": "error", "error": "not enough valid calibration samples"}
@@ -1160,6 +1197,7 @@ async def apply_input(
     processing_state["latest_metrics"] = {}
     processing_state["latest_raw_metrics"] = {}
     processing_state["latest_timestamp_ms"] = None
+    processing_state["pose_valid"] = False
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
     processing_state["morrisness"] = None
@@ -2943,7 +2981,7 @@ VIEWER_HTML = """
     function defaultCalibrationName() {
       const d = new Date();
       const pad = value => String(value).padStart(2, '0');
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`;
+      return `${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
     }
 
     function syncCalibration(payload) {
@@ -2977,9 +3015,15 @@ VIEWER_HTML = """
       }
 
       const sampleCount = Number(calibration.sample_count || 0);
-      if (calibration.active) {
-        calibrationStatusEl.textContent = `recording ${sampleCount}`;
-        calibrationOverlayEl.textContent = `Calibrating ${sampleCount}`;
+      const countdown = Math.max(0, Math.ceil(Number(calibration.countdown_remaining || 0)));
+      const poseValid = Boolean(payload?.processing?.pose_valid);
+      if (calibration.active && countdown > 0) {
+        calibrationStatusEl.textContent = `starting ${countdown}`;
+        calibrationOverlayEl.textContent = `Calibration starts ${countdown}`;
+        calibrationOverlayEl.classList.remove('hidden');
+      } else if (calibration.active) {
+        calibrationStatusEl.textContent = poseValid || sampleCount > 0 ? `recording ${sampleCount}` : 'waiting skeleton';
+        calibrationOverlayEl.textContent = poseValid || sampleCount > 0 ? `Calibrating ${sampleCount}` : 'Waiting skeleton';
         calibrationOverlayEl.classList.remove('hidden');
       } else if (applied) {
         calibrationStatusEl.textContent = `fixed ${applied}`;
@@ -3032,8 +3076,9 @@ VIEWER_HTML = """
 
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
       const calibrationActive = Boolean(payload?.calibration?.active);
+      const calibrationCountdown = Math.max(0, Math.ceil(Number(payload?.calibration?.countdown_remaining || 0)));
       document.getElementById('status').textContent =
-        processing.error || (calibrationActive ? 'calibrating' : (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off'));
+        processing.error || (calibrationActive ? (calibrationCountdown > 0 ? `calibrating in ${calibrationCountdown}` : 'calibrating') : (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off'));
       document.getElementById('metaA').textContent = `source: ${source.source || '-'}`;
       document.getElementById('metaB').textContent =
         `fps: ${Number(processing.fps || 0).toFixed(1)} / pose: ${Number(processing.analysis_fps || 0).toFixed(1)}`;

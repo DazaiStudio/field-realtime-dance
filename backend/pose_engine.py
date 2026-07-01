@@ -6,6 +6,8 @@ Public interface is unchanged from the original (process_frame / set_metrics_fps
 backend ("mediapipe" default, or "rtmpose3d") is chosen at construction and can
 be swapped live with set_backend().
 """
+import numpy as np
+
 from dance_metrics import DanceMetricsEngine
 from one_euro import JointSmoother
 
@@ -21,6 +23,7 @@ class PoseEngine:
         self.metrics_engine = DanceMetricsEngine(fps=30)
         self.smoother = JointSmoother(min_cutoff=smooth_min_cutoff, beta=smooth_beta)
         self.smoothing_enabled = bool(smoothing_enabled)
+        self.last_pose_valid = False
         self.source = self._make_source(self.backend_name)
 
     # --- source / backend management ---------------------------------------
@@ -68,11 +71,19 @@ class PoseEngine:
     def process_frame(self, frame, timestamp_ms, draw_overlay: bool = True):
         frame, h36m = self.source.estimate(frame, timestamp_ms, draw_overlay)
         metrics = self.metrics_engine.get_empty_metrics()
-        if h36m is not None:
+        self.last_pose_valid = self._pose_is_complete(h36m)
+        if self.last_pose_valid:
             if self.smoothing_enabled:
                 h36m = self.smoother.filter(h36m, timestamp_ms)
             metrics = self.metrics_engine.update(h36m)
         return frame, metrics
+
+    @staticmethod
+    def _pose_is_complete(h36m) -> bool:
+        if h36m is None:
+            return False
+        arr = np.asarray(h36m, dtype=float)
+        return arr.shape == (17, 3) and bool(np.isfinite(arr).all())
 
     def close(self):
         try:

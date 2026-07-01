@@ -1,4 +1,4 @@
-import sys, os, tempfile, unittest
+import sys, os, tempfile, time, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -125,15 +125,17 @@ class TestViewerCalibrationFlow(unittest.TestCase):
                 osc_viewer.osc_sender.set_metric_alpha(name, 1.0)
             osc_viewer.osc_sender.set_metric_alpha("energy", 0.5)
             osc_viewer.calibration_state["active"] = True
+            osc_viewer.calibration_state["countdown_until"] = None
             osc_viewer.calibration_state["sample_count"] = 0
+            osc_viewer.calibration_state["skipped_frames"] = 0
 
             frame_a = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
             frame_b = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
             frame_a["energy"] = 100.0
             frame_b["energy"] = 0.0
 
-            osc_viewer.set_analysis_result(frame_a, timestamp_ms=1000)
-            osc_viewer.set_analysis_result(frame_b, timestamp_ms=1100)
+            osc_viewer.set_analysis_result(frame_a, timestamp_ms=1000, pose_valid=True)
+            osc_viewer.set_analysis_result(frame_b, timestamp_ms=1100, pose_valid=True)
 
             energy_samples = osc_viewer.calibration_collector._samples["energy"][-2:]
             self.assertEqual(len(energy_samples), 2)
@@ -145,6 +147,55 @@ class TestViewerCalibrationFlow(unittest.TestCase):
             osc_viewer.osc_sender.metric_alphas.clear()
             osc_viewer.osc_sender.metric_alphas.update(original_metric_alphas)
             osc_viewer.osc_sender.configure(mode=original_mode, alpha=original_alpha)
+            osc_viewer.osc_sender.reset_state()
+
+    def test_calibration_countdown_does_not_collect_samples(self):
+        import osc_viewer
+
+        original_state = dict(osc_viewer.calibration_state)
+        try:
+            osc_viewer.calibration_collector.reset()
+            osc_viewer.osc_sender.configure(mode="raw")
+            osc_viewer.osc_sender.reset_state()
+            osc_viewer.calibration_state["active"] = True
+            osc_viewer.calibration_state["countdown_until"] = time.time() + 10.0
+            osc_viewer.calibration_state["sample_count"] = 0
+            osc_viewer.calibration_state["skipped_frames"] = 0
+
+            frame = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
+            frame["energy"] = 100.0
+            osc_viewer.set_analysis_result(frame, timestamp_ms=1000, pose_valid=True)
+
+            self.assertEqual(osc_viewer.calibration_collector.count("energy"), 0)
+            self.assertEqual(osc_viewer.calibration_state["sample_count"], 0)
+        finally:
+            osc_viewer.calibration_state.update(original_state)
+            osc_viewer.calibration_collector.reset()
+            osc_viewer.osc_sender.reset_state()
+
+    def test_calibration_skips_invalid_pose_frames(self):
+        import osc_viewer
+
+        original_state = dict(osc_viewer.calibration_state)
+        try:
+            osc_viewer.calibration_collector.reset()
+            osc_viewer.osc_sender.configure(mode="raw")
+            osc_viewer.osc_sender.reset_state()
+            osc_viewer.calibration_state["active"] = True
+            osc_viewer.calibration_state["countdown_until"] = time.time() - 1.0
+            osc_viewer.calibration_state["sample_count"] = 0
+            osc_viewer.calibration_state["skipped_frames"] = 0
+
+            frame = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
+            frame["energy"] = 100.0
+            osc_viewer.set_analysis_result(frame, timestamp_ms=1000, pose_valid=False)
+
+            self.assertEqual(osc_viewer.calibration_collector.count("energy"), 0)
+            self.assertEqual(osc_viewer.calibration_state["sample_count"], 0)
+            self.assertEqual(osc_viewer.calibration_state["skipped_frames"], 1)
+        finally:
+            osc_viewer.calibration_state.update(original_state)
+            osc_viewer.calibration_collector.reset()
             osc_viewer.osc_sender.reset_state()
 
 
