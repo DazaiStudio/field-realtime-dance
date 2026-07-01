@@ -2401,11 +2401,21 @@ VIEWER_HTML = """
     }
 
     function applyMetricOrder(activeSet = null) {
-      for (const name of orderedMetricNames(activeSet)) {
-        const row = document.getElementById(`metric-${name}`);
-        if (row) metricsEl.appendChild(row);
-        const overlayRow = document.getElementById(`ov-row-${name}`);
-        if (overlayRow) metricOverlayEl.appendChild(overlayRow);
+      const ordered = orderedMetricNames(activeSet);
+      const current = Array.from(metricsEl.children).map(row => row.id.replace(/^metric-/, ''));
+      if (current.join('|') !== ordered.join('|')) {
+        for (const name of ordered) {
+          const row = document.getElementById(`metric-${name}`);
+          if (row) metricsEl.appendChild(row);
+        }
+      }
+
+      const currentOverlay = Array.from(metricOverlayEl.children).map(row => row.id.replace(/^ov-row-/, ''));
+      if (currentOverlay.join('|') !== ordered.join('|')) {
+        for (const name of ordered) {
+          const overlayRow = document.getElementById(`ov-row-${name}`);
+          if (overlayRow) metricOverlayEl.appendChild(overlayRow);
+        }
       }
     }
 
