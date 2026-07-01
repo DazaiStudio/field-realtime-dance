@@ -47,8 +47,8 @@ class TestPerMetricSmoothing(unittest.TestCase):
         self.assertAlmostEqual(osc.last_prepared_metrics["energy"], 1.0)
 
         osc.send_metrics({"energy": 0.0}, send_keys=set())
-        self.assertGreater(osc.last_prepared_metrics["energy"], 0.7)
-        self.assertLess(osc.last_prepared_metrics["energy"], 0.72)
+        self.assertGreater(osc.last_prepared_metrics["energy"], 0.61)
+        self.assertLess(osc.last_prepared_metrics["energy"], 0.62)
 
     def test_viewer_defaults_do_not_smooth_sync_correlation(self):
         import osc_viewer

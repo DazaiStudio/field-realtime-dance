@@ -31,7 +31,7 @@ ADAPTIVE_RANGE_METRICS = {"height", "sway"}
 UNBOUNDED_METRICS = {"energy", "expansion", "curvature", "torque", "jerk"}
 LOG_FIXED_RANGE_METRICS = {"jerk"}
 FIXED_RESPONSE_GAMMA = {
-    "energy": 0.5,
+    "energy": 0.7,
     "jerk": 0.6,
 }
 

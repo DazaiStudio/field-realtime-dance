@@ -90,8 +90,8 @@ class TestFixedNormalize(unittest.TestCase):
         osc.set_metric_ranges({"energy": (0.0, 100.0)})
         osc.send_metrics({"energy": 25.0}, send_keys=set())
         value = osc.last_prepared_metrics["energy"]
-        self.assertGreater(value, 0.49)
-        self.assertLess(value, 0.51)
+        self.assertGreater(value, 0.37)
+        self.assertLess(value, 0.39)
 
     def test_fixed_clamps_out_of_range(self):
         osc = self._sender()
