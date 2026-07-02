@@ -5,7 +5,7 @@ OSC sender's "fixed" normalize mode.
 Why percentiles instead of min/max: a single bad detection frame can spike a
 metric, and min/max would bake that outlier into the range. The 1st/99th
 percentiles give a robust working range fitted to the actual dancer + camera
-and the Smoothness(EMA) settings used during calibration.
+and the Smoothness settings used during calibration.
 
 Only the 7 unbounded metrics need a calibrated range. sync_velocity and
 sync_correlation are already bounded (0..1 / -1..1), so they are excluded.

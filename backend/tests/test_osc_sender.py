@@ -165,6 +165,25 @@ class TestSendMetrics(unittest.TestCase):
         self.assertEqual([target["id"] for target in status["targets"]], ["sound", "broadcast"])
         self.assertTrue(status["targets"][1]["broadcast"])
 
+    def test_send_skeleton_outputs_joint_addresses(self):
+        sender = make_sender(enabled=True, mode="raw")
+        sent = []
+
+        class FakeClient:
+            def send_message(self, address, value):
+                sent.append((address, value))
+
+        sender.targets[0].client.close()
+        sender.targets[0].client = FakeClient()
+        skeleton = [[joint, joint + 0.1, joint + 0.2] for joint in range(17)]
+
+        sender.send_skeleton(skeleton)
+
+        self.assertEqual(len(sent), 17)
+        self.assertEqual(sent[0], ("/field/sk/pelvis", [0.0, 0.1, 0.2]))
+        self.assertEqual(sent[1], ("/field/sk/r/hip", [1.0, 1.1, 1.2]))
+        self.assertEqual(sent[-1], ("/field/sk/r/wrist", [16.0, 16.1, 16.2]))
+
 
 if __name__ == "__main__":
     unittest.main()

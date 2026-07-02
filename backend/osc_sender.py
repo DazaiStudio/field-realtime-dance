@@ -22,6 +22,25 @@ OSC_ADDRESS_NAMES = {
     "sync_velocity": "sync_vel",
     "sync_correlation": "sync_corr",
 }
+SKELETON_ADDRESS_NAMES = (
+    "sk/pelvis",
+    "sk/r/hip",
+    "sk/r/knee",
+    "sk/r/ankle",
+    "sk/l/hip",
+    "sk/l/knee",
+    "sk/l/ankle",
+    "sk/spine",
+    "sk/thorax",
+    "sk/neck",
+    "sk/head",
+    "sk/l/shoulder",
+    "sk/l/elbow",
+    "sk/l/wrist",
+    "sk/r/shoulder",
+    "sk/r/elbow",
+    "sk/r/wrist",
+)
 
 BOUNDED_METRICS = {"sync_velocity"}
 # height is CoM above the foot base in metres and sway is a small metre-scale
@@ -259,7 +278,7 @@ class OSCSender:
         if not math.isfinite(numeric):
             return None
 
-        # Keep calibration and runtime on the same signal path: Smoothness(EMA)
+        # Keep calibration and runtime on the same signal path: Smoothness
         # first, then apply fixed/profile normalization to that smoothed value.
         numeric = self._smooth(key, numeric)
 
@@ -365,6 +384,25 @@ class OSCSender:
         if not self.enabled:
             return
         if self._send_message(self._address(name), float(value)):
+            self.last_sent_at = time.time()
+
+    def send_skeleton(self, points) -> None:
+        """Send H36M-17 skeleton coordinates, one OSC Vector3-like message per joint."""
+        if not self.enabled:
+            return
+        try:
+            coords = [[float(v) for v in point[:3]] for point in points]
+        except (TypeError, ValueError):
+            return
+        if len(coords) != len(SKELETON_ADDRESS_NAMES):
+            return
+        sent = False
+        for name, xyz in zip(SKELETON_ADDRESS_NAMES, coords):
+            if len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
+                return
+            if self._send_message(self._address(name), xyz):
+                sent = True
+        if sent:
             self.last_sent_at = time.time()
 
     def metric_address(self, key: str) -> str:

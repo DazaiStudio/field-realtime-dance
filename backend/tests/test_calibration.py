@@ -214,6 +214,27 @@ class TestViewerCalibrationFlow(unittest.TestCase):
             osc_viewer.calibration_collector.reset()
             osc_viewer.osc_sender.reset_state()
 
+    def test_skeleton_output_does_not_require_calibration_valid_pose(self):
+        import osc_viewer
+
+        original_skeleton_enabled = osc_viewer.source_state.get("osc_skeleton")
+        original_send_skeleton = osc_viewer.osc_sender.send_skeleton
+        sent = []
+        try:
+            osc_viewer.source_state["osc_skeleton"] = True
+            osc_viewer.osc_sender.send_skeleton = lambda skeleton: sent.append(skeleton)
+            frame = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
+            skeleton = [[float(i), float(i + 1), float(i + 2)] for i in range(17)]
+
+            osc_viewer.set_analysis_result(frame, timestamp_ms=1000, pose_valid=False, skeleton=skeleton)
+
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(osc_viewer.processing_state["latest_skeleton"][0], [0.0, 1.0, 2.0])
+        finally:
+            osc_viewer.source_state["osc_skeleton"] = original_skeleton_enabled
+            osc_viewer.osc_sender.send_skeleton = original_send_skeleton
+            osc_viewer.processing_state["latest_skeleton"] = None
+
 
 if __name__ == "__main__":
     unittest.main()

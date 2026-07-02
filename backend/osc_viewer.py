@@ -79,6 +79,8 @@ DEFAULT_METRIC_ALPHA = 2.0 / (DEFAULT_METRIC_EMA_FRAMES + 1.0)
 NO_SMOOTHING_ALPHA = 1.0
 CALIBRATION_COUNTDOWN_SECONDS = 3.0
 CAMERA_SCAN_MAX_INDEX = int(os.getenv("FIELD_CAMERA_SCAN_MAX_INDEX", "8"))
+DEFAULT_TRACKER_MODEL = os.getenv("FIELD_TRACKER_MODEL", "yolov8n.pt")
+DEFAULT_TRACKER_YAML = os.getenv("FIELD_TRACKER_YAML", "bytetrack.yaml")
 
 for metric_name in METRIC_NAMES:
     alpha = NO_SMOOTHING_ALPHA if metric_name == "sync_correlation" else DEFAULT_METRIC_ALPHA
@@ -100,8 +102,13 @@ source_state = {
     "height": PERFORMANCE_PRESETS[DEFAULT_PERFORMANCE]["height"],
     "session_id": 0,
     "osc_metrics": list(METRIC_NAMES),
+    "osc_skeleton": False,
     "detect_enabled": False,
     "pose_backend": os.getenv("FIELD_POSE_BACKEND", "mediapipe"),
+    "tracking_enabled": False,
+    "tracking_target": "auto_largest",
+    "tracker_model": DEFAULT_TRACKER_MODEL,
+    "tracker_yaml": DEFAULT_TRACKER_YAML,
     "smooth_enabled": False,
     "smooth_min_cutoff": 0.3,
     "applied_at": time.time(),
@@ -119,9 +126,11 @@ processing_state = {
     "encode_ms": 0.0,
     "latest_metrics": {},
     "latest_raw_metrics": {},
+    "latest_skeleton": None,
     "latest_timestamp_ms": None,
     "pose_valid": False,
     "pose_quality": 0.0,
+    "tracking": {"enabled": False, "state": "disabled", "count": 0},
     "last_frame_at": None,
     "signal_mean": None,
     "morrisness": None,
@@ -151,22 +160,38 @@ def get_pose_engine() -> PoseEngine:
         desired = "mediapipe"
     smooth_enabled = bool(source_state.get("smooth_enabled", False))
     min_cutoff = float(source_state.get("smooth_min_cutoff", 0.3))
+    tracking_enabled = bool(source_state.get("tracking_enabled", False))
+    tracking_selection = str(source_state.get("tracking_target") or "auto_largest")
+    tracker_model = str(source_state.get("tracker_model") or DEFAULT_TRACKER_MODEL)
+    tracker_yaml = str(source_state.get("tracker_yaml") or DEFAULT_TRACKER_YAML)
 
     if pose_engine is None:
         pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
                                  smoothing_enabled=smooth_enabled,
-                                 smooth_min_cutoff=min_cutoff)
+                                 smooth_min_cutoff=min_cutoff,
+                                 tracking_enabled=tracking_enabled,
+                                 tracker_model=tracker_model,
+                                 tracker_yaml=tracker_yaml,
+                                 tracking_selection=tracking_selection)
     elif pose_engine.backend_name != desired:
         old = pose_engine
         pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
                                  smoothing_enabled=smooth_enabled,
-                                 smooth_min_cutoff=min_cutoff)
+                                 smooth_min_cutoff=min_cutoff,
+                                 tracking_enabled=tracking_enabled,
+                                 tracker_model=tracker_model,
+                                 tracker_yaml=tracker_yaml,
+                                 tracking_selection=tracking_selection)
         try:
             old.close()
         except Exception:
             pass
     else:
         pose_engine.configure_smoothing(enabled=smooth_enabled, min_cutoff=min_cutoff)
+        pose_engine.configure_tracking(enabled=tracking_enabled,
+                                       tracker_model=tracker_model,
+                                       tracker_yaml=tracker_yaml,
+                                       selection=tracking_selection)
     # Reflect the backend that actually loaded (it may have fallen back, e.g. to
     # MediaPipe on a machine without CUDA), so we don't retry-build every frame.
     source_state["pose_backend"] = pose_engine.backend_name
@@ -341,6 +366,20 @@ def active_metric_set() -> set[str]:
 def filter_active_metrics(metrics: dict) -> dict:
     active = active_metric_set()
     return {k: v for k, v in (metrics or {}).items() if k in active}
+
+
+def normalize_tracking_target(value: str) -> str:
+    target = str(value or "auto_largest").strip()
+    if target in {"auto_largest", "auto_center"}:
+        return target
+    if target.startswith("id:"):
+        try:
+            stable_id = int(target.split(":", 1)[1])
+        except ValueError:
+            return "auto_largest"
+        if stable_id > 0:
+            return f"id:{stable_id}"
+    return "auto_largest"
 
 
 def is_broadcast_host(host: str) -> bool:
@@ -594,13 +633,26 @@ def set_analysis_result(
     pose_ms: float = 0.0,
     pose_valid: bool = True,
     pose_quality: Optional[float] = None,
+    skeleton=None,
+    tracking: Optional[dict] = None,
 ) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
+    if skeleton is not None:
+        try:
+            processing_state["latest_skeleton"] = [
+                [float(coord) for coord in point[:3]]
+                for point in skeleton
+            ]
+        except (TypeError, ValueError):
+            processing_state["latest_skeleton"] = None
+    else:
+        processing_state["latest_skeleton"] = None
     processing_state["latest_timestamp_ms"] = timestamp_ms
     processing_state["pose_valid"] = bool(pose_valid)
     processing_state["pose_quality"] = float(pose_quality) if pose_quality is not None else (1.0 if pose_valid else 0.0)
+    processing_state["tracking"] = tracking or {"enabled": False, "state": "disabled", "count": 0}
     processing_state["analysis_count"] += 1
     processing_state["pose_ms"] = float(pose_ms)
     elapsed = time.time() - processing_state["started_at"]
@@ -608,6 +660,8 @@ def set_analysis_result(
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
     active = active_metric_set()
     osc_sender.send_metrics(metrics, send_keys=active)
+    if source_state.get("osc_skeleton") and skeleton is not None:
+        osc_sender.send_skeleton(skeleton)
     prepared_metrics = osc_sender.last_prepared_metrics
     if calibration_state["active"] and calibration_countdown_remaining() <= 0.0:
         if pose_valid and has_usable_calibration_metrics(prepared_metrics):
@@ -737,6 +791,8 @@ async def stream_live():
                         pose_ms,
                         pose_valid=bool(getattr(engine, "last_pose_valid", False)),
                         pose_quality=getattr(engine, "last_pose_quality", 0.0),
+                        skeleton=getattr(engine, "last_skeleton_h36m", None),
+                        tracking=getattr(engine, "last_tracking", None),
                     )
                     next_analysis_at = now + analysis_interval
                 elif source_state.get("overlay_enabled", True):
@@ -872,6 +928,8 @@ async def stream_video():
                     pose_ms,
                     pose_valid=bool(getattr(engine, "last_pose_valid", False)),
                     pose_quality=getattr(engine, "last_pose_quality", 0.0),
+                    skeleton=getattr(engine, "last_skeleton_h36m", None),
+                    tracking=getattr(engine, "last_tracking", None),
                 )
                 next_analysis_at = now + analysis_interval
             elif source_state.get("overlay_enabled", True):
@@ -982,6 +1040,7 @@ async def apply_osc_config(
     osc_port: int = Form(9000),
     osc_targets: str = Form(""),
     osc_enabled: bool = Form(True),
+    osc_skeleton: bool = Form(False),
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form(""),
@@ -1003,6 +1062,7 @@ async def apply_osc_config(
         osc_sender.configure_targets(targets)
     except ValueError as exc:
         return {"status": "error", "error": str(exc)}
+    source_state["osc_skeleton"] = bool(osc_skeleton)
     refresh_prepared_metrics()
 
     return {"status": "applied", **state_payload()}
@@ -1031,6 +1091,14 @@ async def apply_metric_smoothing(metric: str = Form(...), alpha: float = Form(..
     except ValueError:
         return {"status": "error", "error": "alpha must be > 0 and <= 1"}
     return {"status": "applied", "metric": metric, "alpha": float(alpha)}
+
+
+@app.post("/api/tracking/config")
+async def apply_tracking_config(tracking_target: str = Form("auto_largest")):
+    source_state["tracking_target"] = normalize_tracking_target(tracking_target)
+    if pose_engine is not None:
+        pose_engine.configure_tracking(selection=source_state["tracking_target"])
+    return {"status": "applied", **state_payload()}
 
 
 @app.post("/api/metrics/enabled")
@@ -1063,6 +1131,7 @@ async def calibration_start():
     calibration_state["skipped_frames"] = 0
     calibration_state["applied_preset"] = None
     processing_state["latest_metrics"] = {}
+    processing_state["latest_skeleton"] = None
     return {"status": "started", **state_payload()}
 
 
@@ -1083,6 +1152,7 @@ async def calibration_stop(name: str = Form(...)):
     osc_sender.reset_state()
     reset_pose_metric_history()
     processing_state["latest_metrics"] = {}
+    processing_state["latest_skeleton"] = None
     return {"status": "saved", "profile": clean_name, **state_payload()}
 
 
@@ -1174,11 +1244,14 @@ async def apply_input(
     osc_port: int = Form(9000),
     osc_targets: str = Form(""),
     osc_enabled: bool = Form(True),
+    osc_skeleton: bool = Form(False),
     osc_mode: str = Form("raw"),
     osc_alpha: float = Form(1.0),
     osc_namespace: str = Form(""),
     performance: str = Form(DEFAULT_PERFORMANCE),
     pose_backend: str = Form("mediapipe"),
+    tracking_enabled: bool = Form(False),
+    tracking_target: str = Form("auto_largest"),
     smooth_enabled: bool = Form(False),
     smooth_min_cutoff: float = Form(0.3),
     video: Optional[UploadFile] = File(None),
@@ -1206,6 +1279,11 @@ async def apply_input(
 
     available_backend_ids = {item["id"] for item in available_pose_backends()}
     source_state["pose_backend"] = pose_backend if pose_backend in available_backend_ids else "mediapipe"
+    source_state["tracking_enabled"] = bool(tracking_enabled)
+    source_state["tracking_target"] = normalize_tracking_target(tracking_target)
+    source_state["tracker_model"] = DEFAULT_TRACKER_MODEL
+    source_state["tracker_yaml"] = DEFAULT_TRACKER_YAML
+    source_state["osc_skeleton"] = bool(osc_skeleton)
     source_state["smooth_enabled"] = False
     source_state["smooth_min_cutoff"] = float(smooth_min_cutoff)
     # Live-apply smoothing to the running engine (cheap). A backend SWAP is
@@ -1265,15 +1343,19 @@ async def apply_input(
     processing_state["encode_ms"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_raw_metrics"] = {}
+    processing_state["latest_skeleton"] = None
     processing_state["latest_timestamp_ms"] = None
     processing_state["pose_valid"] = False
     processing_state["pose_quality"] = 0.0
+    processing_state["tracking"] = {"enabled": bool(tracking_enabled), "state": "enabled" if tracking_enabled else "disabled", "count": 0}
     processing_state["last_frame_at"] = None
     processing_state["signal_mean"] = None
     processing_state["morrisness"] = None
     processing_state["error"] = None
     osc_sender.reset_state()
     reset_pose_metric_history()
+    if pose_engine is not None:
+        pose_engine.reset_tracking()
     if calibration_state.get("applied_preset") in calibration_presets:
         osc_sender.set_metric_ranges(calibration_presets[calibration_state["applied_preset"]])
     if culture_score is not None:
@@ -1539,6 +1621,36 @@ VIEWER_HTML = """
       letter-spacing: .06em;
     }
     .mirror-row input { width: 15px; min-height: 15px; }
+    .tracking-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 24px;
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .tracking-row input { width: 15px; min-height: 15px; }
+    .tracking-panel {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      z-index: 3;
+      width: min(220px, calc(100% - 92px));
+      padding: 8px;
+      background: rgba(29, 26, 23, .9);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.32);
+    }
+    .tracking-panel label { font-size: 10px; gap: 5px; }
+    .tracking-panel select {
+      min-height: 34px;
+      padding: 7px 9px;
+      font-size: 12px;
+      border-radius: 6px;
+    }
     .control-bar {
       position: absolute;
       left: 50%;
@@ -2103,15 +2215,57 @@ VIEWER_HTML = """
     .metric-address-panel { border-top: 1px solid var(--line); padding: 12px; background: #171411; }
     .output-header {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 190px;
+      grid-template-columns: minmax(0, 1fr) max-content max-content;
       gap: 12px;
-      align-items: end;
+      align-items: center;
       margin-bottom: 10px;
+      position: relative;
     }
-    .output-header .section-title { margin: 0 0 8px; }
-    .output-mode select { min-height: 34px; padding: 6px 10px; }
+    .output-header .section-title { margin: 0; }
+    .output-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      background: #211c17;
+      border-radius: 7px;
+    }
+    .output-tab {
+      width: auto;
+      min-height: 28px;
+      padding: 5px 9px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .output-tab.active { color: var(--text); background: #383026; }
+    .output-skeleton {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .output-skeleton input { width: 15px; min-height: 15px; }
     .address-list { display: grid; gap: 7px; color: var(--muted); font: 13px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
+    .skeleton-values {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font: 12px ui-monospace, monospace;
+    }
+    .skeleton-row {
+      display: grid;
+      grid-template-columns: 2.2ch minmax(88px, .7fr) repeat(3, minmax(54px, 1fr));
+      gap: 8px;
+      align-items: baseline;
+      overflow-wrap: anywhere;
+    }
+    .skeleton-row span:first-child { color: var(--teal); }
+    .skeleton-empty { color: var(--muted); font: 12px ui-monospace, monospace; }
     @media (max-width: 1080px) {
       .layout { grid-template-columns: 1fr; }
       .controls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2119,12 +2273,14 @@ VIEWER_HTML = """
     }
     @media (max-width: 680px) {
       header { align-items: flex-start; flex-direction: column; }
-      .controls-grid, .osc-toolbar, .osc-prefix, .osc-target-row, .input-source-toggle, .metric-osc-controls, .calibration-row, .meta, .output-header { grid-template-columns: 1fr; }
+      .controls-grid, .osc-toolbar, .osc-prefix, .output-skeleton, .osc-target-row, .input-source-toggle, .metric-osc-controls, .calibration-row, .meta, .output-header { grid-template-columns: 1fr; }
       .osc-remove { width: 100%; }
       .switch-row { justify-content: flex-start; }
       .metric { grid-template-columns: 22px 28px minmax(0, 1fr); align-items: start; }
       .metric-smooth-row { grid-column: 1 / -1; justify-self: stretch; width: 100%; }
       .metric-readout { grid-column: 1 / -1; }
+      .skeleton-row { grid-template-columns: 2.2ch minmax(0, 1fr); }
+      .skeleton-row span:nth-child(n+3) { grid-column: 2; }
     }
   </style>
 </head>
@@ -2185,6 +2341,10 @@ VIEWER_HTML = """
                   <option value="mediapipe">MediaPipe</option>
                 </select>
               </label>
+              <label class="tracking-row" data-tooltip-title="Stable ID" data-tooltip-body="Uses YOLO person tracking before pose. Metrics follow one locked track id instead of whichever person is largest in the frame. Requires ultralytics tracking extras.">
+                <input id="stableTracking" name="tracking_enabled" type="checkbox" />
+                Stable ID
+              </label>
               <div class="input-actions">
                 <button id="enterInputButton" class="enter-button" type="button">Enter</button>
                 <button id="enterCalibrationButton" class="calibrate-enter-button" type="button">Calibrate</button>
@@ -2193,6 +2353,14 @@ VIEWER_HTML = """
           </div>
           <div id="emptyState" class="empty hidden"></div>
           <div id="metricOverlay" class="metric-overlay"></div>
+          <div id="trackingPanel" class="tracking-panel hidden">
+            <label>Target
+              <select id="trackingTarget" name="tracking_target">
+                <option value="auto_largest">Auto largest</option>
+                <option value="auto_center">Auto center</option>
+              </select>
+            </label>
+          </div>
           <div id="calibrationOverlay" class="calibration-overlay hidden">Calibrating 0</div>
           <button id="changeInputButton" class="change-input hidden" type="button">Change Input</button>
           <div id="controlBar" class="control-bar hidden">
@@ -2249,8 +2417,17 @@ VIEWER_HTML = """
         <div class="metric-address-panel">
           <div class="output-header">
             <p class="section-title">Output values</p>
+            <div class="output-tabs" role="tablist" aria-label="Output values">
+              <button id="outputTabMetrics" class="output-tab active" type="button" role="tab" aria-selected="true">Metrics</button>
+              <button id="outputTabSkeleton" class="output-tab" type="button" role="tab" aria-selected="false">Skeleton</button>
+            </div>
+            <label class="output-skeleton" data-tooltip-title="Skeleton OSC" data-tooltip-body="Send one OSC message per H36M joint under /sk, each with x y z values.">
+              <input id="oscSkeleton" name="osc_skeleton" type="checkbox" />
+              Skeleton
+            </label>
           </div>
           <div id="addresses" class="address-list"></div>
+          <div id="skeletonValues" class="skeleton-values hidden"></div>
         </div>
       </section>
 
@@ -2267,7 +2444,7 @@ VIEWER_HTML = """
             <button id="calibrationStart" type="button">Start</button>
           </div>
           <div class="calibration-row">
-            <label class="normalize-profile-row" data-tooltip-title="Normalize Profile" data-tooltip-body="None sends raw metric values. Saved calibration profiles use fixed ranges from Smoothness(EMA) output samples.">
+            <label class="normalize-profile-row" data-tooltip-title="Normalize Profile" data-tooltip-body="None sends raw metric values. Saved calibration profiles use fixed ranges from Smoothness output samples.">
               Normalize profile
               <select id="normalizeProfile"></select>
             </label>
@@ -2319,6 +2496,26 @@ VIEWER_HTML = """
       torque: 'Torque',
       jerk: 'Jerk',
     };
+    const skeletonJoints = [
+      { name: 'Pelvis', path: 'sk/pelvis' },
+      { name: 'R Hip', path: 'sk/r/hip' },
+      { name: 'R Knee', path: 'sk/r/knee' },
+      { name: 'R Ankle', path: 'sk/r/ankle' },
+      { name: 'L Hip', path: 'sk/l/hip' },
+      { name: 'L Knee', path: 'sk/l/knee' },
+      { name: 'L Ankle', path: 'sk/l/ankle' },
+      { name: 'Spine', path: 'sk/spine' },
+      { name: 'Thorax', path: 'sk/thorax' },
+      { name: 'Neck', path: 'sk/neck' },
+      { name: 'Head', path: 'sk/head' },
+      { name: 'L Shoulder', path: 'sk/l/shoulder' },
+      { name: 'L Elbow', path: 'sk/l/elbow' },
+      { name: 'L Wrist', path: 'sk/l/wrist' },
+      { name: 'R Shoulder', path: 'sk/r/shoulder' },
+      { name: 'R Elbow', path: 'sk/r/elbow' },
+      { name: 'R Wrist', path: 'sk/r/wrist' },
+    ];
+    let outputTab = 'metrics';
     const metricDescriptions = {
       energy: 'Overall movement intensity from limb rotation speed. Higher means bigger or faster full-body motion; near 0 means stillness.',
       sync_velocity: 'Left-right activity balance. 1 means both sides are similarly active; 0 means one side is doing most of the movement.',
@@ -2536,7 +2733,7 @@ VIEWER_HTML = """
     function oscControlsHaveFocus() {
       const active = document.activeElement;
       if (!active) return false;
-      return oscTargetsEl.contains(active) || active.id === 'oscNamespace';
+      return oscTargetsEl.contains(active) || active.id === 'oscNamespace' || active.id === 'oscSkeleton';
     }
 
     function addOscTargetRow(target = null) {
@@ -2606,8 +2803,8 @@ VIEWER_HTML = """
           <div class="name">${labelForMetric(name)}</div>
         </div>
         <div class="metric-smooth-row">
-          <span class="ms-label">Smoothness(EMA)</span>
-          <input class="metric-smooth thin-range" type="range" min="0" max="10" step="1" value="${defaultMetricEmaFrames}" data-tooltip-title="${labelForMetric(name)} Smoothness(EMA)" data-tooltip-body="Per-metric output EMA after metrics are calculated. Value is pose analysis frames, not rendered camera frames. 0f is off; 10f is the strongest setting." />
+          <span class="ms-label">Smoothness</span>
+          <input class="metric-smooth thin-range" type="range" min="0" max="10" step="1" value="${defaultMetricEmaFrames}" data-tooltip-title="${labelForMetric(name)} Smoothness" data-tooltip-body="Per-metric output smoothing after metrics are calculated. Value is pose analysis frames, not rendered camera frames. 0f is off; 10f is the strongest setting." />
           <span class="ms-val">${formatEmaFrames(defaultMetricEmaFrames)}</span>
         </div>
         <div class="metric-readout">
@@ -2700,7 +2897,10 @@ VIEWER_HTML = """
       data.set('loop', document.getElementById('loopVideo').checked ? 'true' : 'false');
       data.set('detect_enabled', detectEnabled ? 'true' : 'false');
       data.set('osc_enabled', 'true');
+      data.set('osc_skeleton', document.getElementById('oscSkeleton').checked ? 'true' : 'false');
       data.set('osc_mode', selectedOscMode());
+      data.set('tracking_enabled', document.getElementById('stableTracking').checked ? 'true' : 'false');
+      data.set('tracking_target', document.getElementById('trackingTarget').value || 'auto_largest');
       data.set('smooth_enabled', 'false');
       data.set('smooth_min_cutoff', '0.3');
       if (document.getElementById('source').value === 'live') {
@@ -2736,6 +2936,7 @@ VIEWER_HTML = """
       data.set('osc_port', String(primary.port || 9000));
       data.set('osc_targets', JSON.stringify(targets));
       data.set('osc_enabled', 'true');
+      data.set('osc_skeleton', document.getElementById('oscSkeleton').checked ? 'true' : 'false');
       data.set('osc_mode', selectedOscMode());
       data.set('osc_alpha', '1');
       data.set('osc_namespace', document.getElementById('oscNamespace').value);
@@ -2796,6 +2997,9 @@ VIEWER_HTML = """
     const videoFileInput = document.getElementById('videoFile');
     const loopVideoInput = document.getElementById('loopVideo');
     const videoFileNameEl = document.getElementById('videoFileName');
+    const stableTrackingInput = document.getElementById('stableTracking');
+    const trackingPanel = document.getElementById('trackingPanel');
+    const trackingTargetSelect = document.getElementById('trackingTarget');
     const detectButton = document.getElementById('detectButton');
     const cameraButton = document.getElementById('cameraButton');
     const inputOverlay = document.getElementById('inputOverlay');
@@ -2957,6 +3161,17 @@ VIEWER_HTML = """
     document.getElementById('mirrorLive').addEventListener('change', () => {
       inputDirty = true;
       setSourceMode('live');
+    });
+    stableTrackingInput.addEventListener('change', () => {
+      inputDirty = true;
+      trackingPanel.classList.toggle('hidden', !stableTrackingInput.checked);
+    });
+    trackingTargetSelect.addEventListener('change', () => {
+      if (isDetecting && stableTrackingInput.checked) {
+        applyTrackingTarget();
+      } else {
+        inputDirty = true;
+      }
     });
     videoFileInput.addEventListener('change', () => {
       inputDirty = true;
@@ -3177,6 +3392,21 @@ VIEWER_HTML = """
       return prefix ? `${prefix}/${leaf}` : `/${leaf}`;
     }
 
+    function skeletonAddress(prefix, joint) {
+      const path = joint?.path || 'sk';
+      return prefix ? `${prefix}/${path}` : `/${path}`;
+    }
+
+    function setOutputTab(tab) {
+      outputTab = tab === 'skeleton' ? 'skeleton' : 'metrics';
+      document.getElementById('addresses').classList.toggle('hidden', outputTab !== 'metrics');
+      document.getElementById('skeletonValues').classList.toggle('hidden', outputTab !== 'skeleton');
+      document.getElementById('outputTabMetrics').classList.toggle('active', outputTab === 'metrics');
+      document.getElementById('outputTabSkeleton').classList.toggle('active', outputTab === 'skeleton');
+      document.getElementById('outputTabMetrics').setAttribute('aria-selected', outputTab === 'metrics' ? 'true' : 'false');
+      document.getElementById('outputTabSkeleton').setAttribute('aria-selected', outputTab === 'skeleton' ? 'true' : 'false');
+    }
+
     function updateAddresses(payload = lastPayload) {
       const metrics = payload?.processing?.latest_metrics || {};
       const active = new Set(payload?.source?.osc_metrics || metricNames);
@@ -3190,6 +3420,33 @@ VIEWER_HTML = """
         row.textContent = `${metricAddress(prefix, name)}  ${formatMetric(value)}`;
         container.appendChild(row);
       }
+      updateSkeletonValues(payload);
+    }
+
+    function updateSkeletonValues(payload = lastPayload) {
+      const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
+      const skeleton = payload?.processing?.latest_skeleton;
+      const container = document.getElementById('skeletonValues');
+      container.innerHTML = '';
+      const header = document.createElement('div');
+      header.textContent = `${prefix || ''}/sk/*  ${payload?.source?.osc_skeleton ? 'OSC on' : 'OSC off'}`;
+      container.appendChild(header);
+      if (!Array.isArray(skeleton) || skeleton.length !== skeletonJoints.length) {
+        const empty = document.createElement('div');
+        empty.className = 'skeleton-empty';
+        empty.textContent = 'No pose skeleton yet';
+        container.appendChild(empty);
+        return;
+      }
+      skeleton.forEach((point, index) => {
+        const row = document.createElement('div');
+        row.className = 'skeleton-row';
+        const x = Number(point?.[0] ?? 0);
+        const y = Number(point?.[1] ?? 0);
+        const z = Number(point?.[2] ?? 0);
+        row.innerHTML = `<span>${index}</span><span>${skeletonAddress(prefix, skeletonJoints[index])}</span><span>x ${formatMetric(x)}</span><span>y ${formatMetric(y)}</span><span>z ${formatMetric(z)}</span>`;
+        container.appendChild(row);
+      });
     }
 
     function formatMetric(value) {
@@ -3335,6 +3592,82 @@ VIEWER_HTML = """
       calibrationStartButton.classList.toggle('recording', Boolean(calibration.active));
     }
 
+    function trackingTargetLabel(track) {
+      const id = track?.stable_id;
+      const state = track?.state || 'tracking';
+      const suffix = state === 'tracking' ? '' : ` ${state}`;
+      return `ID ${id}${track?.active ? ' active' : ''}${suffix}`;
+    }
+
+    function syncTrackingTargets(source, tracking) {
+      const enabled = Boolean(source?.tracking_enabled || tracking?.enabled);
+      trackingPanel.classList.toggle('hidden', !enabled);
+      trackingTargetSelect.disabled = !enabled;
+
+      const tracks = Array.isArray(tracking?.tracks)
+        ? tracking.tracks.filter(track => track && track.stable_id && track.state !== 'lost')
+        : [];
+      const desired = source?.tracking_target || tracking?.selection || 'auto_largest';
+      const signature = [
+        desired,
+        ...tracks.map(track => `${track.stable_id}:${track.state}:${track.active ? 1 : 0}`),
+      ].join('|');
+      if (trackingTargetSelect.dataset.signature !== signature) {
+        trackingTargetSelect.innerHTML = '';
+        const autoLargest = document.createElement('option');
+        autoLargest.value = 'auto_largest';
+        autoLargest.textContent = 'Auto largest';
+        trackingTargetSelect.appendChild(autoLargest);
+        const autoCenter = document.createElement('option');
+        autoCenter.value = 'auto_center';
+        autoCenter.textContent = 'Auto center';
+        trackingTargetSelect.appendChild(autoCenter);
+        for (const track of tracks) {
+          const option = document.createElement('option');
+          option.value = `id:${track.stable_id}`;
+          option.textContent = trackingTargetLabel(track);
+          trackingTargetSelect.appendChild(option);
+        }
+        if (String(desired).startsWith('id:') && !Array.from(trackingTargetSelect.options).some(option => option.value === desired)) {
+          const option = document.createElement('option');
+          option.value = desired;
+          option.textContent = `ID ${desired.slice(3)} missing`;
+          trackingTargetSelect.appendChild(option);
+        }
+        trackingTargetSelect.dataset.signature = signature;
+      }
+      if (Array.from(trackingTargetSelect.options).some(option => option.value === desired)) {
+        trackingTargetSelect.value = desired;
+      } else {
+        trackingTargetSelect.value = 'auto_largest';
+      }
+    }
+
+    async function applyTrackingTarget() {
+      const data = new FormData();
+      data.set('tracking_target', trackingTargetSelect.value || 'auto_largest');
+      try {
+        const res = await fetch('/api/tracking/config', { method: 'POST', body: data });
+        const payload = await res.json();
+        if (payload.status === 'applied') update(payload);
+      } catch (error) {
+        console.warn('Tracking target update failed', error);
+      }
+    }
+
+    function formatTrackingStatus(track) {
+      if (!track?.enabled) return 'track off';
+      if (track.error) return 'track error';
+      const state = track.state || 'enabled';
+      const id = track.active_id ?? track.locked_id;
+      if ((state === 'tracking' || state === 'holding' || state === 'reidentified') && id !== null && id !== undefined) {
+        return `${state} id ${id}`;
+      }
+      if (state === 'lost') return 'track lost';
+      if (state === 'bad_bbox') return 'track bbox';
+      return `track ${state}`;
+    }
+
     function update(payload) {
       lastPayload = payload;
       const source = payload.source || {};
@@ -3352,10 +3685,12 @@ VIEWER_HTML = """
       syncInitialMetricSmoothness(osc);
       refreshEmaFrameLabels();
       syncCalibration(payload);
+      syncTrackingTargets(source, processing.tracking || {});
       applyMetricOrder(active);
       if (!inputDirty) {
         setSourceMode(source.source === 'video' ? 'video' : 'live');
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
+        stableTrackingInput.checked = Boolean(source.tracking_enabled);
         loopVideoInput.checked = Boolean(source.loop ?? true);
         previewVideo.loop = loopVideoInput.checked;
         const cameraSelect = document.getElementById('camera');
@@ -3367,6 +3702,7 @@ VIEWER_HTML = """
       if (!oscDirty && !oscControlsHaveFocus()) {
         document.getElementById('oscNamespace').value =
           (osc.namespace === undefined || osc.namespace === null) ? '/field' : osc.namespace;
+        document.getElementById('oscSkeleton').checked = Boolean(source.osc_skeleton);
         renderOscTargets(Array.isArray(osc.targets) ? osc.targets : [{
           id: 'default',
           name: 'Output 1',
@@ -3380,14 +3716,18 @@ VIEWER_HTML = """
       document.getElementById('dot').className = age < 2 ? 'dot live' : 'dot';
       const calibrationActive = Boolean(payload?.calibration?.active);
       const calibrationCountdown = Math.max(0, Math.ceil(Number(payload?.calibration?.countdown_remaining || 0)));
+      const trackStatus = formatTrackingStatus(processing.tracking);
+      const trackerError = processing.tracking?.enabled && processing.tracking?.error
+        ? processing.tracking.error
+        : '';
       document.getElementById('status').textContent =
-        processing.error || (calibrationActive ? (calibrationCountdown > 0 ? `calibrating in ${calibrationCountdown}` : 'calibrating') : (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off'));
+        processing.error || trackerError || (calibrationActive ? (calibrationCountdown > 0 ? `calibrating in ${calibrationCountdown}` : 'calibrating') : (source.detect_enabled ? (age < 2 ? 'detecting' : 'waiting') : 'detect off'));
       document.getElementById('metaA').textContent = `source: ${source.source || '-'}`;
       document.getElementById('metaB').textContent =
         `fps: ${Number(processing.fps || 0).toFixed(1)} / pose: ${Number(processing.analysis_fps || 0).toFixed(1)}`;
       if (source.source === 'video') {
         document.getElementById('metaC').textContent = `time: ${Number(processing.elapsed_seconds || 0).toFixed(1)}s`;
-        document.getElementById('metaD').textContent = `file: ${source.video_name || '-'} / loop ${source.loop ? 'on' : 'off'}`;
+        document.getElementById('metaD').textContent = `file: ${source.video_name || '-'} / loop ${source.loop ? 'on' : 'off'} / ${trackStatus}`;
       } else {
         const cameraSelect = document.getElementById('camera');
         const cameraValue = String(source.camera_index ?? '');
@@ -3397,7 +3737,7 @@ VIEWER_HTML = """
         const oscTargetText = `${targets.length} output${targets.length === 1 ? '' : 's'}`;
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
         document.getElementById('metaD').textContent =
-          `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / osc: ${oscTargetText}`;
+          `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / ${trackStatus} / osc: ${oscTargetText}`;
       }
       updateAddresses(payload);
 
@@ -3471,6 +3811,12 @@ VIEWER_HTML = """
       scheduleOscApply();
       updateAddresses();
     });
+    document.getElementById('oscSkeleton').addEventListener('change', () => {
+      scheduleOscApply(0);
+    });
+    document.getElementById('outputTabMetrics').addEventListener('click', () => setOutputTab('metrics'));
+    document.getElementById('outputTabSkeleton').addEventListener('click', () => setOutputTab('skeleton'));
+    setOutputTab('metrics');
     renderOscTargets([{ id: 'default', name: 'Output 1', host: '127.0.0.1', port: 9000, enabled: true, broadcast: false }]);
     loadCameras();
 
@@ -3520,7 +3866,7 @@ CHARTS_HTML = """<!doctype html>
   <a href="/">back to viewer</a>
 </header>
 <div class="grid" id="grid"></div>
-<div class="legend">Per chart: <b>value sent to OSC after Smoothness(EMA) and normalize profile</b>. Window approx last 30s.</div>
+<div class="legend">Per chart: <b>value sent to OSC after Smoothness and normalize profile</b>. Window approx last 30s.</div>
 <script>
 const METRICS = [
   {key:'energy', name:'Energy'},
