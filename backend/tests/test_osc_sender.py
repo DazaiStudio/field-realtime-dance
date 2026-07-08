@@ -21,6 +21,17 @@ def make_sender(**kwargs) -> OSCSender:
     return OSCSender(**kwargs)
 
 
+def close_client(client):
+    # pythonosc's SimpleUDPClient only grew close() in newer releases
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+        return
+    sock = getattr(client, "_sock", None)
+    if sock is not None:
+        sock.close()
+
+
 class TestAddresses(unittest.TestCase):
     def test_frozen_addresses(self):
         sender = make_sender()
@@ -144,7 +155,7 @@ class TestSendMetrics(unittest.TestCase):
                 sent_by_target.setdefault(self.target_id, []).append((address, value))
 
         for target in sender.targets:
-            target.client.close()
+            close_client(target.client)
             target.client = FakeClient(target.id)
 
         sent = sender.send_metrics({"energy": 2.5}, send_keys={"energy"})
@@ -173,7 +184,7 @@ class TestSendMetrics(unittest.TestCase):
             def send_message(self, address, value):
                 sent.append((address, value))
 
-        sender.targets[0].client.close()
+        close_client(sender.targets[0].client)
         sender.targets[0].client = FakeClient()
         skeleton = [[joint, joint + 0.1, joint + 0.2] for joint in range(17)]
 
