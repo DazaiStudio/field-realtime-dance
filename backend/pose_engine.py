@@ -33,6 +33,7 @@ class PoseEngine:
         self.last_pose_quality = 0.0
         self.last_skeleton_h36m = None
         self.last_tracking = {"enabled": False, "state": "disabled", "count": 0}
+        self._metrics_person_id = None
         self.source = self._make_source(self.backend_name)
 
     # --- source / backend management ---------------------------------------
@@ -120,6 +121,13 @@ class PoseEngine:
         if pose_complete:
             self.last_pose_quality = self._clamp_quality(getattr(self.source, "last_pose_quality", 1.0))
             self.last_pose_valid = bool(getattr(self.source, "last_pose_valid", True))
+            active_id = self.last_tracking.get("active_id") if isinstance(self.last_tracking, dict) else None
+            if active_id != self._metrics_person_id:
+                # A different dancer now feeds the metrics: restart history so
+                # velocity/jerk are never computed across two bodies.
+                self.metrics_engine.reset()
+                self.smoother.reset()
+                self._metrics_person_id = active_id
             if self.smoothing_enabled:
                 h36m = self.smoother.filter(h36m, timestamp_ms)
             self.last_skeleton_h36m = np.asarray(h36m, dtype=float).copy()

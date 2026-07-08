@@ -302,19 +302,23 @@ class MultiPersonTrackRegistry:
         reidentify_seconds: float = 12.0,
         reidentify_min_iou: float = 0.12,
         reidentify_max_center_distance: float = 0.85,
+        auto_switch_area_ratio: float = 1.3,
     ):
         self.hold_seconds = float(hold_seconds)
         self.reidentify_seconds = float(reidentify_seconds)
         self.reidentify_min_iou = float(reidentify_min_iou)
         self.reidentify_max_center_distance = float(reidentify_max_center_distance)
+        self.auto_switch_area_ratio = float(auto_switch_area_ratio)
         self._next_stable_id = 1
         self._tracks: dict[int, StablePersonTrack] = {}
         self._raw_to_stable: dict[int, int] = {}
+        self._last_active_id: Optional[int] = None
 
     def reset(self) -> None:
         self._next_stable_id = 1
         self._tracks = {}
         self._raw_to_stable = {}
+        self._last_active_id = None
 
     def update(self, raw_tracks: Sequence[PersonTrack], now: float) -> list[StablePersonTrack]:
         clean_tracks = suppress_duplicate_person_tracks(raw_tracks)
@@ -375,6 +379,7 @@ class MultiPersonTrackRegistry:
             track = self._tracks.get(stable_id) if stable_id is not None else None
             if track is None or track.state == "lost":
                 return None, "lost"
+            self._last_active_id = track.stable_id
             return track, track.state
 
         visible = [track for track in tracks if track.state == "tracking"]
@@ -387,8 +392,21 @@ class MultiPersonTrackRegistry:
             frame_center = self._frame_center(frame_shape)
             if frame_center is not None:
                 track = min(visible, key=lambda item: center_distance(item.bbox, frame_center))
+                self._last_active_id = track.stable_id
                 return track, track.state
         track = max(visible, key=lambda item: (bbox_area(item.bbox), item.confidence))
+        # Stickiness: keep the incumbent active dancer unless the challenger
+        # is clearly larger, so similar-sized dancers don't swap the metrics
+        # subject frame to frame.
+        incumbent = self._tracks.get(self._last_active_id) if self._last_active_id is not None else None
+        if (
+            incumbent is not None
+            and incumbent.stable_id != track.stable_id
+            and any(candidate is incumbent for candidate in visible)
+            and bbox_area(track.bbox) < self.auto_switch_area_ratio * bbox_area(incumbent.bbox)
+        ):
+            track = incumbent
+        self._last_active_id = track.stable_id
         return track, track.state
 
     def _new_track(self, raw: PersonTrack, now: float) -> int:

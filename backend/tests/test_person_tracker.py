@@ -156,5 +156,39 @@ class TestMultiPersonTrackRegistry(unittest.TestCase):
         self.assertEqual(active.stable_id, 2)
 
 
+class TestAutoLargestStickiness(unittest.TestCase):
+    """auto_largest must not flip the active dancer on every frame: two
+    similar-sized dancers would otherwise swap the metrics subject
+    repeatedly, spiking velocity/jerk over OSC."""
+
+    def test_keeps_incumbent_until_challenger_clearly_larger(self):
+        registry = MultiPersonTrackRegistry()
+        a = PersonTrack(1, (0, 0, 100, 100), 0.9)  # area 10000
+        registry.update([a], now=0.0)
+        track, _state = registry.choose_active("auto_largest")
+        self.assertEqual(track.stable_id, 1)
+
+        b_slightly_larger = PersonTrack(2, (300, 0, 405, 100), 0.9)  # area 10500
+        registry.update([a, b_slightly_larger], now=0.1)
+        track, _state = registry.choose_active("auto_largest")
+        self.assertEqual(track.stable_id, 1)  # 1.05x must not steal the lock
+
+        b_clearly_larger = PersonTrack(2, (300, 0, 440, 100), 0.9)  # area 14000
+        registry.update([a, b_clearly_larger], now=0.2)
+        track, _state = registry.choose_active("auto_largest")
+        self.assertEqual(track.stable_id, 2)  # 1.4x takes over
+
+    def test_switches_when_incumbent_disappears(self):
+        registry = MultiPersonTrackRegistry()
+        a = PersonTrack(1, (0, 0, 100, 100), 0.9)
+        b = PersonTrack(2, (300, 0, 380, 100), 0.9)  # smaller
+        registry.update([a, b], now=0.0)
+        registry.choose_active("auto_largest")
+
+        registry.update([b], now=0.5)  # A occluded -> holding
+        track, _state = registry.choose_active("auto_largest")
+        self.assertEqual(track.stable_id, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
