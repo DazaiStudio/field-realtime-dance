@@ -5,8 +5,9 @@ viewer keeps working on machines that have not installed YOLO tracking extras.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -487,7 +488,12 @@ def center_distance(bbox: Sequence[float], point: tuple[float, float]) -> float:
 
 
 class UltralyticsPersonTracker:
-    """YOLO person detector + built-in MOT tracker wrapper."""
+    """YOLO person detector + built-in MOT tracker wrapper.
+
+    Model loading (including ultralytics' first-use weight download) never
+    runs in the frame loop: start_preload() loads in a background thread and
+    a load failure is latched instead of being retried every frame.
+    """
 
     def __init__(
         self,
@@ -495,16 +501,79 @@ class UltralyticsPersonTracker:
         tracker_yaml: str = "bytetrack.yaml",
         confidence: float = 0.25,
         iou: float = 0.45,
+        model_factory: Optional[Callable[[], object]] = None,
     ):
         self.model_name = model_name
         self.tracker_yaml = tracker_yaml
         self.confidence = float(confidence)
         self.iou = float(iou)
         self._model = None
+        self._model_factory = model_factory
+        self._load_error: Optional[str] = None
+        self._load_thread: Optional[threading.Thread] = None
+        self._load_lock = threading.Lock()
+
+    @property
+    def status(self) -> str:
+        if self._model is not None:
+            return "ready"
+        thread = self._load_thread
+        if thread is not None and thread.is_alive():
+            return "loading"
+        if self._load_error is not None:
+            return "error"
+        return "idle"
+
+    @property
+    def load_error(self) -> Optional[str]:
+        return self._load_error
+
+    def is_ready(self) -> bool:
+        return self._model is not None
+
+    def start_preload(self, retry_error: bool = False) -> None:
+        """Begin loading the model in a background thread. Idempotent; after a
+        failure it stays latched in 'error' unless retry_error=True (explicit
+        user action such as re-enabling tracking)."""
+        with self._load_lock:
+            if self._model is not None:
+                return
+            if self._load_thread is not None and self._load_thread.is_alive():
+                return
+            if self._load_error is not None and not retry_error:
+                return
+            self._load_error = None
+            self._load_thread = threading.Thread(
+                target=self._load_model, name="person-tracker-preload", daemon=True
+            )
+            self._load_thread.start()
+
+    def wait_until_settled(self, timeout: Optional[float] = None) -> None:
+        thread = self._load_thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def _load_model(self) -> None:
+        factory = self._model_factory or self._default_model_factory
+        try:
+            model = factory()
+        except Exception as exc:
+            self._load_error = str(exc)
+            return
+        self._model = model
+
+    def _default_model_factory(self):
+        try:
+            from ultralytics import YOLO
+        except Exception as exc:
+            raise RuntimeError("Stable ID tracking needs `pip install ultralytics lap`") from exc
+        return YOLO(self.model_name)
 
     def track(self, frame) -> list[PersonTrack]:
-        self._ensure_model()
-        results = self._model.track(
+        model = self._model
+        if model is None:
+            raise RuntimeError(self._load_error or "person tracker model is still loading")
+        results = model.track(
             source=frame,
             persist=True,
             classes=[0],
@@ -535,12 +604,3 @@ class UltralyticsPersonTracker:
             confidence = float(np.asarray(confs).reshape(-1)[index]) if confs is not None else 0.0
             tracks.append(PersonTrack(track_id=track_id, bbox=bbox, confidence=confidence))
         return tracks
-
-    def _ensure_model(self):
-        if self._model is not None:
-            return
-        try:
-            from ultralytics import YOLO
-        except Exception as exc:
-            raise RuntimeError("Stable ID tracking needs `pip install ultralytics lap`") from exc
-        self._model = YOLO(self.model_name)

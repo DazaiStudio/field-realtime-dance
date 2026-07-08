@@ -1,4 +1,5 @@
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from person_tracker import (
     MultiPersonTrackRegistry,
     PersonTrack,
     StableTrackSelector,
+    UltralyticsPersonTracker,
     bbox_area,
     expand_bbox,
     suppress_duplicate_person_tracks,
@@ -188,6 +190,61 @@ class TestAutoLargestStickiness(unittest.TestCase):
         registry.update([b], now=0.5)  # A occluded -> holding
         track, _state = registry.choose_active("auto_largest")
         self.assertEqual(track.stable_id, 2)
+
+
+class TestTrackerPreload(unittest.TestCase):
+    """YOLO model loading (including the first-use weight download) must never
+    run inside the frame loop: it is preloaded in a background thread, and a
+    load failure is latched instead of being retried every frame."""
+
+    def test_preload_runs_in_background_and_becomes_ready(self):
+        release = threading.Event()
+        loaded = threading.Event()
+
+        def slow_factory():
+            release.wait(timeout=2.0)
+            loaded.set()
+            return object()
+
+        tracker = UltralyticsPersonTracker(model_factory=slow_factory)
+        self.assertEqual(tracker.status, "idle")
+
+        tracker.start_preload()
+        self.assertEqual(tracker.status, "loading")  # returns immediately
+        self.assertFalse(tracker.is_ready())
+
+        release.set()
+        self.assertTrue(loaded.wait(timeout=2.0))
+        tracker.wait_until_settled(timeout=2.0)
+        self.assertEqual(tracker.status, "ready")
+        self.assertTrue(tracker.is_ready())
+
+    def test_load_failure_is_latched_and_not_retried(self):
+        calls = []
+
+        def failing_factory():
+            calls.append(1)
+            raise RuntimeError("no ultralytics here")
+
+        tracker = UltralyticsPersonTracker(model_factory=failing_factory)
+        tracker.start_preload()
+        tracker.wait_until_settled(timeout=2.0)
+        self.assertEqual(tracker.status, "error")
+        self.assertIn("no ultralytics", tracker.load_error)
+
+        tracker.start_preload()  # frame-path call: must NOT retry
+        tracker.wait_until_settled(timeout=2.0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(tracker.status, "error")
+
+        tracker.start_preload(retry_error=True)  # explicit user action retries
+        tracker.wait_until_settled(timeout=2.0)
+        self.assertEqual(len(calls), 2)
+
+    def test_track_refuses_until_ready(self):
+        tracker = UltralyticsPersonTracker(model_factory=lambda: object())
+        with self.assertRaises(RuntimeError):
+            tracker.track(None)
 
 
 if __name__ == "__main__":

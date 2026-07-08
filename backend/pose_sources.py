@@ -204,7 +204,9 @@ class MediaPipePoseSource:
         self.tracking_selection = str(tracking_selection or "auto_largest")
         self.tracker = None
         self.track_registry = MultiPersonTrackRegistry(hold_seconds=self.tracker_hold_seconds)
-        self.track_padding = 0.18
+        if self.tracking_enabled:
+            # Load YOLO (and its first-use weight download) off the frame loop.
+            self._ensure_tracker().start_preload()
         self._ensure_model()
         self.landmarker = self._create_landmarker(mp.tasks.vision.RunningMode.VIDEO)
         self.image_landmarker = None
@@ -212,12 +214,11 @@ class MediaPipePoseSource:
         self.last_pose_quality = 0.0
         self.last_pose_valid = False
         self.last_tracking = self._tracking_status("disabled")
+        self.last_h36m_by_id = {} if self.tracking_enabled else None
         self._last_overlay_points = None
         self._last_overlay_points_by_id = {}
-        self._last_tracks = []
         self._last_stable_tracks = []
         self._last_active_track = None
-        self._last_crop_rect = None
 
     def _ensure_model(self):
         if not os.path.exists(self.model_path):
@@ -274,14 +275,17 @@ class MediaPipePoseSource:
             self.tracking_selection = str(selection or "auto_largest")
         if reset_needed:
             self.reset_tracking()
+        if self.tracking_enabled:
+            # Explicit user action: (re)start the model load, retrying a
+            # previously latched failure.
+            self._ensure_tracker().start_preload(retry_error=True)
 
     def reset_tracking(self) -> None:
         self.track_registry.reset()
-        self._last_tracks = []
         self._last_stable_tracks = []
         self._last_active_track = None
-        self._last_crop_rect = None
         self._last_overlay_points_by_id = {}
+        self.last_h36m_by_id = {} if self.tracking_enabled else None
         self.last_tracking = self._tracking_status("enabled" if self.tracking_enabled else "disabled")
 
     def _ensure_tracker(self):
@@ -324,35 +328,34 @@ class MediaPipePoseSource:
     def _select_tracking_crop(self, frame, timestamp_ms: float):
         if not self.tracking_enabled:
             self.last_tracking = self._tracking_status("disabled")
-            return None
+            return
+        tracker = self._ensure_tracker()
+        if not tracker.is_ready():
+            error = tracker.load_error
+            if error:
+                # Latched load failure: report it, never retry per frame.
+                self.last_tracking = self._tracking_status("error", error=error)
+            else:
+                tracker.start_preload()  # idempotent no-op while loading
+                self.last_tracking = self._tracking_status("loading")
+            return
         try:
-            tracks = self._ensure_tracker().track(frame)
+            tracks = tracker.track(frame)
         except Exception as exc:
-            self._last_tracks = []
+            self._last_stable_tracks = []
             self._last_active_track = None
-            self._last_crop_rect = None
             self.last_tracking = self._tracking_status("error", error=str(exc))
-            return None
+            return
 
         now = float(timestamp_ms) / 1000.0
-        self._last_tracks = list(tracks)
         stable_tracks = self.track_registry.update(tracks, now)
         active, state = self.track_registry.choose_active(self.tracking_selection, frame.shape)
         self._last_stable_tracks = stable_tracks
         self._last_active_track = active
         if active is None:
-            self._last_crop_rect = None
             self.last_tracking = self._tracking_status(state, tracks=stable_tracks)
-            return None
-
-        rect = expand_bbox_rect(active.bbox, frame.shape, padding_x=0.06, padding_y=0.08)
-        if rect is None:
-            self._last_crop_rect = None
-            self.last_tracking = self._tracking_status("bad_bbox", tracks=stable_tracks, active=active)
-            return None
-        self._last_crop_rect = rect
+            return
         self.last_tracking = self._tracking_status(state, tracks=stable_tracks, active=active)
-        return rect
 
     def _landmark_points(self, image, landmarks, crop_rect=None):
         if crop_rect is None:
@@ -379,9 +382,6 @@ class MediaPipePoseSource:
         for a, b in _MP_CONNECTIONS:
             if a in points and b in points:
                 cv2.line(image, points[a], points[b], line_color, 2)
-
-    def _draw_landmarks(self, image, landmarks, crop_rect=None):
-        self._draw_points(image, self._landmark_points(image, landmarks, crop_rect))
 
     def _draw_tracking_overlay(self, image):
         if not self.tracking_enabled:
@@ -448,7 +448,7 @@ class MediaPipePoseSource:
         return h36m, overlay_points, quality, valid, landmarks
 
     def _estimate_tracked_people(self, frame, timestamp_ms: float, draw: bool = True):
-        crop_rect = self._select_tracking_crop(frame, timestamp_ms)
+        self._select_tracking_crop(frame, timestamp_ms)
         if draw:
             self._draw_tracking_overlay(frame)
 
@@ -458,14 +458,15 @@ class MediaPipePoseSource:
         self._last_overlay_points = None
 
         active_id = self._last_active_track.stable_id if self._last_active_track is not None else None
-        if active_id is None:
-            self._last_overlay_points_by_id = {}
-            return frame, None
+        non_lost = [track for track in self._last_stable_tracks if track.state != "lost"]
 
         active_h36m = None
-        pose_results = {}
-        for stable_track in self._last_stable_tracks:
-            if stable_track.state == "lost":
+        fresh_points = {}
+        h36m_by_id = {}
+        for stable_track in non_lost:
+            if stable_track.state != "tracking":
+                # 'holding' bboxes are frozen at the last-seen position; running
+                # pose there would report whoever walks through under this ID.
                 continue
             rect = expand_bbox_rect(stable_track.bbox, frame.shape, padding_x=0.06, padding_y=0.08)
             if rect is None:
@@ -474,21 +475,35 @@ class MediaPipePoseSource:
             result = self._detect_frame_pose(input_frame, timestamp_ms, stateless=True)
             h36m, points, quality, valid, landmarks = self._pose_from_result(frame, rect, result)
             if points:
-                pose_results[stable_track.stable_id] = points
-                if draw:
-                    if stable_track.stable_id == active_id:
-                        self._draw_points(frame, points, joint_color=(0, 255, 255), line_color=(0, 255, 0))
-                    else:
-                        self._draw_points(frame, points, joint_color=(192, 211, 52), line_color=(192, 211, 52))
+                fresh_points[stable_track.stable_id] = points
+            if h36m is not None:
+                h36m_by_id[stable_track.stable_id] = h36m
             if stable_track.stable_id == active_id:
                 if landmarks is not None:
                     self.last_pose_landmarks = landmarks
                 self.last_pose_quality = quality
                 self.last_pose_valid = valid
-                self._last_overlay_points = points
                 active_h36m = h36m
 
-        self._last_overlay_points_by_id = pose_results
+        # Keep the previous overlay for non-lost tracks that missed a
+        # detection this frame so the skeleton doesn't strobe.
+        merged_points = {}
+        for track in non_lost:
+            sid = track.stable_id
+            if sid in fresh_points:
+                merged_points[sid] = fresh_points[sid]
+            elif sid in self._last_overlay_points_by_id:
+                merged_points[sid] = self._last_overlay_points_by_id[sid]
+        self._last_overlay_points_by_id = merged_points
+        self._last_overlay_points = merged_points.get(active_id)
+        self.last_h36m_by_id = h36m_by_id
+
+        if draw:
+            for sid, points in sorted(merged_points.items()):
+                if sid == active_id:
+                    self._draw_points(frame, points, joint_color=(0, 255, 255), line_color=(0, 255, 0))
+                else:
+                    self._draw_points(frame, points, joint_color=(192, 211, 52), line_color=(192, 211, 52))
         return frame, active_h36m
 
     def estimate(self, frame, timestamp_ms: float, draw: bool = True):
@@ -499,11 +514,15 @@ class MediaPipePoseSource:
         h36m, points, quality, valid, landmarks = self._pose_from_result(frame, None, result)
         self.last_pose_quality = quality
         self.last_pose_valid = valid
-        self.last_pose_landmarks = landmarks
-        self._last_overlay_points = points
+        if landmarks is not None:
+            # Only overwrite the cached overlay on a successful detection so a
+            # single missed frame doesn't strobe the skeleton.
+            self.last_pose_landmarks = landmarks
+            self._last_overlay_points = points
         self._last_overlay_points_by_id = {}
-        if draw and points:
-            self._draw_points(frame, points)
+        self.last_h36m_by_id = None
+        if draw and self._last_overlay_points:
+            self._draw_points(frame, self._last_overlay_points)
         return frame, h36m
 
     def close(self):
