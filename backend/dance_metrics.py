@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 from scipy.spatial import ConvexHull
 from constants import *
@@ -7,7 +9,11 @@ class DanceMetricsEngine:
         self.fps = fps
         self.dt = 1.0 / fps
         self.history_size = history_size
-        
+
+        # update() runs in the stream worker thread while reset()/set_fps()
+        # are called from FastAPI handlers on the event loop.
+        self._lock = threading.RLock()
+
         # Historical buffers
         self.positions_history = [] # List of (17, 3) arrays
         # Used for derivations
@@ -19,24 +25,26 @@ class DanceMetricsEngine:
         self.omega_r_history = []
 
     def reset(self):
-        self.positions_history.clear()
-        self.velocities_history.clear()
-        self.accelerations_history.clear()
-        self.omega_l_history.clear()
-        self.omega_r_history.clear()
-        if hasattr(self, 'omega_history'):
-            self.omega_history.clear()
+        with self._lock:
+            self.positions_history.clear()
+            self.velocities_history.clear()
+            self.accelerations_history.clear()
+            self.omega_l_history.clear()
+            self.omega_r_history.clear()
+            if hasattr(self, 'omega_history'):
+                self.omega_history.clear()
 
     def set_fps(self, fps):
-        fps = max(float(fps), 1.0)
-        self.fps = fps
-        self.dt = 1.0 / fps
-        self.history_size = max(2, int(round(fps)))
-        self.positions_history = self.positions_history[-self.history_size:]
-        self.velocities_history = self.velocities_history[-self.history_size:]
-        self.accelerations_history = self.accelerations_history[-self.history_size:]
-        self.omega_l_history = self.omega_l_history[-self.history_size:]
-        self.omega_r_history = self.omega_r_history[-self.history_size:]
+        with self._lock:
+            fps = max(float(fps), 1.0)
+            self.fps = fps
+            self.dt = 1.0 / fps
+            self.history_size = max(2, int(round(fps)))
+            self.positions_history = self.positions_history[-self.history_size:]
+            self.velocities_history = self.velocities_history[-self.history_size:]
+            self.accelerations_history = self.accelerations_history[-self.history_size:]
+            self.omega_l_history = self.omega_l_history[-self.history_size:]
+            self.omega_r_history = self.omega_r_history[-self.history_size:]
 
     def update(self, positions):
         """
@@ -46,10 +54,14 @@ class DanceMetricsEngine:
         if positions is None:
             return self.get_empty_metrics()
 
+        with self._lock:
+            return self._update_locked(positions)
+
+    def _update_locked(self, positions):
         self.positions_history.append(positions)
         if len(self.positions_history) > self.history_size:
             self.positions_history.pop(0)
-            
+
         # Need at least previous frame for velocity/energy
         if len(self.positions_history) < 2:
             return self.get_empty_metrics()
@@ -61,7 +73,7 @@ class DanceMetricsEngine:
         curvature = self._calculate_curvature()
         height, sway = self._calculate_stability(positions)
         torque, jerk = self._calculate_transition(omegas)
-        
+
         return {
             "energy": float(energy),
             "sync_velocity": float(sync_velocity),
