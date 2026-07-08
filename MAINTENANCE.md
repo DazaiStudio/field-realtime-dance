@@ -17,7 +17,7 @@
 | Branch | 狀態 | 說明 |
 |---|---|---|
 | `master` | **production(排練用)** | 單人版。feat/rtmpose-backend 已合入 + 6/27–7/1 排練期 tuning。本次已修 metrics reset race(`ca894f5`) |
-| `research/stable-id-tracking` | 開發中,**未完成** | 多人 stable-ID(YOLO yolov8n + `person_tracker.py` registry),只有 active 一人餵 metrics/OSC。本次已修「換人不 reset」+ auto_largest 遲滯;**仍有 4 個 blocker(§3)才能實機驗證/合併** |
+| `research/stable-id-tracking` | 開發中,**待實機驗證** | 多人 stable-ID(YOLO yolov8n + `person_tracker.py` registry)。2026-07-08:4 個 blocker 已修 + 改為 **per-person OSC 輸出 `/field/<id>/<metric>`(新 wire contract,見 §8)**。剩餘工作見 §3b;實機驗證後可合併 |
 | `feat/rtmpose-backend` | 已合入 master | 封存 |
 | `feat/multi-person` | **已淘汰** | 2026-06 舊多人架構(SlotBinder / per-slot OSC / CentroidTracker),被 research/stable-id-tracking 取代。留作參考,勿繼續開發,勿把兩套 tracker 混用 |
 
@@ -51,21 +51,19 @@
 | 低 | Stop 按鈕被 15Hz sync 重新 enable → 可雙擊重入 | JS `syncCalibration` |
 | 低 | 2026-07-01 前存的使用者 preset,height 是舊語意 → fixed mode 的 `/field/height` 釘在 1.0(內建 Rebecca preset 是新語意,沒事);重新校準即解 | height 語意變更 `69b2616` |
 
-### 3b. research/stable-id-tracking(合併前 blocker)
+### 3b. research/stable-id-tracking(剩餘工作)
+
+**4 個 blocker 已於 2026-07-08 修復**(commits `c6d5024`、`f061fab`,105 測試綠):YOLO 背景預載+失敗 latch(不再於 frame loop 下載/重試)、holding track 不再跑 pose(不會鎖錯人)、單人 overlay guard 恢復(不閃爍)、tracker 錯誤清 ghost 框、`send_skeleton` 先全驗證再送(不再送半具骨架)、dead state 清理;並改為 **per-person metrics/OSC**(每個 id 一台 DanceMetricsEngine,「換人尖峰」問題從根本解除)。
 
 | 優先 | 問題 | 位置 |
 |---|---|---|
-| **blocker** | YOLO 權重在 frame loop 內 lazy 建構(第一次會**同步下載** yolov8n.pt),失敗**每幀重試**無 latch → stream 卡死 | `person_tracker.py` `_ensure_model`(~521);應 stream start 預載 + 失敗 latch |
-| **blocker** | 每個非 lost track 都跑完整 MediaPipe IMAGE 推論(overlay 關也跑;只有 active 有用)→ N 人 = N× 成本,M1 fps 崩 | `pose_sources.py` `_estimate_tracked_people`(~467);只推 active,其他人 overlay 開啟時低頻推 |
-| **blocker** | holding track 的 stale bbox:被遮擋期間別的舞者走進該區域 → 被鎖成原 ID;re-id(IoU 0.12 對 stale box)會永久接管 | `person_tracker.py` holding fallback + `pose_sources.py` 無身分檢查 |
-| **blocker** | 重構掉了 `if result.pose_landmarks:` guard → 漏偵測一幀就清掉快取骨架 → overlay 閃爍(master 會保留上一幀) | `pose_sources.py` `estimate`(~502) |
-| 高 | tracked 路徑用 IMAGE mode(stateless),校準 preset 是 VIDEO mode 錄的 → jitter 可能讓 jerk/torque 貼 1.0;需實機驗證,可能要 per-mode 校準 | `_detect_frame_pose(stateless=True)` |
+| 高 | **實機驗證**:多人、交錯遮擋、M1 效能。per-person 輸出後每個 tracking 中的人都要各跑一次 MediaPipe(這是功能成本,不再是浪費)——M1 上 3–4 人的 fps 要實測,必要時降 analysis_fps 或限制人數上限 | — |
+| 高 | tracked 路徑用 IMAGE mode(stateless),校準 preset 是 VIDEO mode 錄的 → jitter 可能讓 jerk/torque 貼 1.0;實機比對,必要時 per-mode 校準 | `_detect_frame_pose(stateless=True)` |
 | 中 | `suppress_duplicate_person_tracks`:被刪的 box 仍繼續壓別人 → 真舞者可能整幀沒 track;加 `if not keep[i]: break` | `person_tracker.py` ~58 |
-| 中 | registry dicts 跨執行緒無鎖,且 `registry.update()` 在 try/except 外 → 罕見 KeyError 會殺 stream | `pose_sources.py` ~339 |
-| 低 | tracker 出錯時 `_last_stable_tracks` 沒清 → ghost overlay 框 | `pose_sources.py` except 分支(~330) |
+| 中 | registry dicts 跨執行緒無鎖,且 `registry.update()` 在 try/except 外 → 罕見 KeyError 會殺 stream | `pose_sources.py` |
 | 低 | `syncTrackingTargets` 15Hz 蓋寫 UI:面板被重新藏起、下拉重建(選單收合)、選擇被改回 auto_largest → 照 `normalizeProfileSelect` 加 activeElement/dirty guard | `osc_viewer.py` JS ~3604 |
+| 低 | re-ID 對 stale bbox 仍可能誤鎖(IoU 0.12 門檻寬);pose 已不會跑在 stale crop 上,只剩 re-id 指派這一條路徑 | `person_tracker.py` `_best_reidentify_match` |
 | 清理 | `StableTrackSelector` + `expand_bbox` 是死碼(~130 行,只有測試在用,re-id 閾值已 drift 1.35 vs 0.85)→ 刪 | `person_tracker.py` |
-| 清理 | dead state:`crop_rect` 未用、`_last_crop_rect`/`_last_tracks` 寫了沒人讀、`track_padding=0.18` 沒用、crop padding 0.06/0.08 兩處重複(只有一處生效)、`_draw_landmarks` 沒人叫 | `pose_sources.py` |
 
 ### 3c. 兩邊皆有(品質 / 重複)
 
@@ -92,18 +90,41 @@
 4. **15Hz ws `update()` 會蓋 UI**:新增任何輸入控件必須加 dirty/focus/signature guard(參考 `syncCalibration` / `syncPoseBackends`),否則使用者輸入 66ms 內被蓋掉。
 5. **metric 改名/新增要動很多處**:`METRIC_NAMES`、`OSC_ADDRESS_NAMES`、`osc_sender` 各 set/dict、`calibration.RANGE_METRICS`、viewer JS `metricLabels`、charts `METRICS`。先全域搜尋再動手。
 6. **校準檔**:`calibration_presets.json`(使用者)+ `project_default_calibration_presets.json`(內建,啟動時 merge)。格式沒有版本欄位;height 語意 7/1 改過,舊檔不相容。
-7. **演出季內不要動 wire contract**(OSC address、值域、`/api/*` schema)— Nick/Mark 的 patch 直接依賴;要動先通知。
+7. **演出季內不要動 wire contract**(OSC address、值域、`/api/*` schema)— Nick/Mark 的 patch 直接依賴;要動先通知。目前契約 = §8 的 v2(per-person)。
 
-## 6. 本次(2026-07-07)已完成
+## 6. 已完成工作紀錄
 
+**2026-07-07**
 - review:9 finder 角度 × 2 diff → 45 項驗證(37 CONFIRMED / 3 PLAUSIBLE / 1 REFUTED)+ sweep 6 項;重點已全數抄錄於 §3/§4。
 - `master ca894f5`:`DanceMetricsEngine` 加 RLock 修 reset race(校準/apply 端點 vs stream worker),附 race regression test。
 - `research/stable-id-tracking 719cb65`:`PoseEngine` 換 active 舞者時 reset metrics/smoother + `choose_active` auto_largest 遲滯,附 tests;`f9767fb`:pythonosc 無 `close()` 的測試清理修正(master 亦同步修)。
-- 測試基準:master 69 綠 / branch 89 綠(各 1 skip)。
+
+**2026-07-08(branch)**
+- `c6d5024`:4 個 blocker 修復(YOLO 背景預載+失敗 latch、holding 不跑 pose、單人 overlay guard、ghost 框清理、dead state 移除)。
+- `f061fab`:**per-person OSC 輸出**(§8 新契約)— 每個 stable id 一台 DanceMetricsEngine + per-id smoothing/normalize 狀態 + per-id skeleton;send_skeleton 改為先全驗證再送。
+- 測試基準:master 69 綠 / branch **105 綠**(各 1 skip)。
 
 ## 7. 建議路線圖
 
 1. **master**:修 §3a 高優先 3 項(都是小改動)。「試音 stop 不自動套用」「開機強制 preset」先跟 Tommy 確認是否刻意,再決定修或加警示。
-2. **branch**:修 4 個 blocker → 實機相機驗證(多人、交錯遮擋、M1 效能)→ 跟 Tommy 確認 OSC 要不要 per-person 輸出(目前只送 active 一人;舊 feat/multi-person 是 per-slot 方案可參考)→ 合併 master。
-3. 清理:刪 `StableTrackSelector` 死碼、清 `pose_sources` dead state、skeletonJoints 改注入。
+2. **branch**:§3b 剩餘項 → 實機相機驗證(多人、交錯遮擋、M1 效能)→ **通知 Nick/Mark 新 OSC 契約(§8)** → 合併 master。
+3. 清理:刪 `StableTrackSelector` 死碼、skeletonJoints 改用 %PLACEHOLDER% 注入。
 4. **ai-motion repo**(另一個 repo):culture map 需因 H36M 對應修正重新匯出,morrisness 才會準。
+5. **Azure Kinect(演出後升級,Tommy 已表態有興趣)**:
+   - 為什麼:ToF/IR 深度**不怕暗場與投影光**(劇場最大痛點);真 3D 公厘座標(dance_metrics 的原生單位,比 MediaPipe 推估深度準);原生多人 body tracking(32 關節)可取代 YOLO 偵測層,深度分離比 RGB bbox 可靠。
+   - 接法:`PoseEngine` 的 pose source 介面就是現成接縫 — 寫一個 `AzureKinectPoseSource`(K4A body tracking → K4ABT-32 → H36M-17 對應表),沿用 `MultiPersonTrackRegistry` 在 body id 上做 re-ID,per-person 管線(§8)原樣可用。
+   - 主要工程:**取像路徑** — 目前 camera loop 綁死 `cv2.VideoCapture`,需加一層 frame-source 抽象讓 Kinect 自帶取像(這是最大塊的改動,pose source 本身反而簡單)。
+   - 限制:Body Tracking SDK 只有 Windows/Linux + GPU,**Mac 不能跑**(Nick/Mark 只收 OSC,不受影響);Azure Kinect DK 已停產 → 新購買 **Orbbec Femto Bolt**(官方合作、K4A 相容 SDK);NFOV 深度範圍約 0.5–3.9m(binned ~5.5m),動工前先量舞台深度。
+   - Python 端:`pyk4a` 或 `pykinect_azure`(sensor + body tracking 包裝)。
+
+## 8. OSC wire contract v2(2026-07-08 起,branch;合併後即為正式契約)
+
+**所有輸出一律帶舞者 id,無 active/非 active 之分**(Tommy 2026-07-08 拍板;舊單人通道已移除):
+
+- `/field/<id>/<metric>` — 例 `/field/1/energy 0.42`、`/field/2/jerk 0.13`;metric 縮寫同舊制(`sync_vel`、`sync_corr`)。
+- `/field/<id>/sk/<joint>` — 每關節 `[x, y, z]`(Skeleton 輸出開啟時,每個追蹤中的舞者都送)。
+- `/field/morrisness` — 維持全域(顯示中舞者的 CultureScore)。
+- id = stable id(1、2、3…,依入場順序;短暫遮擋後 re-id 沿用同號)。**Stable ID 關閉時單人固定 id=1**,接收端只需一套 schema。
+- 舞者被遮擋/離場 → 該 id **靜默**(不送 0);回場後同 id 繼續。
+- 校準 fixed ranges 全域套用(所有 id 同一組 range;per-dancer preset 需手動切換)。
+- **⚠️ 上場前必須通知 Nick(Max/MSP)與 Mark(TouchDesigner)改 patch**:舊的 `/field/energy` 等位址已不存在。
