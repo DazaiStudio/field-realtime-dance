@@ -1,5 +1,7 @@
 # Handoff - field-realtime-dance (2026-06-27)
 
+> **Maintainers / AI assistants: read [MAINTENANCE.md](MAINTENANCE.md) first** - current branch states, open issues from the 2026-07-07 review, deliberate design decisions, and code minefields. Parts of this file predate the 06/30-07/01 rehearsal tuning (e.g. RTMPose3D is no longer reachable from the viewer).
+
 Continuation notes for picking up development on another machine, including macOS.
 
 ## TL;DR
