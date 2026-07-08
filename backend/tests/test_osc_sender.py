@@ -34,17 +34,19 @@ def close_client(client):
 
 class TestAddresses(unittest.TestCase):
     def test_frozen_addresses(self):
+        # Wire contract since 2026-07: every metric is per-dancer,
+        # /<namespace>/<person id>/<metric>.
         sender = make_sender()
         expected = {
-            "energy": "/field/energy",
-            "sync_velocity": "/field/sync_vel",
-            "sync_correlation": "/field/sync_corr",
-            "expansion": "/field/expansion",
-            "curvature": "/field/curvature",
-            "height": "/field/height",
-            "sway": "/field/sway",
-            "torque": "/field/torque",
-            "jerk": "/field/jerk",
+            "energy": "/field/1/energy",
+            "sync_velocity": "/field/1/sync_vel",
+            "sync_correlation": "/field/1/sync_corr",
+            "expansion": "/field/1/expansion",
+            "curvature": "/field/1/curvature",
+            "height": "/field/1/height",
+            "sway": "/field/1/sway",
+            "torque": "/field/1/torque",
+            "jerk": "/field/1/jerk",
         }
         for name in METRIC_NAMES:
             self.assertEqual(sender.metric_address(name), expected[name])
@@ -54,7 +56,7 @@ class TestAddresses(unittest.TestCase):
         self.assertEqual(make_sender(namespace="/custom/").namespace, "/custom")
         empty = make_sender(namespace="")
         self.assertEqual(empty.namespace, "")
-        self.assertEqual(empty.metric_address("energy"), "/energy")
+        self.assertEqual(empty.metric_address("energy"), "/1/energy")
 
 
 class TestNormalize(unittest.TestCase):
@@ -160,8 +162,8 @@ class TestSendMetrics(unittest.TestCase):
 
         sent = sender.send_metrics({"energy": 2.5}, send_keys={"energy"})
         self.assertEqual({item["target"] for item in sent}, {"sound", "visuals"})
-        self.assertEqual(sent_by_target["sound"], [("/field/energy", 2.5)])
-        self.assertEqual(sent_by_target["visuals"], [("/field/energy", 2.5)])
+        self.assertEqual(sent_by_target["sound"], [("/field/1/energy", 2.5)])
+        self.assertEqual(sent_by_target["visuals"], [("/field/1/energy", 2.5)])
         self.assertNotIn("off", sent_by_target)
 
     def test_status_exposes_osc_targets(self):
@@ -175,6 +177,59 @@ class TestSendMetrics(unittest.TestCase):
         self.assertEqual(status["port"], 9000)
         self.assertEqual([target["id"] for target in status["targets"]], ["sound", "broadcast"])
         self.assertTrue(status["targets"][1]["broadcast"])
+
+
+class TestPerPersonOutput(unittest.TestCase):
+    """Every OSC message is addressed per dancer: /field/<id>/<metric>."""
+
+    def _capture_sender(self, **kwargs):
+        sender = make_sender(enabled=True, **kwargs)
+        messages = []
+
+        class FakeClient:
+            def send_message(self, address, value):
+                messages.append((address, value))
+
+        close_client(sender.targets[0].client)
+        sender.targets[0].client = FakeClient()
+        return sender, messages
+
+    def test_metric_address_includes_person_id(self):
+        sender = make_sender()
+        self.assertEqual(sender.metric_address("energy", 2), "/field/2/energy")
+        self.assertEqual(sender.metric_address("sync_correlation", 1), "/field/1/sync_corr")
+
+    def test_send_metrics_multi_sends_each_person_under_their_id(self):
+        sender, messages = self._capture_sender(mode="raw")
+        sender.send_metrics_multi(
+            {1: {"energy": 0.5}, 2: {"energy": 0.9}},
+            send_keys={"energy"},
+        )
+        self.assertIn(("/field/1/energy", 0.5), messages)
+        self.assertIn(("/field/2/energy", 0.9), messages)
+
+    def test_smoothing_state_is_independent_per_person(self):
+        sender = make_sender(mode="raw", alpha=0.5)
+        sender.send_metrics({"energy": 0.0}, person_id=1)
+        sender.send_metrics({"energy": 1.0}, person_id=1)
+        self.assertAlmostEqual(sender.last_prepared_by_id[1]["energy"], 0.5)
+        sender.send_metrics({"energy": 1.0}, person_id=2)
+        self.assertAlmostEqual(sender.last_prepared_by_id[2]["energy"], 1.0)
+
+    def test_departed_person_state_is_pruned(self):
+        sender = make_sender(mode="normalize", alpha=0.5)
+        sender.send_metrics_multi({1: {"energy": 5.0}, 2: {"energy": 3.0}})
+        self.assertIn(2, sender.last_prepared_by_id)
+        sender.send_metrics_multi({1: {"energy": 5.0}}, keep_ids={1})
+        self.assertNotIn(2, sender.last_prepared_by_id)
+        self.assertFalse(any(key[0] == 2 for key in sender._smoothed))
+        self.assertFalse(any(key[0] == 2 for key in sender._peaks))
+
+    def test_send_skeleton_addresses_include_person_id(self):
+        sender, messages = self._capture_sender(mode="raw")
+        skeleton = [[float(j), float(j) + 0.1, float(j) + 0.2] for j in range(17)]
+        sender.send_skeleton(skeleton, person_id=3)
+        self.assertEqual(messages[0], ("/field/3/sk/pelvis", [0.0, 0.1, 0.2]))
 
     def test_send_skeleton_outputs_joint_addresses(self):
         sender = make_sender(enabled=True, mode="raw")
@@ -191,9 +246,9 @@ class TestSendMetrics(unittest.TestCase):
         sender.send_skeleton(skeleton)
 
         self.assertEqual(len(sent), 17)
-        self.assertEqual(sent[0], ("/field/sk/pelvis", [0.0, 0.1, 0.2]))
-        self.assertEqual(sent[1], ("/field/sk/r/hip", [1.0, 1.1, 1.2]))
-        self.assertEqual(sent[-1], ("/field/sk/r/wrist", [16.0, 16.1, 16.2]))
+        self.assertEqual(sent[0], ("/field/1/sk/pelvis", [0.0, 0.1, 0.2]))
+        self.assertEqual(sent[1], ("/field/1/sk/r/hip", [1.0, 1.1, 1.2]))
+        self.assertEqual(sent[-1], ("/field/1/sk/r/wrist", [16.0, 16.1, 16.2]))
 
 
 if __name__ == "__main__":

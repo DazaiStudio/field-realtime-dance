@@ -126,6 +126,7 @@ processing_state = {
     "encode_ms": 0.0,
     "latest_metrics": {},
     "latest_raw_metrics": {},
+    "latest_raw_metrics_by_id": {},
     "latest_skeleton": None,
     "latest_timestamp_ms": None,
     "pose_valid": False,
@@ -328,11 +329,25 @@ def safe_download_stem(name: str, fallback: str = "profile") -> str:
     return (stem or fallback)[:120]
 
 
+def current_display_person_id() -> int:
+    """Stable id of the dancer the UI panels follow (active track, else 1)."""
+    tracking = processing_state.get("tracking") or {}
+    active = tracking.get("active_id")
+    try:
+        return int(active) if active is not None else 1
+    except (TypeError, ValueError):
+        return 1
+
+
 def refresh_prepared_metrics() -> None:
-    raw_metrics = processing_state.get("latest_raw_metrics") or {}
-    if raw_metrics:
-        osc_sender.send_metrics(raw_metrics, send_keys=set())
-        processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
+    by_id = processing_state.get("latest_raw_metrics_by_id") or {}
+    if not by_id:
+        raw_metrics = processing_state.get("latest_raw_metrics") or {}
+        by_id = {1: raw_metrics} if raw_metrics else {}
+    if by_id:
+        osc_sender.send_metrics_multi(by_id, send_keys=set())
+        prepared = osc_sender.last_prepared_by_id.get(current_display_person_id(), {})
+        processing_state["latest_metrics"] = filter_active_metrics(prepared)
 
 
 def reset_pose_metric_history() -> None:
@@ -635,10 +650,17 @@ def set_analysis_result(
     pose_quality: Optional[float] = None,
     skeleton=None,
     tracking: Optional[dict] = None,
+    metrics_by_id: Optional[dict] = None,
+    skeletons_by_id: Optional[dict] = None,
 ) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["latest_raw_metrics"] = metrics
+    if metrics_by_id is not None:
+        by_id = {int(pid): person for pid, person in metrics_by_id.items()}
+    else:
+        by_id = {1: metrics} if metrics else {}
+    processing_state["latest_raw_metrics_by_id"] = by_id
     if skeleton is not None:
         try:
             processing_state["latest_skeleton"] = [
@@ -659,17 +681,31 @@ def set_analysis_result(
     if elapsed > 0.25:
         processing_state["analysis_fps"] = processing_state["analysis_count"] / elapsed
     active = active_metric_set()
-    osc_sender.send_metrics(metrics, send_keys=active)
-    if source_state.get("osc_skeleton") and skeleton is not None:
-        osc_sender.send_skeleton(skeleton)
-    prepared_metrics = osc_sender.last_prepared_metrics
+    # Protect briefly-occluded (holding) dancers' smoothing state from pruning.
+    keep_ids = None
+    track_list = (tracking or {}).get("tracks")
+    if isinstance(track_list, list):
+        keep_ids = {
+            int(track["stable_id"])
+            for track in track_list
+            if isinstance(track, dict) and track.get("state") != "lost" and track.get("stable_id") is not None
+        }
+    osc_sender.send_metrics_multi(by_id, send_keys=active, keep_ids=keep_ids)
+    if source_state.get("osc_skeleton"):
+        sk_by_id = skeletons_by_id if skeletons_by_id is not None else (
+            {1: skeleton} if skeleton is not None else {}
+        )
+        for pid in sorted(sk_by_id):
+            if sk_by_id[pid] is not None:
+                osc_sender.send_skeleton(sk_by_id[pid], person_id=pid)
+    prepared_metrics = osc_sender.last_prepared_by_id.get(current_display_person_id(), {})
     if calibration_state["active"] and calibration_countdown_remaining() <= 0.0:
         if pose_valid and has_usable_calibration_metrics(prepared_metrics):
             calibration_collector.add(prepared_metrics)
             calibration_state["sample_count"] = calibration_collector.count()
         elif not pose_valid:
             calibration_state["skipped_frames"] = int(calibration_state.get("skipped_frames") or 0) + 1
-    processing_state["latest_metrics"] = filter_active_metrics(osc_sender.last_prepared_metrics)
+    processing_state["latest_metrics"] = filter_active_metrics(prepared_metrics)
     if culture_score is not None:
         # All-zero metrics mean "no pose detected"; keep the previous score
         # instead of letting zeros drag the rolling average around.
@@ -793,6 +829,8 @@ async def stream_live():
                         pose_quality=getattr(engine, "last_pose_quality", 0.0),
                         skeleton=getattr(engine, "last_skeleton_h36m", None),
                         tracking=getattr(engine, "last_tracking", None),
+                        metrics_by_id=getattr(engine, "last_metrics_by_id", None),
+                        skeletons_by_id=getattr(engine, "last_skeletons_by_id", None),
                     )
                     next_analysis_at = now + analysis_interval
                 elif source_state.get("overlay_enabled", True):
@@ -930,6 +968,8 @@ async def stream_video():
                     pose_quality=getattr(engine, "last_pose_quality", 0.0),
                     skeleton=getattr(engine, "last_skeleton_h36m", None),
                     tracking=getattr(engine, "last_tracking", None),
+                    metrics_by_id=getattr(engine, "last_metrics_by_id", None),
+                    skeletons_by_id=getattr(engine, "last_skeletons_by_id", None),
                 )
                 next_analysis_at = now + analysis_interval
             elif source_state.get("overlay_enabled", True):
@@ -1343,6 +1383,7 @@ async def apply_input(
     processing_state["encode_ms"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_raw_metrics"] = {}
+    processing_state["latest_raw_metrics_by_id"] = {}
     processing_state["latest_skeleton"] = None
     processing_state["latest_timestamp_ms"] = None
     processing_state["pose_valid"] = False
@@ -3387,14 +3428,19 @@ VIEWER_HTML = """
       return value;
     }
 
-    function metricAddress(prefix, name) {
-      const leaf = oscAddressNames[name] || name;
-      return prefix ? `${prefix}/${leaf}` : `/${leaf}`;
+    function displayPersonId(payload = lastPayload) {
+      const id = payload?.processing?.tracking?.active_id;
+      return (id === null || id === undefined) ? 1 : id;
     }
 
-    function skeletonAddress(prefix, joint) {
+    function metricAddress(prefix, name, personId) {
+      const leaf = oscAddressNames[name] || name;
+      return `${prefix || ''}/${personId}/${leaf}`;
+    }
+
+    function skeletonAddress(prefix, joint, personId) {
       const path = joint?.path || 'sk';
-      return prefix ? `${prefix}/${path}` : `/${path}`;
+      return `${prefix || ''}/${personId}/${path}`;
     }
 
     function setOutputTab(tab) {
@@ -3411,13 +3457,14 @@ VIEWER_HTML = """
       const metrics = payload?.processing?.latest_metrics || {};
       const active = new Set(payload?.source?.osc_metrics || metricNames);
       const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
+      const personId = displayPersonId(payload);
       const container = document.getElementById('addresses');
       container.innerHTML = '';
       for (const name of orderedMetricNames(active)) {
         if (!active.has(name)) continue;
         const row = document.createElement('div');
         const value = Number(metrics[name] ?? 0);
-        row.textContent = `${metricAddress(prefix, name)}  ${formatMetric(value)}`;
+        row.textContent = `${metricAddress(prefix, name, personId)}  ${formatMetric(value)}`;
         container.appendChild(row);
       }
       updateSkeletonValues(payload);
@@ -3425,11 +3472,12 @@ VIEWER_HTML = """
 
     function updateSkeletonValues(payload = lastPayload) {
       const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
+      const personId = displayPersonId(payload);
       const skeleton = payload?.processing?.latest_skeleton;
       const container = document.getElementById('skeletonValues');
       container.innerHTML = '';
       const header = document.createElement('div');
-      header.textContent = `${prefix || ''}/sk/*  ${payload?.source?.osc_skeleton ? 'OSC on' : 'OSC off'}`;
+      header.textContent = `${prefix || ''}/${personId}/sk/*  ${payload?.source?.osc_skeleton ? 'OSC on' : 'OSC off'}`;
       container.appendChild(header);
       if (!Array.isArray(skeleton) || skeleton.length !== skeletonJoints.length) {
         const empty = document.createElement('div');
@@ -3444,7 +3492,7 @@ VIEWER_HTML = """
         const x = Number(point?.[0] ?? 0);
         const y = Number(point?.[1] ?? 0);
         const z = Number(point?.[2] ?? 0);
-        row.innerHTML = `<span>${index}</span><span>${skeletonAddress(prefix, skeletonJoints[index])}</span><span>x ${formatMetric(x)}</span><span>y ${formatMetric(y)}</span><span>z ${formatMetric(z)}</span>`;
+        row.innerHTML = `<span>${index}</span><span>${skeletonAddress(prefix, skeletonJoints[index], personId)}</span><span>x ${formatMetric(x)}</span><span>y ${formatMetric(y)}</span><span>z ${formatMetric(z)}</span>`;
         container.appendChild(row);
       });
     }

@@ -222,7 +222,9 @@ class TestViewerCalibrationFlow(unittest.TestCase):
         sent = []
         try:
             osc_viewer.source_state["osc_skeleton"] = True
-            osc_viewer.osc_sender.send_skeleton = lambda skeleton: sent.append(skeleton)
+            osc_viewer.osc_sender.send_skeleton = (
+                lambda skeleton, person_id=1: sent.append((person_id, skeleton))
+            )
             frame = {name: 1.0 for name in osc_viewer.METRIC_NAMES}
             skeleton = [[float(i), float(i + 1), float(i + 2)] for i in range(17)]
 

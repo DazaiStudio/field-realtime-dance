@@ -34,6 +34,12 @@ class PoseEngine:
         self.last_skeleton_h36m = None
         self.last_tracking = {"enabled": False, "state": "disabled", "count": 0}
         self._metrics_person_id = None
+        # Per-dancer pipelines (stable id -> engine/smoother): each tracked
+        # person gets an independent metrics stream for /field/<id>/<metric>.
+        self._metric_engines = {}
+        self._person_smoothers = {}
+        self.last_metrics_by_id = {}
+        self.last_skeletons_by_id = {}
         self.source = self._make_source(self.backend_name)
 
     # --- source / backend management ---------------------------------------
@@ -97,10 +103,16 @@ class PoseEngine:
 
     def set_metrics_fps(self, fps):
         self.metrics_engine.set_fps(fps)
+        for engine in self._metric_engines.values():
+            engine.set_fps(fps)
 
     def reset_metrics(self):
         self.metrics_engine.reset()
         self.smoother.reset()
+        self._metric_engines.clear()
+        self._person_smoothers.clear()
+        self.last_metrics_by_id = {}
+        self.last_skeletons_by_id = {}
 
     def reset_tracking(self):
         if hasattr(self.source, "reset_tracking"):
@@ -118,6 +130,11 @@ class PoseEngine:
         self.last_pose_valid = False
         self.last_skeleton_h36m = None
         self.last_tracking = getattr(self.source, "last_tracking", {"enabled": False, "state": "disabled", "count": 0})
+
+        poses_by_id = getattr(self.source, "last_h36m_by_id", None)
+        if self.tracking_enabled and isinstance(poses_by_id, dict):
+            return frame, self._process_tracked(poses_by_id, timestamp_ms)
+
         if pose_complete:
             self.last_pose_quality = self._clamp_quality(getattr(self.source, "last_pose_quality", 1.0))
             self.last_pose_valid = bool(getattr(self.source, "last_pose_valid", True))
@@ -132,7 +149,67 @@ class PoseEngine:
                 h36m = self.smoother.filter(h36m, timestamp_ms)
             self.last_skeleton_h36m = np.asarray(h36m, dtype=float).copy()
             metrics = self.metrics_engine.update(h36m)
+            # Single-person output rides the same per-id OSC schema as id 1.
+            self.last_metrics_by_id = {1: metrics}
+            self.last_skeletons_by_id = {1: self.last_skeleton_h36m}
+        else:
+            self.last_metrics_by_id = {}
+            self.last_skeletons_by_id = {}
         return frame, metrics
+
+    def _process_tracked(self, poses_by_id, timestamp_ms):
+        """Per-dancer pipelines: each stable id feeds its own metrics engine,
+        so no stream ever mixes two bodies' motion."""
+        active_id = self.last_tracking.get("active_id") if isinstance(self.last_tracking, dict) else None
+        keep_ids = self._registry_person_ids()
+        if keep_ids is not None:
+            for pid in [pid for pid in self._metric_engines if pid not in keep_ids]:
+                self._metric_engines.pop(pid, None)
+                self._person_smoothers.pop(pid, None)
+
+        metrics_by_id = {}
+        skeletons_by_id = {}
+        for pid in sorted(poses_by_id):
+            pose = poses_by_id[pid]
+            if not self._pose_is_complete(pose):
+                continue
+            engine = self._metric_engines.get(pid)
+            if engine is None:
+                engine = DanceMetricsEngine(fps=30)
+                engine.set_fps(self.metrics_engine.fps)
+                self._metric_engines[pid] = engine
+            arr = np.asarray(pose, dtype=float)
+            if self.smoothing_enabled:
+                smoother = self._person_smoothers.get(pid)
+                if smoother is None:
+                    smoother = JointSmoother(
+                        min_cutoff=self.smoother.min_cutoff, beta=self.smoother.beta
+                    )
+                    self._person_smoothers[pid] = smoother
+                arr = smoother.filter(arr, timestamp_ms)
+            skeletons_by_id[pid] = np.asarray(arr, dtype=float).copy()
+            metrics_by_id[pid] = engine.update(arr)
+
+        self.last_metrics_by_id = metrics_by_id
+        self.last_skeletons_by_id = skeletons_by_id
+        self.last_pose_quality = self._clamp_quality(getattr(self.source, "last_pose_quality", 0.0))
+        self.last_pose_valid = bool(getattr(self.source, "last_pose_valid", False))
+        display = metrics_by_id.get(active_id) if active_id is not None else None
+        self.last_skeleton_h36m = skeletons_by_id.get(active_id) if active_id is not None else None
+        return display if display is not None else self.metrics_engine.get_empty_metrics()
+
+    def _registry_person_ids(self):
+        tracks = self.last_tracking.get("tracks") if isinstance(self.last_tracking, dict) else None
+        if not isinstance(tracks, list):
+            return None
+        ids = set()
+        for track in tracks:
+            if not isinstance(track, dict) or track.get("state") == "lost":
+                continue
+            stable_id = track.get("stable_id")
+            if stable_id is not None:
+                ids.add(int(stable_id))
+        return ids
 
     @staticmethod
     def _pose_is_complete(h36m) -> bool:

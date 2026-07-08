@@ -127,16 +127,20 @@ class OSCSender:
                 enabled=True,
             )
         ]
-        self._smoothed: Dict[str, float] = {}
+        # Runtime state is keyed by (person_id, metric): every dancer gets an
+        # independent smoothing/normalization stream under /<ns>/<id>/<metric>.
+        self._smoothed: Dict[tuple, float] = {}
         # Per-metric output smoothing override; falls back to self.alpha (the
         # global slider) for any metric without its own value. 1.0 = off.
         self.metric_alphas: Dict[str, float] = {}
         # Calibrated fixed [lo, hi] ranges per metric, used by mode "fixed"
-        # (comparable across time + bounded + personalised). Empty = none yet.
+        # (comparable across time + bounded + personalised). Shared across
+        # dancers: one venue calibration applies to every person id.
         self.metric_ranges: Dict[str, tuple] = {}
-        self._peaks: Dict[str, float] = {}
-        self._ranges: Dict[str, tuple] = {}
+        self._peaks: Dict[tuple, float] = {}
+        self._ranges: Dict[tuple, tuple] = {}
         self.last_prepared_metrics: Dict[str, float] = {}
+        self.last_prepared_by_id: Dict[int, Dict[str, float]] = {}
         self.last_sent_at: Optional[float] = None
 
     def configure(
@@ -221,6 +225,17 @@ class OSCSender:
         self._peaks.clear()
         self._ranges.clear()
         self.last_prepared_metrics.clear()
+        self.last_prepared_by_id.clear()
+
+    def prune_person_state(self, keep_ids) -> None:
+        """Drop smoothing/normalization state for dancers no longer tracked so
+        the per-person dictionaries stay bounded."""
+        keep = {int(pid) for pid in keep_ids}
+        for state in (self._smoothed, self._peaks, self._ranges):
+            for key in [key for key in state if key[0] not in keep]:
+                del state[key]
+        for pid in [pid for pid in self.last_prepared_by_id if pid not in keep]:
+            del self.last_prepared_by_id[pid]
 
     def close(self) -> None:
         for target in self.targets:
@@ -246,30 +261,56 @@ class OSCSender:
             "last_sent_at": self.last_sent_at,
         }
 
-    def send_metrics(self, metrics: Mapping[str, float], send_keys: Optional[set[str]] = None) -> list[dict]:
+    def send_metrics(
+        self,
+        metrics: Mapping[str, float],
+        send_keys: Optional[set[str]] = None,
+        person_id: int = 1,
+    ) -> list[dict]:
         sent = []
-        self.last_prepared_metrics = {}
+        person_id = int(person_id)
+        prepared: Dict[str, float] = {}
 
         for key in METRIC_NAMES:
             if key not in metrics:
                 continue
-            value = self._prepare_value(key, metrics[key])
+            value = self._prepare_value(key, metrics[key], person_id)
             if value is None:
                 continue
-            self.last_prepared_metrics[key] = value
+            prepared[key] = value
             if send_keys is not None and key not in send_keys:
                 continue
             if not self.enabled:
                 continue
-            address = self.metric_address(key)
+            address = self.metric_address(key, person_id)
             for target_id in self._send_message(address, value):
                 sent.append({"address": address, "value": value, "target": target_id})
 
+        self.last_prepared_metrics = prepared
+        self.last_prepared_by_id[person_id] = prepared
         if sent:
             self.last_sent_at = time.time()
         return sent
 
-    def _prepare_value(self, key: str, value: object) -> Optional[float]:
+    def send_metrics_multi(
+        self,
+        metrics_by_id: Mapping[int, Mapping[str, float]],
+        send_keys: Optional[set[str]] = None,
+        keep_ids=None,
+    ) -> list[dict]:
+        """Send every dancer's metrics under /<ns>/<id>/<metric>. keep_ids
+        (e.g. all non-lost track ids) protects briefly-occluded dancers' state
+        from pruning; defaults to the ids present in metrics_by_id."""
+        sent = []
+        current_ids = set()
+        for pid in sorted(metrics_by_id):
+            current_ids.add(int(pid))
+            sent.extend(self.send_metrics(metrics_by_id[pid], send_keys=send_keys, person_id=pid))
+        keep = current_ids if keep_ids is None else current_ids | {int(pid) for pid in keep_ids}
+        self.prune_person_state(keep)
+        return sent
+
+    def _prepare_value(self, key: str, value: object, person_id: int = 1) -> Optional[float]:
         try:
             numeric = float(value)
         except (TypeError, ValueError):
@@ -280,14 +321,14 @@ class OSCSender:
 
         # Keep calibration and runtime on the same signal path: Smoothness
         # first, then apply fixed/profile normalization to that smoothed value.
-        numeric = self._smooth(key, numeric)
+        numeric = self._smooth(key, numeric, person_id)
 
         if self.mode in ("normalize", "fixed"):
-            numeric = self._normalize(key, numeric)
+            numeric = self._normalize(key, numeric, person_id)
 
         return numeric
 
-    def _normalize(self, key: str, value: float) -> float:
+    def _normalize(self, key: str, value: float, person_id: int = 1) -> float:
         if key == "sync_correlation":
             return _clamp(value, -1.0, 1.0)
         if key in BOUNDED_METRICS:
@@ -310,39 +351,42 @@ class OSCSender:
                 normalized = normalized ** gamma
             return normalized
         if key in ADAPTIVE_RANGE_METRICS:
-            return self._normalize_range(key, value)
+            return self._normalize_range(key, value, person_id)
         if key in UNBOUNDED_METRICS:
-            current_peak = self._peaks.get(key, 1e-6)
+            state_key = (person_id, key)
+            current_peak = self._peaks.get(state_key, 1e-6)
             decayed_peak = current_peak * 0.995
             peak = max(decayed_peak, abs(value), 1e-6)
-            self._peaks[key] = peak
+            self._peaks[state_key] = peak
             return _clamp(value / peak)
         return value
 
-    def _normalize_range(self, key: str, value: float) -> float:
-        lo, hi = self._ranges.get(key, (value, value))
+    def _normalize_range(self, key: str, value: float, person_id: int = 1) -> float:
+        state_key = (person_id, key)
+        lo, hi = self._ranges.get(state_key, (value, value))
         span = hi - lo
         lo = min(lo + span * RANGE_DECAY, value)
         hi = max(hi - span * RANGE_DECAY, value)
-        self._ranges[key] = (lo, hi)
+        self._ranges[state_key] = (lo, hi)
         span = hi - lo
         if span < 1e-9:
             return 0.5
         return _clamp((value - lo) / span)
 
-    def _smooth(self, key: str, value: float) -> float:
+    def _smooth(self, key: str, value: float, person_id: int = 1) -> float:
+        state_key = (person_id, key)
         alpha = self.metric_alphas.get(key, self.alpha)
         if alpha >= 1.0:
-            self._smoothed[key] = value
+            self._smoothed[state_key] = value
             return value
 
-        previous = self._smoothed.get(key)
+        previous = self._smoothed.get(state_key)
         if previous is None:
             smoothed = value
         else:
             smoothed = (alpha * value) + ((1.0 - alpha) * previous)
 
-        self._smoothed[key] = smoothed
+        self._smoothed[state_key] = smoothed
         return smoothed
 
     def set_metric_alpha(self, name: str, alpha: float) -> None:
@@ -386,8 +430,10 @@ class OSCSender:
         if self._send_message(self._address(name), float(value)):
             self.last_sent_at = time.time()
 
-    def send_skeleton(self, points) -> None:
-        """Send H36M-17 skeleton coordinates, one OSC Vector3-like message per joint."""
+    def send_skeleton(self, points, person_id: int = 1) -> None:
+        """Send H36M-17 skeleton coordinates, one OSC Vector3-like message per
+        joint, under /<ns>/<id>/sk/<joint>. Validates all joints up front so a
+        bad frame is dropped whole instead of sent torn."""
         if not self.enabled:
             return
         try:
@@ -396,22 +442,24 @@ class OSCSender:
             return
         if len(coords) != len(SKELETON_ADDRESS_NAMES):
             return
-        sent = False
-        for name, xyz in zip(SKELETON_ADDRESS_NAMES, coords):
+        for xyz in coords:
             if len(xyz) != 3 or not all(math.isfinite(v) for v in xyz):
                 return
-            if self._send_message(self._address(name), xyz):
+        sent = False
+        for name, xyz in zip(SKELETON_ADDRESS_NAMES, coords):
+            if self._send_message(self._address(name, person_id), xyz):
                 sent = True
         if sent:
             self.last_sent_at = time.time()
 
-    def metric_address(self, key: str) -> str:
-        return self._address(OSC_ADDRESS_NAMES.get(key, key))
+    def metric_address(self, key: str, person_id: int = 1) -> str:
+        return self._address(OSC_ADDRESS_NAMES.get(key, key), person_id)
 
-    def _address(self, name: str) -> str:
-        if not self.namespace:
-            return f"/{name}"
-        return f"{self.namespace}/{name}"
+    def _address(self, name: str, person_id: Optional[int] = None) -> str:
+        base = self.namespace if self.namespace else ""
+        if person_id is None:
+            return f"{base}/{name}"
+        return f"{base}/{int(person_id)}/{name}"
 
     @staticmethod
     def _validate_mode(mode: str) -> str:
