@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -86,6 +88,57 @@ class TestDanceMetricsStability(unittest.TestCase):
         self.assertEqual(engine.positions_history, [])
         self.assertEqual(engine.omega_l_history, [])
         self.assertEqual(getattr(engine, "omega_history", []), [])
+
+
+class TestConcurrentReset(unittest.TestCase):
+    """reset() is called from the FastAPI event loop (calibration start/stop/
+    apply/clear, /api/apply) while update() may be mid-flight in the
+    asyncio.to_thread worker. If reset() clears positions_history between
+    update()'s length check and _calculate_energy's indexing, the worker
+    raises IndexError and the live stream dies."""
+
+    def test_reset_during_update_does_not_crash(self):
+        engine = DanceMetricsEngine(fps=30)
+        engine.update(_pose(pelvis_y=900.0))
+        engine.update(_pose(pelvis_y=920.0))
+
+        reset_started = threading.Event()
+        reset_finished = threading.Event()
+
+        def concurrent_reset():
+            reset_started.set()
+            engine.reset()
+            reset_finished.set()
+
+        class LenTriggeredList(list):
+            """Fires a concurrent reset() at the len() call inside
+            _calculate_energy (the 3rd len() of an update pass), simulating
+            the worst-case event-loop/worker interleaving."""
+
+            calls = 0
+            armed = True
+
+            def __len__(self):
+                n = list.__len__(self)
+                cls = LenTriggeredList
+                if cls.armed:
+                    cls.calls += 1
+                    if cls.calls == 3:
+                        cls.armed = False
+                        threading.Thread(target=concurrent_reset).start()
+                        reset_started.wait(timeout=1.0)
+                        time.sleep(0.15)  # window for reset() to interleave
+                return n
+
+        engine.positions_history = LenTriggeredList(engine.positions_history)
+
+        try:
+            metrics = engine.update(_pose(pelvis_y=940.0))
+        except Exception as exc:
+            self.fail(f"update() crashed when reset() ran concurrently: {exc!r}")
+
+        self.assertTrue(reset_finished.wait(timeout=1.0))
+        self.assertIn("energy", metrics)
 
 
 if __name__ == "__main__":
