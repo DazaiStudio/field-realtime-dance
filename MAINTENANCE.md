@@ -111,6 +111,7 @@
 3. 清理:刪 `StableTrackSelector` 死碼、skeletonJoints 改用 %PLACEHOLDER% 注入。
 4. **ai-motion repo**(另一個 repo):culture map 需因 H36M 對應修正重新匯出,morrisness 才會準。
 5. **Azure Kinect(演出後升級,Tommy 已表態有興趣)**:
+   - **狀態:已實作於 `feat/kinect-pose-source`(2026-07-30),實機 smoke 通過(30fps、多視圖、mirror、OSC);用法/env 見 `HANDOFF.md` "Azure Kinect backend"。設計 spec 與實作計畫在 `docs/superpowers/`。**
    - 為什麼:ToF/IR 深度**不怕暗場與投影光**(劇場最大痛點);真 3D 公厘座標(dance_metrics 的原生單位,比 MediaPipe 推估深度準);原生多人 body tracking(32 關節)可取代 YOLO 偵測層,深度分離比 RGB bbox 可靠。
    - 接法:`PoseEngine` 的 pose source 介面就是現成接縫 — 寫一個 `AzureKinectPoseSource`(K4A body tracking → K4ABT-32 → H36M-17 對應表),沿用 `MultiPersonTrackRegistry` 在 body id 上做 re-ID,per-person 管線(§8)原樣可用。
    - 主要工程:**取像路徑** — 目前 camera loop 綁死 `cv2.VideoCapture`,需加一層 frame-source 抽象讓 Kinect 自帶取像(這是最大塊的改動,pose source 本身反而簡單)。

@@ -35,8 +35,18 @@ height, sway, torque, jerk
 |---|---|---|
 | MediaPipe (default) | Windows / macOS / Linux, CPU or any GPU | Cross-platform pseudo-3D path. Use this on the Mac. No extra deps. |
 | RTMPose3D (hidden from rehearsal UI) | NVIDIA GPU for real-time | Cleaner monocular 3D via rtmlib RTMW3D-x/ONNX. Needs `rtmlib`, `onnxruntime-gpu`, CUDA 12, cuDNN 9. Code remains available, but the viewer exposes MediaPipe only for field use. |
+| Azure Kinect (auto-shown when available) | Windows only, GPU (DirectML) | True depth 3D in mm + native multi-person body tracking; works in the dark (ToF/IR). Appears in the backend dropdown only when the SDKs + `pykinect_azure` are installed. |
 
 RTMPose3D is fully optional and lazy-imported. The rehearsal UI intentionally hides it.
+
+### Azure Kinect backend (2026-07-30, branch feat/kinect-pose-source)
+
+- Requirements (Windows only): Azure Kinect Sensor SDK v1.4.2 + Body Tracking SDK 1.1.2 installed to their default `C:\Program Files` locations, plus `pip install pykinect_azure`.
+- Env vars: `FIELD_KINECT_GPU` = DirectML adapter index (default `1` for the dual-GPU dev laptop where 0 is the iGPU at ~6 fps; set `0` on single-GPU machines), `FIELD_KINECT_MODEL` = `full` (default) | `lite`.
+- The Kinect brings its own capture: the camera dropdown and `/preview_stream` are ignored for this backend, and the Kinect's RGB camera must not be opened as a UVC webcam at the same time.
+- "Kinect view" dropdown (visible only for this backend): Color, or colorized Depth (16:9 letterboxed) for dark-stage work.
+- Stable ID uses the same `MultiPersonTrackRegistry`; K4ABT body ids are raw ids only (they change after occlusion). OSC contract v2 (`/field/<id>/<metric>`) is unchanged.
+- Depth range NFOV ~0.5-3.9 m; measure the stage before relying on it.
 
 ## File Map
 
