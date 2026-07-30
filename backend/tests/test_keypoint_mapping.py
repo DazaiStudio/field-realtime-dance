@@ -3,7 +3,12 @@ from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from keypoint_mapping import mp33_to_h36m17, coco17_to_h36m17_3d
+from keypoint_mapping import (
+    coco17_to_h36m17_3d,
+    k4abt32_to_h36m17,
+    mirror_h36m17,
+    mp33_to_h36m17,
+)
 
 
 class _LM:
@@ -67,6 +72,69 @@ class TestCoco3D(unittest.TestCase):
         np.testing.assert_allclose(out[8], thorax)
         np.testing.assert_allclose(out[7], (pelvis + thorax) / 2)
         np.testing.assert_allclose(out[9], (thorax + c[0]) / 2)
+
+
+def _k4abt_body():
+    """Synthetic 32-joint body, mm, depth-camera coords (y down)."""
+    j = np.zeros((32, 3))
+    j[18] = [-100, 0, 1000]    # HIP_LEFT
+    j[22] = [100, 0, 1000]     # HIP_RIGHT
+    j[19] = [-110, 400, 1000]  # KNEE_LEFT
+    j[23] = [110, 400, 1000]   # KNEE_RIGHT
+    j[20] = [-120, 800, 1000]  # ANKLE_LEFT
+    j[24] = [120, 800, 1000]   # ANKLE_RIGHT
+    j[5] = [-180, -500, 1000]  # SHOULDER_LEFT
+    j[12] = [180, -500, 1000]  # SHOULDER_RIGHT
+    j[6] = [-200, -250, 1000]  # ELBOW_LEFT
+    j[13] = [200, -250, 1000]  # ELBOW_RIGHT
+    j[7] = [-210, 0, 1000]     # WRIST_LEFT
+    j[14] = [210, 0, 1000]     # WRIST_RIGHT
+    j[27] = [0, -700, 1000]    # NOSE
+    return j
+
+
+class K4abtMappingTests(unittest.TestCase):
+    def test_shape_and_root_centering(self):
+        h = k4abt32_to_h36m17(_k4abt_body())
+        self.assertEqual(h.shape, (17, 3))
+        # pelvis = hip midpoint, root-centered at origin
+        np.testing.assert_allclose(h[0], [0, 0, 0], atol=1e-9)
+
+    def test_joint_assignment(self):
+        h = k4abt32_to_h36m17(_k4abt_body())
+        np.testing.assert_allclose(h[3], [120, 800, 0])    # r_ankle (z centered)
+        np.testing.assert_allclose(h[6], [-120, 800, 0])   # l_ankle
+        np.testing.assert_allclose(h[13], [-210, 0, 0])    # l_wrist
+        np.testing.assert_allclose(h[16], [210, 0, 0])     # r_wrist
+        np.testing.assert_allclose(h[10], [0, -700, 0])    # head=nose
+
+    def test_derived_joints(self):
+        h = k4abt32_to_h36m17(_k4abt_body())
+        np.testing.assert_allclose(h[8], [0, -500, 0])     # thorax = mid-shoulders
+        np.testing.assert_allclose(h[7], [0, -250, 0])     # spine = mid(pelvis, thorax)
+        np.testing.assert_allclose(h[9], [0, -600, 0])     # neck = mid(thorax, nose)
+
+    def test_accepts_extra_columns(self):
+        j = np.zeros((32, 8))
+        j[:, :3] = _k4abt_body()
+        h = k4abt32_to_h36m17(j)
+        np.testing.assert_allclose(h[3], [120, 800, 0])
+
+
+class MirrorH36MTests(unittest.TestCase):
+    def test_involution(self):
+        h = k4abt32_to_h36m17(_k4abt_body())
+        np.testing.assert_allclose(mirror_h36m17(mirror_h36m17(h)), h, atol=1e-9)
+
+    def test_swaps_sides_and_negates_x(self):
+        h = k4abt32_to_h36m17(_k4abt_body())
+        m = mirror_h36m17(h)
+        # r_ankle slot now carries the mirrored left ankle: x -(-120) = +120
+        np.testing.assert_allclose(m[3], [120, 800, 0])
+        np.testing.assert_allclose(m[6], [-120, 800, 0])
+        np.testing.assert_allclose(m[13], [-210, 0, 0])
+        # midline joints: x negated only (x=0 here, so unchanged)
+        np.testing.assert_allclose(m[10], [0, -700, 0])
 
 
 if __name__ == "__main__":

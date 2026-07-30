@@ -63,6 +63,49 @@ def mp33_to_h36m17(world_landmarks, scale: float = 1000.0) -> np.ndarray:
     )
 
 
+# --- Azure Kinect Body Tracking (K4ABT) 32-joint indices ---
+_K4_L_SH, _K4_L_EL, _K4_L_WR = 5, 6, 7
+_K4_R_SH, _K4_R_EL, _K4_R_WR = 12, 13, 14
+_K4_L_HIP, _K4_L_KNEE, _K4_L_ANK = 18, 19, 20
+_K4_R_HIP, _K4_R_KNEE, _K4_R_ANK = 22, 23, 24
+_K4_NOSE = 27
+
+# H36M index pairs to swap when mirroring (right limb <-> left limb).
+_H36M_MIRROR_SWAP = [(1, 4), (2, 5), (3, 6), (11, 14), (12, 15), (13, 16)]
+
+
+def k4abt32_to_h36m17(joints: np.ndarray) -> np.ndarray:
+    """K4ABT 32-joint skeleton (mm, depth-camera coords) -> standard H36M-17,
+    root-centered on the hip midpoint. Accepts (32, 3+) arrays (extra columns
+    such as orientation/confidence are ignored). Same conventions as the other
+    mappings: pelvis = hip midpoint, head = nose, spine/thorax/neck derived."""
+    j = np.asarray(joints, dtype=float)[:, :3]
+
+    def p(i):
+        return j[i]
+
+    h36m = _assemble_h36m17(
+        pelvis=(p(_K4_L_HIP) + p(_K4_R_HIP)) / 2.0,
+        r_hip=p(_K4_R_HIP), r_knee=p(_K4_R_KNEE), r_ank=p(_K4_R_ANK),
+        l_hip=p(_K4_L_HIP), l_knee=p(_K4_L_KNEE), l_ank=p(_K4_L_ANK),
+        l_sh=p(_K4_L_SH), l_el=p(_K4_L_EL), l_wr=p(_K4_L_WR),
+        r_sh=p(_K4_R_SH), r_el=p(_K4_R_EL), r_wr=p(_K4_R_WR),
+        nose=p(_K4_NOSE),
+    )
+    return h36m - h36m[0]
+
+
+def mirror_h36m17(h36m: np.ndarray) -> np.ndarray:
+    """Mirror a standard H36M-17 skeleton: negate x and swap left/right limbs.
+    Matches what the camera mirror does to the displayed image, so mirrored
+    frames and skeleton data stay consistent."""
+    out = np.asarray(h36m, dtype=float).copy()
+    out[:, 0] = -out[:, 0]
+    for a, b in _H36M_MIRROR_SWAP:
+        out[[a, b]] = out[[b, a]]
+    return out
+
+
 def coco17_to_h36m17_3d(kpts: np.ndarray) -> np.ndarray:
     """COCO-17 body keypoints WITH z (3D) -> standard H36M-17 (z preserved).
     Used by the rtmpose3d source: RTMW3D returns 133 keypoints whose first 17
