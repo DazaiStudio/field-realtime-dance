@@ -11,7 +11,7 @@ import numpy as np
 from dance_metrics import DanceMetricsEngine
 from one_euro import JointSmoother
 
-VALID_BACKENDS = ("mediapipe", "rtmpose3d")
+VALID_BACKENDS = ("mediapipe", "rtmpose3d", "azure_kinect")
 
 
 class PoseEngine:
@@ -44,6 +44,19 @@ class PoseEngine:
 
     # --- source / backend management ---------------------------------------
     def _make_source(self, backend: str):
+        if backend == "azure_kinect":
+            try:
+                from pose_backends.azure_kinect import AzureKinectPoseSource, get_runtime
+                return AzureKinectPoseSource(
+                    get_runtime(),
+                    tracking_enabled=self.tracking_enabled,
+                    tracking_selection=self.tracking_selection,
+                )
+            except Exception as exc:
+                # pykinect/SDK missing -> degrade to MediaPipe, same pattern as
+                # the rtmpose3d fallback below.
+                print(f"[PoseEngine] Azure Kinect unavailable ({exc}); falling back to MediaPipe.")
+                self.backend_name = "mediapipe"
         if backend == "rtmpose3d":
             try:
                 from pose_sources import RTMPose3DPoseSource

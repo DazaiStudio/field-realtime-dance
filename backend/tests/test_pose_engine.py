@@ -7,7 +7,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pose_engine import PoseEngine  # noqa: E402
+from pose_engine import PoseEngine, VALID_BACKENDS  # noqa: E402
 
 
 class FakeSource:
@@ -120,6 +120,11 @@ class TestPerPersonMetrics(unittest.TestCase):
         engine = _make_engine(source)
         engine.process_frame(None, 0)
         self.assertEqual(set(engine.last_metrics_by_id), {1})
+
+
+class KinectBackendRegistrationTests(unittest.TestCase):
+    def test_azure_kinect_is_a_valid_backend(self):
+        self.assertIn("azure_kinect", VALID_BACKENDS)
 
 
 if __name__ == "__main__":
