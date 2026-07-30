@@ -79,5 +79,118 @@ class PadToAspectTests(unittest.TestCase):
         self.assertEqual((x_off, y_off), (0, 0))
 
 
+from pose_backends.azure_kinect import AzureKinectPoseSource  # noqa: E402
+
+
+class FakeRuntime:
+    def __init__(self, bodies=None, view="color", mirrored=False,
+                 native_size=(1280, 720)):
+        self.last_bodies = bodies or []
+        self.view = view
+        self.mirrored = mirrored
+        self.native_view_size = native_size
+        self.last_error = None
+
+
+def _fake_body(body_id, x_offset=0.0, conf=2):
+    joints = np.zeros((32, 4))
+    joints[:, 3] = conf
+    base = {18: [-100, 0, 1000], 22: [100, 0, 1000],
+            19: [-110, 400, 1000], 23: [110, 400, 1000],
+            20: [-120, 800, 1000], 24: [120, 800, 1000],
+            5: [-180, -500, 1000], 12: [180, -500, 1000],
+            6: [-200, -250, 1000], 13: [200, -250, 1000],
+            7: [-210, 0, 1000], 14: [210, 0, 1000],
+            27: [0, -700, 1000]}
+    for i, xyz in base.items():
+        joints[i, :3] = xyz
+        joints[i, 0] += x_offset
+    joints2d = np.zeros((32, 2))
+    joints2d[:, 0] = 280.0 + np.arange(32) * 2.0 + x_offset / 5.0  # non-zero width
+    joints2d[:, 1] = 300.0
+    joints2d[20, 1] = joints2d[24, 1] = 600.0   # ankles lower for a real bbox
+    return KinectBody(body_id=body_id, joints=joints, joints2d=joints2d)
+
+
+def _frame():
+    return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+
+class PoseSourceSingleTests(unittest.TestCase):
+    def test_no_bodies(self):
+        source = AzureKinectPoseSource(FakeRuntime())
+        frame, h36m = source.estimate(_frame(), 1000.0)
+        self.assertIsNone(h36m)
+        self.assertFalse(source.last_pose_valid)
+        self.assertIsNone(source.last_h36m_by_id)
+
+    def test_single_body_disabled_tracking(self):
+        source = AzureKinectPoseSource(FakeRuntime(bodies=[_fake_body(7)]))
+        frame, h36m = source.estimate(_frame(), 1000.0)
+        self.assertEqual(h36m.shape, (17, 3))
+        self.assertTrue(source.last_pose_valid)
+        self.assertAlmostEqual(source.last_pose_quality, 0.8)
+        self.assertIsNone(source.last_h36m_by_id)      # single-person contract
+        # registry still runs: active id present so PoseEngine resets on change
+        self.assertEqual(source.last_tracking["active_id"], 1)
+        self.assertFalse(source.last_tracking["enabled"])
+
+    def test_invalid_body_returns_none(self):
+        body = _fake_body(7)
+        body.joints[18, 3] = 0   # HIP_LEFT NONE
+        source = AzureKinectPoseSource(FakeRuntime(bodies=[body]))
+        frame, h36m = source.estimate(_frame(), 1000.0)
+        self.assertIsNone(h36m)
+        self.assertFalse(source.last_pose_valid)
+
+
+class PoseSourceTrackedTests(unittest.TestCase):
+    def _source(self, runtime):
+        return AzureKinectPoseSource(runtime, tracking_enabled=True)
+
+    def test_two_bodies_get_stable_ids(self):
+        runtime = FakeRuntime(bodies=[_fake_body(11), _fake_body(23, x_offset=500)])
+        source = self._source(runtime)
+        source.estimate(_frame(), 1000.0)
+        self.assertEqual(set(source.last_h36m_by_id), {1, 2})
+        self.assertEqual(source.last_tracking["count"], 2)
+        states = {t["stable_id"]: t["state"] for t in source.last_tracking["tracks"]}
+        self.assertEqual(states, {1: "tracking", 2: "tracking"})
+
+    def test_body_id_change_keeps_stable_id(self):
+        runtime = FakeRuntime(bodies=[_fake_body(11)])
+        source = self._source(runtime)
+        source.estimate(_frame(), 1000.0)
+        runtime.last_bodies = [_fake_body(99)]   # K4ABT re-assigned the raw id
+        source.estimate(_frame(), 1100.0)
+        self.assertEqual(list(source.last_h36m_by_id), [1])   # registry re-id
+
+    def test_mirror_flips_skeleton(self):
+        runtime = FakeRuntime(bodies=[_fake_body(3)], mirrored=True)
+        source = self._source(runtime)
+        source.estimate(_frame(), 1000.0)
+        h = source.last_h36m_by_id[1]
+        # r_ankle should carry the mirrored left ankle x (+120)
+        np.testing.assert_allclose(h[3], [120, 800, 0], atol=1e-6)
+
+    def test_configure_tracking_toggles(self):
+        runtime = FakeRuntime(bodies=[_fake_body(4)])
+        source = self._source(runtime)
+        source.configure_tracking(enabled=False)
+        source.estimate(_frame(), 1000.0)
+        self.assertIsNone(source.last_h36m_by_id)
+        source.configure_tracking(enabled=True)
+        source.estimate(_frame(), 1100.0)
+        self.assertIsInstance(source.last_h36m_by_id, dict)
+
+    def test_runtime_error_reported(self):
+        runtime = FakeRuntime()
+        runtime.last_error = "device unplugged"
+        source = self._source(runtime)
+        source.estimate(_frame(), 1000.0)
+        self.assertEqual(source.last_tracking["state"], "error")
+        self.assertEqual(source.last_tracking["error"], "device unplugged")
+
+
 if __name__ == "__main__":
     unittest.main()
