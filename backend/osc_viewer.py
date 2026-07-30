@@ -20,6 +20,7 @@ import uvicorn
 
 from calibration import CalibrationCollector, load_presets, normalize_presets, save_presets
 from culture_score import CultureScore
+from frame_sources import KinectFrameSource, OpenCVFrameSource
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
 from pose_engine import PoseEngine, VALID_BACKENDS
 
@@ -105,6 +106,7 @@ source_state = {
     "osc_skeleton": False,
     "detect_enabled": False,
     "pose_backend": os.getenv("FIELD_POSE_BACKEND", "mediapipe"),
+    "kinect_view": "color",
     "tracking_enabled": False,
     "tracking_target": "auto_largest",
     "tracker_model": DEFAULT_TRACKER_MODEL,
@@ -266,11 +268,25 @@ def open_camera(index: int, owner: Optional[int] = None):
         return camera
 
 
-async def reopen_live_camera(session_id: int, reason: str):
-    processing_state["error"] = reason
-    await asyncio.to_thread(release_camera, session_id)
-    await asyncio.sleep(0.35)
-    return await asyncio.to_thread(open_camera, int(source_state["camera_index"]), session_id)
+def make_live_frame_source(session_id: int):
+    """Build the frame source for a live stream session. Kinect brings its own
+    capture (depth + body tracking ride the same device); everything else is
+    the existing cv2 path via delegation."""
+    if source_state.get("pose_backend") == "azure_kinect":
+        from pose_backends.azure_kinect import get_runtime
+        runtime = get_runtime().acquire(
+            owner=session_id,
+            view=str(source_state.get("kinect_view", "color")),
+            mirrored=bool(source_state.get("mirror_live")),
+        )
+        return KinectFrameSource(runtime, owner=session_id)
+    return OpenCVFrameSource(
+        index=int(source_state["camera_index"]),
+        owner=session_id,
+        open_fn=open_camera,
+        read_fn=read_camera_frame,
+        release_fn=release_camera,
+    ).open()
 
 
 def state_payload() -> dict:
@@ -448,6 +464,14 @@ def rtmpose3d_selectable() -> bool:
     return False
 
 
+def azure_kinect_selectable() -> bool:
+    try:
+        from pose_backends.azure_kinect import azure_kinect_available
+        return azure_kinect_available()
+    except Exception:
+        return False
+
+
 def available_pose_backends() -> list[dict]:
     backends = [{
         "id": "mediapipe",
@@ -459,6 +483,12 @@ def available_pose_backends() -> list[dict]:
             "id": "rtmpose3d",
             "label": "RTMPose3D",
             "description": "NVIDIA GPU",
+        })
+    if azure_kinect_selectable():
+        backends.append({
+            "id": "azure_kinect",
+            "label": "Azure Kinect",
+            "description": "depth 3D, multi-person",
         })
     return backends
 
@@ -756,7 +786,7 @@ async def stream_live():
     processing_state["running"] = True
     session_id = source_state["session_id"]
     try:
-        cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]), session_id)
+        frame_source = await asyncio.to_thread(make_live_frame_source, session_id)
     except Exception as exc:
         processing_state["error"] = f"Camera unavailable: {exc}"
         processing_state["running"] = False
@@ -775,18 +805,19 @@ async def stream_live():
             and source_state["detect_enabled"]
         ):
             started = time.time()
-            ok, frame = await asyncio.to_thread(read_camera_frame, cap, session_id)
+            ok, frame = await asyncio.to_thread(frame_source.read)
             if not ok:
                 missed_frames += 1
                 if missed_frames >= 5:
                     try:
-                        cap = await reopen_live_camera(session_id, "Camera frame dropped; reconnecting")
+                        processing_state["error"] = f"{frame_source.describe()} frame dropped; reconnecting"
+                        await asyncio.to_thread(frame_source.reopen)
                         missed_frames = 0
                     except Exception as exc:
-                        processing_state["error"] = f"Camera reconnect failed: {exc}"
+                        processing_state["error"] = f"{frame_source.describe()} reconnect failed: {exc}"
                         await asyncio.sleep(0.75)
                 else:
-                    processing_state["error"] = "Camera frame not available"
+                    processing_state["error"] = f"{frame_source.describe()} frame not available"
                     await asyncio.sleep(0.08)
                 continue
             missed_frames = 0
@@ -848,14 +879,23 @@ async def stream_live():
     finally:
         if not engine_task.done():
             engine_task.cancel()
-        release_camera(session_id)
+        frame_source.release()
         processing_state["running"] = False
 
 
 async def stream_live_preview():
     session_id = source_state["session_id"]
+    # Preview is always the cv2 webcam path — it must never grab the Kinect
+    # device out from under an analysis stream.
+    frame_source = OpenCVFrameSource(
+        index=int(source_state["camera_index"]),
+        owner=session_id,
+        open_fn=open_camera,
+        read_fn=read_camera_frame,
+        release_fn=release_camera,
+    )
     try:
-        cap = await asyncio.to_thread(open_camera, int(source_state["camera_index"]), session_id)
+        await asyncio.to_thread(frame_source.open)
     except Exception as exc:
         processing_state["error"] = f"Camera unavailable: {exc}"
         return
@@ -868,18 +908,19 @@ async def stream_live_preview():
             and not source_state["detect_enabled"]
         ):
             started = time.time()
-            ok, frame = await asyncio.to_thread(read_camera_frame, cap, session_id)
+            ok, frame = await asyncio.to_thread(frame_source.read)
             if not ok:
                 missed_frames += 1
                 if missed_frames >= 5:
                     try:
-                        cap = await reopen_live_camera(session_id, "Camera frame dropped; reconnecting")
+                        processing_state["error"] = f"{frame_source.describe()} frame dropped; reconnecting"
+                        await asyncio.to_thread(frame_source.reopen)
                         missed_frames = 0
                     except Exception as exc:
-                        processing_state["error"] = f"Camera reconnect failed: {exc}"
+                        processing_state["error"] = f"{frame_source.describe()} reconnect failed: {exc}"
                         await asyncio.sleep(0.75)
                 else:
-                    processing_state["error"] = "Camera frame not available"
+                    processing_state["error"] = f"{frame_source.describe()} frame not available"
                     await asyncio.sleep(0.08)
                 continue
             missed_frames = 0
@@ -897,7 +938,7 @@ async def stream_live_preview():
             elapsed = time.time() - started
             await asyncio.sleep(max(0.0, frame_interval - elapsed))
     finally:
-        release_camera(session_id)
+        frame_source.release()
 
 
 async def stream_video():
@@ -1290,6 +1331,7 @@ async def apply_input(
     osc_namespace: str = Form(""),
     performance: str = Form(DEFAULT_PERFORMANCE),
     pose_backend: str = Form("mediapipe"),
+    kinect_view: str = Form("color"),
     tracking_enabled: bool = Form(False),
     tracking_target: str = Form("auto_largest"),
     smooth_enabled: bool = Form(False),
@@ -1319,6 +1361,7 @@ async def apply_input(
 
     available_backend_ids = {item["id"] for item in available_pose_backends()}
     source_state["pose_backend"] = pose_backend if pose_backend in available_backend_ids else "mediapipe"
+    source_state["kinect_view"] = kinect_view if kinect_view in ("color", "depth") else "color"
     source_state["tracking_enabled"] = bool(tracking_enabled)
     source_state["tracking_target"] = normalize_tracking_target(tracking_target)
     source_state["tracker_model"] = DEFAULT_TRACKER_MODEL
@@ -2382,6 +2425,12 @@ VIEWER_HTML = """
                   <option value="mediapipe">MediaPipe</option>
                 </select>
               </label>
+              <label id="kinectViewRow" class="model-row hidden">Kinect view
+                <select id="kinectView" name="kinect_view">
+                  <option value="color">Color</option>
+                  <option value="depth">Depth</option>
+                </select>
+              </label>
               <label class="tracking-row" data-tooltip-title="Stable ID" data-tooltip-body="Uses YOLO person tracking before pose. Metrics follow one locked track id instead of whichever person is largest in the frame. Requires ultralytics tracking extras.">
                 <input id="stableTracking" name="tracking_enabled" type="checkbox" />
                 Stable ID
@@ -3203,6 +3252,10 @@ VIEWER_HTML = """
       inputDirty = true;
       setSourceMode('live');
     });
+    document.getElementById('kinectView').addEventListener('change', () => {
+      inputDirty = true;
+      setSourceMode('live');
+    });
     stableTrackingInput.addEventListener('change', () => {
       inputDirty = true;
       trackingPanel.classList.toggle('hidden', !stableTrackingInput.checked);
@@ -3309,6 +3362,8 @@ VIEWER_HTML = """
 
     document.getElementById('poseBackend').addEventListener('change', async () => {
       inputDirty = true;
+      const isKinect = document.getElementById('poseBackend').value === 'azure_kinect';
+      document.getElementById('kinectViewRow').classList.toggle('hidden', !isKinect);
       // Backend swap rebuilds the engine on stream restart; re-apply + restart.
       if (isDetecting) {
         const payload = await applySettings(true);
@@ -3575,6 +3630,12 @@ VIEWER_HTML = """
         select.dataset.signature = signature;
       }
       select.value = payload?.source?.pose_backend || 'mediapipe';
+      const kinectRow = document.getElementById('kinectViewRow');
+      const kinectSelect = document.getElementById('kinectView');
+      kinectRow.classList.toggle('hidden', select.value !== 'azure_kinect');
+      if (document.activeElement !== kinectSelect) {
+        kinectSelect.value = payload?.source?.kinect_view || 'color';
+      }
     }
 
     function defaultCalibrationName() {
