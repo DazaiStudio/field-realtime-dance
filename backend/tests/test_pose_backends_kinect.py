@@ -192,5 +192,46 @@ class PoseSourceTrackedTests(unittest.TestCase):
         self.assertEqual(source.last_tracking["error"], "device unplugged")
 
 
+from pose_backends.azure_kinect import KinectError, KinectRuntime, _guarded  # noqa: E402
+
+
+class GuardedCallTests(unittest.TestCase):
+    def test_converts_system_exit(self):
+        def boom():
+            raise SystemExit(1)   # pykinect VERIFY() does this
+        with self.assertRaises(KinectError):
+            _guarded("enqueue", boom)
+
+    def test_converts_exception(self):
+        def boom():
+            raise RuntimeError("usb reset")
+        with self.assertRaises(KinectError):
+            _guarded("capture", boom)
+
+    def test_passes_result(self):
+        self.assertEqual(_guarded("ok", lambda: 42), 42)
+
+
+class RuntimeOwnershipTests(unittest.TestCase):
+    def test_release_requires_owner(self):
+        runtime = KinectRuntime()
+        runtime._opened = True
+        runtime._owner = 7
+        closed = []
+        runtime._close_device = lambda: closed.append(True)
+        runtime.release(owner=3)      # wrong owner: no-op
+        self.assertTrue(runtime._opened)
+        runtime.release(owner=7)
+        self.assertFalse(runtime._opened)
+        self.assertEqual(closed, [True])
+
+    def test_read_when_closed_reports_error(self):
+        runtime = KinectRuntime()
+        ok, frame = runtime.read()
+        self.assertFalse(ok)
+        self.assertIsNone(frame)
+        self.assertTrue(runtime.last_error)
+
+
 if __name__ == "__main__":
     unittest.main()

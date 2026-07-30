@@ -305,3 +305,205 @@ class AzureKinectPoseSource:
             ],
             "error": error,
         }
+
+
+# --- Hardware runtime --------------------------------------------------------
+
+_SDK_DIRS = (
+    r"C:\Program Files\Azure Kinect SDK v1.4.2",
+    r"C:\Program Files\Azure Kinect SDK v1.4.1",
+)
+_BT_SDK_DIR = r"C:\Program Files\Azure Kinect Body Tracking SDK"
+
+
+def azure_kinect_available() -> bool:
+    """Cheap probe for the backend dropdown: Windows + SDKs + python binding.
+    Does NOT import pykinect (import loads DLLs; keep the probe instant)."""
+    if os.name != "nt":
+        return False
+    import importlib.util
+    if importlib.util.find_spec("pykinect_azure") is None:
+        return False
+    return any(os.path.isdir(d) for d in _SDK_DIRS) and os.path.isdir(_BT_SDK_DIR)
+
+
+def _guarded(what: str, fn, *args, **kwargs):
+    """Run a pykinect call, converting BOTH exceptions and sys.exit into
+    KinectError. pykinect's VERIFY() calls sys.exit(1) on sensor errors —
+    uncaught, an unplugged cable would kill the whole viewer process."""
+    try:
+        return fn(*args, **kwargs)
+    except SystemExit as exc:
+        raise KinectError(f"Kinect {what} failed (SDK aborted)") from exc
+    except KinectError:
+        raise
+    except Exception as exc:
+        raise KinectError(f"Kinect {what} failed: {exc}") from exc
+
+
+class KinectRuntime:
+    """Owns the k4a device + body tracker. read() = capture + track + cache.
+
+    One module-level instance (get_runtime()); the device is opened by the
+    frame source (acquire) per stream session and closed on release, with the
+    same owner-token semantics as osc_viewer's camera globals."""
+
+    POP_TIMEOUT_MS = 350
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._opened = False
+        self._owner = None
+        self._device = None
+        self._tracker = None
+        self.view = "color"
+        self.mirrored = False
+        self.native_view_size = (1280, 720)
+        self.last_bodies: list[KinectBody] = []
+        self.last_error = None
+        self._calibration_type_color = None
+        self._calibration_type_depth = None
+
+    # --- lifecycle -----------------------------------------------------------
+    def acquire(self, owner, view: str = "color", mirrored: bool = False):
+        """(Re)open the device for a stream session (takes over like
+        open_camera does)."""
+        with self._lock:
+            self._close_device()
+            self.view = view if view in KINECT_VIEWS else "color"
+            self.mirrored = bool(mirrored)
+            self._owner = owner
+            self._open_device()
+            self._opened = True
+            self.last_error = None
+            return self
+
+    def release(self, owner=None, force: bool = False):
+        with self._lock:
+            if not self._opened:
+                return
+            if not force and owner is not None and self._owner != owner:
+                return
+            self._close_device()
+            self._opened = False
+            self._owner = None
+
+    def reopen(self):
+        """Close + reopen after read failures (mirrors reopen_live_camera)."""
+        with self._lock:
+            owner, view, mirrored = self._owner, self.view, self.mirrored
+            self._close_device()
+            time.sleep(0.35)
+            self.view = view
+            self.mirrored = mirrored
+            self._owner = owner
+            self._open_device()
+            self._opened = True
+            self.last_error = None
+
+    def _open_device(self):
+        import pykinect_azure as pykinect
+        from pykinect_azure.k4abt import _k4abtTypes as _bt
+
+        _guarded("library init", pykinect.initialize_libraries, track_body=True)
+        # initialize_libraries resets processing_mode, so set these AFTER it.
+        _bt.k4abt_tracker_default_configuration.processing_mode = \
+            _bt.K4ABT_TRACKER_PROCESSING_MODE_GPU_DIRECTML
+        _bt.k4abt_tracker_default_configuration.gpu_device_id = \
+            int(os.getenv("FIELD_KINECT_GPU", "1"))
+
+        config = pykinect.default_configuration
+        config.color_resolution = pykinect.K4A_COLOR_RESOLUTION_720P
+        config.depth_mode = pykinect.K4A_DEPTH_MODE_NFOV_UNBINNED
+        config.camera_fps = pykinect.K4A_FRAMES_PER_SECOND_30
+        config.synchronized_images_only = True
+
+        self._device = _guarded("device open", pykinect.start_device, config=config)
+        model = _bt.K4ABT_LITE_MODEL if os.getenv("FIELD_KINECT_MODEL", "full") == "lite" \
+            else _bt.K4ABT_DEFAULT_MODEL
+        self._tracker = _guarded("tracker create", pykinect.start_body_tracker, model)
+        self._calibration_type_color = pykinect.K4A_CALIBRATION_TYPE_COLOR
+        self._calibration_type_depth = pykinect.K4A_CALIBRATION_TYPE_DEPTH
+
+    def _close_device(self):
+        device, self._device = self._device, None
+        self._tracker = None
+        if device is not None:
+            try:
+                device.close()
+            except (Exception, SystemExit):
+                pass
+        self.last_bodies = []
+
+    # --- frame source protocol ----------------------------------------------
+    def read(self):
+        """Capture one frame, run body tracking, cache bodies, return the view
+        image (BGR). On failure returns (False, None) and sets last_error."""
+        with self._lock:
+            if not self._opened or self._device is None:
+                self.last_error = "Kinect not open"
+                return False, None
+            try:
+                capture = _guarded("capture", self._device.update)
+                body_frame = _guarded("body tracking", self._tracker.update,
+                                      timeout_in_ms=self.POP_TIMEOUT_MS)
+                image = self._render_view(capture, body_frame)
+                if image is None:
+                    return False, None
+                self.last_error = None
+                return True, image
+            except KinectError as exc:
+                self.last_error = str(exc)
+                self.last_bodies = []
+                return False, None
+
+    def describe(self) -> str:
+        return "Azure Kinect"
+
+    # --- internals -----------------------------------------------------------
+    def _render_view(self, capture, body_frame):
+        if self.view == "depth":
+            ret, image = _guarded("depth image", capture.get_colored_depth_image)
+            dest_camera = self._calibration_type_depth
+        else:
+            ret, image = _guarded("color image", capture.get_color_image)
+            dest_camera = self._calibration_type_color
+        if not ret or image is None:
+            return None
+        if image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
+        x_off = y_off = 0
+        if self.view == "depth":
+            image, x_off, y_off = pad_to_aspect(image, 16, 9)
+        self.native_view_size = (image.shape[1], image.shape[0])
+        self._extract_bodies(body_frame, dest_camera, x_off, y_off)
+        return image
+
+    def _extract_bodies(self, body_frame, dest_camera, x_off, y_off):
+        bodies = []
+        n = _guarded("body count", body_frame.get_num_bodies)
+        for i in range(int(n)):
+            body_id = int(_guarded("body id", body_frame.get_body_id, i))
+            raw = np.asarray(
+                _guarded("body joints", lambda idx=i: body_frame.get_body(idx).numpy()),
+                dtype=float)
+            joints = raw[:, [0, 1, 2, 7]]          # x, y, z, confidence
+            raw2d = np.asarray(
+                _guarded("body 2d", lambda idx=i: body_frame.get_body2d(idx, dest_camera).numpy()),
+                dtype=float)
+            joints2d = raw2d[:, :2] + np.array([x_off, y_off], dtype=float)
+            bodies.append(KinectBody(body_id=body_id, joints=joints, joints2d=joints2d))
+        self.last_bodies = bodies
+
+
+_runtime = None
+_runtime_lock = threading.Lock()
+
+
+def get_runtime() -> KinectRuntime:
+    global _runtime
+    with _runtime_lock:
+        if _runtime is None:
+            _runtime = KinectRuntime()
+        return _runtime
