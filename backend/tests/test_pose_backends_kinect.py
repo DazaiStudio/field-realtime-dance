@@ -10,6 +10,7 @@ from pose_backends.azure_kinect import (
     KinectBody,
     body_quality,
     bbox_from_points,
+    sanitize_joints2d,
     transform_points_2d,
     pad_to_aspect,
 )
@@ -53,6 +54,25 @@ class Transform2DTests(unittest.TestCase):
         np.testing.assert_allclose(out, [[1180.0, 50.0]])
 
 
+class Sanitize2DTests(unittest.TestCase):
+    def test_zero_marker_and_conf_gate(self):
+        # k4a marks failed 3d->2d projections as (0, 0); NONE-confidence joints
+        # are position guesses (occluded behind scenery) — both must not reach
+        # the overlay/bbox as if they were real pixels.
+        pts = np.array([[0.0, 0.0], [100.0, 50.0], [200.0, 80.0]])
+        conf = np.array([2, 0, 2])
+        out = sanitize_joints2d(pts, conf)
+        self.assertTrue(np.isnan(out[0]).all())   # projection-failed marker
+        self.assertTrue(np.isnan(out[1]).all())   # confidence NONE
+        np.testing.assert_allclose(out[2], [200.0, 80.0])
+
+    def test_non_finite_input(self):
+        pts = np.array([[np.inf, 5.0], [50.0, 60.0]])
+        out = sanitize_joints2d(pts, np.array([2, 2]))
+        self.assertTrue(np.isnan(out[0]).all())
+        np.testing.assert_allclose(out[1], [50.0, 60.0])
+
+
 class BboxTests(unittest.TestCase):
     def test_bbox_padded_and_clamped(self):
         pts = np.array([[10.0, 10.0], [110.0, 210.0]])
@@ -61,6 +81,16 @@ class BboxTests(unittest.TestCase):
         self.assertAlmostEqual(y1, 0.0)     # 10 - 10% of 200 = -10 -> clamp 0
         self.assertAlmostEqual(x2, 120.0)
         self.assertAlmostEqual(y2, 220.0)   # 230 -> clamp to frame
+
+    def test_ignores_nan_points(self):
+        pts = np.array([[np.nan, np.nan], [10.0, 10.0], [110.0, 210.0]])
+        bbox = bbox_from_points(pts, frame_size=(200, 220), pad_frac=0.0)
+        self.assertAlmostEqual(bbox[0], 10.0)
+        self.assertAlmostEqual(bbox[3], 210.0)
+
+    def test_all_nan_returns_none(self):
+        pts = np.full((3, 2), np.nan)
+        self.assertIsNone(bbox_from_points(pts, frame_size=(200, 220)))
 
 
 class PadToAspectTests(unittest.TestCase):
@@ -190,6 +220,27 @@ class PoseSourceTrackedTests(unittest.TestCase):
         source.estimate(_frame(), 1000.0)
         self.assertEqual(source.last_tracking["state"], "error")
         self.assertEqual(source.last_tracking["error"], "device unplugged")
+
+    def test_nan_joints_skipped_in_overlay_and_bbox(self):
+        body = _fake_body(6)
+        body.joints2d[20] = np.nan          # left ankle unprojectable (occluded)
+        runtime = FakeRuntime(bodies=[body])
+        source = self._source(runtime)
+        source.estimate(_frame(), 1000.0)
+        points = source._overlay_points_by_id[1]
+        self.assertNotIn(6, points)         # H36M l_ankle not drawn
+        self.assertIn(3, points)            # r_ankle still drawn
+        bbox = source.last_tracking["tracks"][0]["bbox"]
+        self.assertTrue(all(np.isfinite(v) for v in bbox))
+
+    def test_body_with_no_projectable_joints_is_dropped(self):
+        body = _fake_body(6)
+        body.joints2d[:] = np.nan
+        runtime = FakeRuntime(bodies=[body])
+        source = self._source(runtime)
+        frame, h36m = source.estimate(_frame(), 1000.0)
+        self.assertEqual(source.last_h36m_by_id, {})
+        self.assertIsNone(h36m)
 
 
 from pose_backends.azure_kinect import KinectError, KinectRuntime, _guarded  # noqa: E402

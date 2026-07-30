@@ -64,10 +64,30 @@ def transform_points_2d(points: np.ndarray, native_size: tuple[int, int],
     return pts
 
 
+def sanitize_joints2d(points: np.ndarray, confidences: np.ndarray) -> np.ndarray:
+    """Mark unusable 2D joints as NaN: k4a returns (0, 0) when the 3d->2d
+    projection fails (joint outside the view frustum), and NONE-confidence
+    joints are position guesses for fully occluded limbs. Left unfiltered they
+    draw skeleton lines into the frame corner and blow the bbox up to the
+    whole frame (seen on hardware 2026-07-30 with legs occluded by a desk)."""
+    pts = np.asarray(points, dtype=float)[:, :2].copy()
+    conf = np.asarray(confidences, dtype=float)
+    bad = ~np.isfinite(pts).all(axis=1)
+    bad |= (np.abs(pts[:, 0]) < 1e-6) & (np.abs(pts[:, 1]) < 1e-6)
+    bad |= conf <= 0
+    pts[bad] = np.nan
+    return pts
+
+
 def bbox_from_points(points: np.ndarray, frame_size: tuple[int, int],
-                     pad_frac: float = 0.08) -> tuple[float, float, float, float]:
-    """Padded, frame-clamped bbox around 2D joints (for the track registry)."""
+                     pad_frac: float = 0.08):
+    """Padded, frame-clamped bbox around the finite 2D joints (for the track
+    registry). Returns None when no joint projects into the view."""
     pts = np.asarray(points, dtype=float)
+    valid = np.isfinite(pts).all(axis=1)
+    if not valid.any():
+        return None
+    pts = pts[valid]
     fw, fh = frame_size
     x1, y1 = float(pts[:, 0].min()), float(pts[:, 1].min())
     x2, y2 = float(pts[:, 0].max()), float(pts[:, 1].max())
@@ -182,6 +202,10 @@ class AzureKinectPoseSource:
             pts2d = transform_points_2d(body.joints2d, native_size,
                                         (frame_w, frame_h), mirrored)
             bbox = bbox_from_points(pts2d, (frame_w, frame_h))
+            if bbox is None:
+                # No joint projects into the view: nothing to draw or box, and
+                # the registry cannot geometry-match it. Skip this body.
+                continue
             conf = float(np.clip(quality, 0.0, 1.0))
             raw_tracks.append(PersonTrack(track_id=int(body.body_id), bbox=bbox,
                                           confidence=conf))
@@ -265,8 +289,10 @@ class AzureKinectPoseSource:
         h36m_pts[9] = (sh_mid + pts2d[_K4_NOSE]) / 2.0
         h36m_pts[11], h36m_pts[12], h36m_pts[13] = pts2d[_K4_L_SH], pts2d[_K4_L_EL], pts2d[_K4_L_WR]
         h36m_pts[14], h36m_pts[15], h36m_pts[16] = pts2d[_K4_R_SH], pts2d[_K4_R_EL], pts2d[_K4_R_WR]
+        # NaN source joints (occluded/unprojectable) drop out here; derived
+        # joints computed from them are NaN too and drop with them.
         return {i: (int(round(h36m_pts[i, 0])), int(round(h36m_pts[i, 1])))
-                for i in _H36M_DRAWN}
+                for i in _H36M_DRAWN if np.isfinite(h36m_pts[i]).all()}
 
     @staticmethod
     def _draw_points(frame, points, joint_color, line_color):
@@ -492,7 +518,8 @@ class KinectRuntime:
             raw2d = np.asarray(
                 _guarded("body 2d", lambda idx=i: body_frame.get_body2d(idx, dest_camera).numpy()),
                 dtype=float)
-            joints2d = raw2d[:, :2] + np.array([x_off, y_off], dtype=float)
+            joints2d = sanitize_joints2d(raw2d, joints[:, 3])
+            joints2d += np.array([x_off, y_off], dtype=float)
             bodies.append(KinectBody(body_id=body_id, joints=joints, joints2d=joints2d))
         self.last_bodies = bodies
 
