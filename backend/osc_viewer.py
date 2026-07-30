@@ -559,13 +559,15 @@ def list_cameras(max_index: int = CAMERA_SCAN_MAX_INDEX) -> list[dict]:
         return camera_cache["cameras"]
 
     # OpenCV camera indices are the only reliable values the stream can open.
-    # OS/DirectShow/macOS device-name order is not guaranteed to match OpenCV
-    # indices, especially with multiple USB or virtual cameras, so the UI uses
-    # stable index labels instead of potentially wrong device names.
+    # On Windows we open with CAP_DSHOW, whose indices follow the DirectShow
+    # enumeration order — the same order pygrabber's FilterGraph reports — so
+    # names align index-for-index there. (NOT true for MSMF; revisit if
+    # camera_backend() ever changes.)
     with camera_lock:
         active_index = camera_index_opened if camera is not None else None
     selected_index = int(source_state.get("camera_index", 0))
     mac_names = get_macos_camera_names() if sys.platform == "darwin" else []
+    dshow_names = get_directshow_camera_names() if os.name == "nt" else []
     if sys.platform == "darwin":
         scan_limit = max(1, len(mac_names), selected_index + 1, (active_index + 1) if active_index is not None else 0)
     else:
@@ -581,7 +583,12 @@ def list_cameras(max_index: int = CAMERA_SCAN_MAX_INDEX) -> list[dict]:
             cap.release()
         if not available:
             continue
-        display_name = mac_names[index] if index < len(mac_names) else f"Camera {index}"
+        if index < len(mac_names):
+            display_name = mac_names[index]
+        elif index < len(dshow_names):
+            display_name = dshow_names[index]
+        else:
+            display_name = f"Camera {index}"
         cameras.append({
             "index": index,
             "name": display_name,
@@ -885,6 +892,11 @@ async def stream_live():
 
 async def stream_live_preview():
     session_id = source_state["session_id"]
+    if source_state.get("pose_backend") == "azure_kinect":
+        # Kinect brings its own capture. A webcam preview here could open the
+        # Kinect's RGB camera over UVC and block the analysis stream from
+        # starting the k4a device.
+        return
     # Preview is always the cv2 webcam path — it must never grab the Kinect
     # device out from under an analysis stream.
     frame_source = OpenCVFrameSource(
@@ -3362,8 +3374,7 @@ VIEWER_HTML = """
 
     document.getElementById('poseBackend').addEventListener('change', async () => {
       inputDirty = true;
-      const isKinect = document.getElementById('poseBackend').value === 'azure_kinect';
-      document.getElementById('kinectViewRow').classList.toggle('hidden', !isKinect);
+      updateKinectUi(document.getElementById('poseBackend').value);
       // Backend swap rebuilds the engine on stream restart; re-apply + restart.
       if (isDetecting) {
         const payload = await applySettings(true);
@@ -3629,13 +3640,24 @@ VIEWER_HTML = """
         }
         select.dataset.signature = signature;
       }
-      select.value = payload?.source?.pose_backend || 'mediapipe';
-      const kinectRow = document.getElementById('kinectViewRow');
+      // Dirty/focus guard: without it the 15Hz sync snaps the dropdown back
+      // to the applied backend before the user can press Enter.
+      if (!inputDirty && document.activeElement !== select) {
+        select.value = payload?.source?.pose_backend || 'mediapipe';
+      }
       const kinectSelect = document.getElementById('kinectView');
-      kinectRow.classList.toggle('hidden', select.value !== 'azure_kinect');
-      if (document.activeElement !== kinectSelect) {
+      if (!inputDirty && document.activeElement !== kinectSelect) {
         kinectSelect.value = payload?.source?.kinect_view || 'color';
       }
+      updateKinectUi(select.value);
+    }
+
+    function updateKinectUi(backendValue) {
+      const isKinect = backendValue === 'azure_kinect';
+      document.getElementById('kinectViewRow').classList.toggle('hidden', !isKinect);
+      const cameraSelect = document.getElementById('camera');
+      cameraSelect.disabled = isKinect;
+      cameraSelect.title = isKinect ? 'Azure Kinect brings its own capture; camera selection is not used' : '';
     }
 
     function defaultCalibrationName() {
