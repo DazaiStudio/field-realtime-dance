@@ -574,27 +574,36 @@ def list_cameras(max_index: int = CAMERA_SCAN_MAX_INDEX) -> list[dict]:
         scan_limit = max(max_index, selected_index + 1, (active_index + 1) if active_index is not None else 0)
 
     cameras = []
-    for index in range(scan_limit):
-        if active_index == index:
-            available = True
-        else:
-            cap = cv2.VideoCapture(index, camera_backend())
-            available = cap.isOpened()
-            cap.release()
-        if not available:
-            continue
-        if index < len(mac_names):
-            display_name = mac_names[index]
-        elif index < len(dshow_names):
-            display_name = dshow_names[index]
-        else:
-            display_name = f"Camera {index}"
-        cameras.append({
-            "index": index,
-            "name": display_name,
-            "label": f"{index} - {display_name}",
-            "source": "OpenCV",
-        })
+    if dshow_names:
+        # DirectShow enumeration already tells us what exists (CAP_DSHOW
+        # indices follow this order). Do NOT probe each index by opening it
+        # with cv2 here: opening flaky virtual devices (NDI / Meta Quest)
+        # inside the server raises native cap_dshow assertions and has hard-
+        # crashed the whole process (exit 116, no traceback, 2026-07-30).
+        for index, name in enumerate(dshow_names):
+            cameras.append({
+                "index": index,
+                "name": name,
+                "label": f"{index} - {name}",
+                "source": "DirectShow",
+            })
+    else:
+        for index in range(scan_limit):
+            if active_index == index:
+                available = True
+            else:
+                cap = cv2.VideoCapture(index, camera_backend())
+                available = cap.isOpened()
+                cap.release()
+            if not available:
+                continue
+            display_name = mac_names[index] if index < len(mac_names) else f"Camera {index}"
+            cameras.append({
+                "index": index,
+                "name": display_name,
+                "label": f"{index} - {display_name}",
+                "source": "OpenCV",
+            })
     if not cameras:
         cameras.append({"index": 0, "name": "Camera 0", "label": "0 - Camera 0", "source": "Fallback"})
     camera_cache["updated_at"] = time.time()
@@ -3080,9 +3089,12 @@ VIEWER_HTML = """
           select.appendChild(option);
         }
         const preferredValue = String(lastPayload?.source?.camera_index ?? currentValue ?? '0');
-        if (Array.from(select.options).some(option => option.value === preferredValue)) {
+        if (!select.disabled &&
+            Array.from(select.options).some(option => option.value === preferredValue)) {
           select.value = preferredValue;
         }
+        // Rebuilding the options resets the parked Kinect entry; re-apply.
+        updateKinectUi(document.getElementById('poseBackend').value);
       } catch (error) {
         console.warn('Camera list unavailable', error);
       }
@@ -3652,10 +3664,30 @@ VIEWER_HTML = """
       updateKinectUi(select.value);
     }
 
+    let cameraBeforeKinect = null;
     function updateKinectUi(backendValue) {
       const isKinect = backendValue === 'azure_kinect';
       document.getElementById('kinectViewRow').classList.toggle('hidden', !isKinect);
       const cameraSelect = document.getElementById('camera');
+      if (isKinect) {
+        // Park the (disabled) camera select on the Kinect entry so the UI
+        // shows which physical device is actually in use.
+        if (!cameraSelect.disabled) {
+          cameraBeforeKinect = cameraSelect.value;
+        }
+        const kinectOption = Array.from(cameraSelect.options)
+          .find(option => option.textContent.includes('Azure Kinect'));
+        if (kinectOption && cameraSelect.value !== kinectOption.value) {
+          cameraSelect.value = kinectOption.value;
+        }
+      } else if (cameraSelect.disabled) {
+        // Leaving Kinect mode: restore whatever webcam was selected before.
+        if (cameraBeforeKinect !== null &&
+            Array.from(cameraSelect.options).some(option => option.value === cameraBeforeKinect)) {
+          cameraSelect.value = cameraBeforeKinect;
+        }
+        cameraBeforeKinect = null;
+      }
       cameraSelect.disabled = isKinect;
       cameraSelect.title = isKinect ? 'Azure Kinect brings its own capture; camera selection is not used' : '';
     }
@@ -3826,7 +3858,10 @@ VIEWER_HTML = """
         previewVideo.loop = loopVideoInput.checked;
         const cameraSelect = document.getElementById('camera');
         const cameraValue = String(source.camera_index ?? '0');
-        if (Array.from(cameraSelect.options).some(option => option.value === cameraValue)) {
+        // In Kinect mode the select is disabled and parked on the Kinect
+        // entry for display; don't drag it back to the applied webcam index.
+        if (!cameraSelect.disabled &&
+            Array.from(cameraSelect.options).some(option => option.value === cameraValue)) {
           cameraSelect.value = cameraValue;
         }
       }
