@@ -13,6 +13,10 @@ Continuation notes for picking up development on another machine, including macO
 
 ## Run It
 
+> Setting up a fresh Windows machine (including the Azure Kinect backend)?
+> Follow **`INSTALL_WINDOWS.md`** — it covers Python, SDKs, env vars, and the
+> verification chain step by step.
+
 Python 3.10+ from the repo root:
 
 ```bash

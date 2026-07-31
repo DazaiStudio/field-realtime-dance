@@ -17,7 +17,15 @@ pygrabber>=0.2; platform_system == "Windows"
 
 # --- Optional: Stable ID person tracking -----------------------------------
 # Enables the "Stable ID" checkbox (YOLO person detector + ByteTrack tracker).
+# Only used by the MediaPipe backend; Azure Kinect tracks multi-person natively.
 #   pip install ultralytics lap
+
+# --- Optional: Azure Kinect backend (Windows only) --------------------------
+# Enables the "Azure Kinect" backend (depth 3D + native multi-person, works in
+# the dark). Also needs the Sensor SDK v1.4.2 + Body Tracking SDK 1.1.2
+# installed to their default C:\Program Files locations — full instructions in
+# INSTALL_WINDOWS.md.
+#   pip install pykinect_azure
 
 # --- Optional: RTMPose3D backend (the "RTMPose3D" dropdown option) ----------
 # Monocular 3D via rtmlib's RTMW3D-x. The default MediaPipe backend needs none

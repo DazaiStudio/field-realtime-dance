@@ -25,13 +25,17 @@ def main():
     pykinect.initialize_libraries(track_body=True)
     print("k4a.dll + k4abt.dll loaded OK")
 
-    # This laptop: DirectML adapter 0 = integrated GPU (~6 fps); adapter 1 =
-    # RTX 4080 (30 fps). CUDA mode is broken here (SDK's ORT 1.10 provider
-    # fails to init on Ada) -- DirectML on the right adapter is the way.
+    # DirectML adapter selection via FIELD_KINECT_GPU (same env the viewer
+    # uses). Dual-GPU laptops: adapter 0 is usually the iGPU (~6 fps), so the
+    # default is 1; single-GPU machines need FIELD_KINECT_GPU=0. CUDA mode is
+    # broken (SDK's ORT 1.10 provider fails to init on Ada GPUs) -- DirectML
+    # on the right adapter is the way.
+    import os
     from pykinect_azure.k4abt import _k4abtTypes as T
     T.k4abt_tracker_default_configuration.processing_mode = \
         T.K4ABT_TRACKER_PROCESSING_MODE_GPU_DIRECTML
-    T.k4abt_tracker_default_configuration.gpu_device_id = 1
+    T.k4abt_tracker_default_configuration.gpu_device_id = \
+        int(os.getenv("FIELD_KINECT_GPU", "1"))
 
     from pykinect_azure.k4a.device import Device
 

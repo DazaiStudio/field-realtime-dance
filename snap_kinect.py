@@ -21,7 +21,8 @@ def main():
     pykinect.initialize_libraries(track_body=True)
     T.k4abt_tracker_default_configuration.processing_mode = \
         T.K4ABT_TRACKER_PROCESSING_MODE_GPU_DIRECTML
-    T.k4abt_tracker_default_configuration.gpu_device_id = 1
+    T.k4abt_tracker_default_configuration.gpu_device_id = \
+        int(os.getenv("FIELD_KINECT_GPU", "1"))
 
     config = pykinect.default_configuration
     config.color_resolution = pykinect.K4A_COLOR_RESOLUTION_720P
