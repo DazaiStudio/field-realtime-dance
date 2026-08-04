@@ -47,24 +47,38 @@ def main():
               "Azure Kinect SDK v1.4.2\\tools\\k4aviewer.exe')")
         return
 
+    # Must match the viewer's configuration (backend/pose_backends/azure_kinect.py).
+    # synchronized_images_only is the one that matters here: without it a capture
+    # can arrive with a colour image but no depth, and the body tracker then dies
+    # on "Get depth buffer from the capture handle failed!" -- a false alarm that
+    # looks exactly like broken hardware.
     device_config = pykinect.default_configuration
     device_config.color_resolution = pykinect.K4A_COLOR_RESOLUTION_720P
     device_config.depth_mode = pykinect.K4A_DEPTH_MODE_NFOV_UNBINNED
+    device_config.camera_fps = pykinect.K4A_FRAMES_PER_SECOND_30
+    device_config.synchronized_images_only = True
 
     device = pykinect.start_device(config=device_config)
-    body_tracker = pykinect.start_body_tracker()
+    try:
+        body_tracker = pykinect.start_body_tracker()
 
-    n_bodies = 0
-    t0 = time.time()
-    frames = 30
-    for _ in range(frames):
-        device.update()
-        body_frame = body_tracker.update()
-        n_bodies = body_frame.get_num_bodies()
-    dt = time.time() - t0
-    print(f"capture + body tracking OK: {frames} frames in {dt:.1f}s "
-          f"({frames / dt:.1f} fps), bodies in last frame: {n_bodies}")
-    device.close()
+        n_bodies = 0
+        t0 = time.time()
+        frames = 30
+        for _ in range(frames):
+            device.update()
+            body_frame = body_tracker.update()
+            n_bodies = body_frame.get_num_bodies()
+        dt = time.time() - t0
+        print(f"capture + body tracking OK: {frames} frames in {dt:.1f}s "
+              f"({frames / dt:.1f} fps), bodies in last frame: {n_bodies}")
+    finally:
+        # Leaving the device open on the way out wedges it badly enough that the
+        # next run reports "devices connected: 0" until the USB cable is replugged.
+        try:
+            device.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
