@@ -126,6 +126,9 @@
 - `/field/<id>/sk/<joint>` — 每關節 `[x, y, z]`(Skeleton 輸出開啟時,每個追蹤中的舞者都送)。
 - `/field/morrisness` — 維持全域(顯示中舞者的 CultureScore)。
 - id = stable id(1、2、3…,依入場順序;短暫遮擋後 re-id 沿用同號)。**Stable ID 關閉時單人固定 id=1**,接收端只需一套 schema。
+- **id 會回收(2026-08-04 改)**:新 track 取**最小空號**,而不是一路遞增。舊行為會讓一整場排練的 id 爬到幾十,接收端寫死 `/field/1/*` 就靜悄悄收不到東西。現在**線上的 id 集合由「同時在場人數」決定**,兩個舞者永遠是 1 和 2。
+  - 代價:**id 代表槽位,不代表人**。舞者離場超過 `reidentify_seconds`(12s)後 track 被丟棄、號碼釋出,新進場的人可能拿到他原本的號。12 秒內的遮擋仍沿用同號(re-id 照舊)。
+  - 要「同一個人恆等於同一個 id」是另一個題目;拉長 `reidentify_seconds` 可延長身分保持,但拉太長會把不同人誤認成同一個。
 - 舞者被遮擋/離場 → 該 id **靜默**(不送 0);回場後同 id 繼續。
 - 校準 fixed ranges 全域套用(所有 id 同一組 range;per-dancer preset 需手動切換)。
 - **⚠️ 上場前必須通知 Nick(Max/MSP)與 Mark(TouchDesigner)改 patch**:舊的 `/field/energy` 等位址已不存在。

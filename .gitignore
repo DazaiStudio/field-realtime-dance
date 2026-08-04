@@ -26,3 +26,7 @@ qa_screenshots/
 
 # Project specific
 osc_viewer.*.log
+
+# YOLO weights are downloaded on first use of Stable ID with the MediaPipe backend
+yolov8n.pt
+logs/

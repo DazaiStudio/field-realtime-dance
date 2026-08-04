@@ -46,11 +46,15 @@ RTMPose3D is fully optional and lazy-imported. The rehearsal UI intentionally hi
 ### Azure Kinect backend (2026-07-30, branch feat/kinect-pose-source)
 
 - Requirements (Windows only): Azure Kinect Sensor SDK v1.4.2 + Body Tracking SDK 1.1.2 installed to their default `C:\Program Files` locations, plus `pip install pykinect_azure`.
-- Env vars: `FIELD_KINECT_GPU` = DirectML adapter index (default `1` for the dual-GPU dev laptop where 0 is the iGPU at ~6 fps; set `0` on single-GPU machines), `FIELD_KINECT_MODEL` = `full` (default) | `lite`.
+- Env vars: `FIELD_KINECT_GPU` = DirectML adapter index (default `1` for the dual-GPU dev laptop where 0 is the iGPU at ~6 fps; set `0` on single-GPU machines), `FIELD_KINECT_MODEL` = `full` (default) | `lite`, `FIELD_KINECT_DEPTH_MODE` = `nfov` (default, ~0.5-3.9 m) | `nfov_binned` (~0.5-5.5 m, half the depth resolution, still 30 fps) | `wfov_binned` (120 deg but only ~0.25-2.9 m).
 - The Kinect brings its own capture: the camera dropdown and `/preview_stream` are ignored for this backend, and the Kinect's RGB camera must not be opened as a UVC webcam at the same time.
 - "Kinect view" dropdown (visible only for this backend): Color, or colorized Depth (16:9 letterboxed) for dark-stage work.
 - Stable ID uses the same `MultiPersonTrackRegistry`; K4ABT body ids are raw ids only (they change after occlusion). OSC contract v2 (`/field/<id>/<metric>`) is unchanged.
 - Depth range NFOV ~0.5-3.9 m; measure the stage before relying on it.
+- **The depth camera sees a narrower field than the colour view** (NFOV ~75 deg horizontal vs ~90 deg for 720P colour). A dancer visible at the left or right edge of the colour preview can be outside the tracked volume entirely. Switch "Kinect view" to Depth to see the real coverage before setting marks.
+- **Never SIGKILL the viewer** (`Stop-Process -Force`, killing the terminal). That skips `finally: frame_source.release()` and the lifespan hook, and leaves the k4a device wedged: the next run reports `devices connected: 0` until the USB cable is physically unplugged and replugged. Stop it with the UI Quit button, or `POST /api/camera/release` then `POST /api/shutdown`.
+- Range is *radial* distance from the sensor, so mounting high and angling down costs reach: a camera 3 m up looking at a dancer 4 m away horizontally is measuring 5 m. Chest height and level maximises horizontal coverage.
+- Costumes matter: the depth camera is an IR time-of-flight sensor, and dark IR-absorbing fabric can return almost nothing, so a dancer inside the range can still be missing from the depth map. Test the actual costumes before the get-in.
 
 ## File Map
 

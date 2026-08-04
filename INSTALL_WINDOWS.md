@@ -89,6 +89,7 @@ Start-Process msiexec -ArgumentList "/i","Azure Kinect Body Tracking SDK 1.1.2.m
 |---|---|---|
 | `FIELD_KINECT_GPU` | `1` | **DirectML GPU adapter 編號,最容易踩的一個。** 雙顯卡筆電 adapter 0 通常是內顯(只有 ~6fps),所以預設 1;**單顯卡桌機要設 `0`**,否則 tracker 建立失敗、viewer 自動 fallback 回 MediaPipe |
 | `FIELD_KINECT_MODEL` | `full` | `full` \| `lite`;4080 上兩者皆 30fps,弱 GPU 可換 lite |
+| `FIELD_KINECT_DEPTH_MODE` | `nfov` | `nfov`(0.5–3.9m、75°)\| `nfov_binned`(**0.5–5.5m**、75°、深度解析度減半、仍 30fps)\| `wfov_binned`(0.25–2.9m、**120°**)。舞台深就用 binned,舞者橫向散開就用 wfov;**進劇場前先量舞台** |
 | `FIELD_POSE_BACKEND` | `mediapipe` | 開機預設 backend;可設 `azure_kinect` |
 | `FIELD_DEFAULT_CALIBRATION_PRESET` | `Rebecca_Clibrate_001_0630` | 開機自動套用的校準 preset(**是 MediaPipe 錄的**,Kinect 需重新校準;設空字串停用) |
 | `FIELD_OSC_ENABLED` | `1` | 測試時不想發 OSC 可設 0 |
@@ -130,7 +131,9 @@ py -3.10 backend\osc_viewer.py
 
 ## 9. 常見問題
 
-- **fps 只有 ~6** → `FIELD_KINECT_GPU` 指到內顯了,見 §6。
+- **fps 只有 ~6** → `FIELD_KINECT_GPU` 指到內顯了,見 §6。注意那是 **DXGI adapter 索引**,不是「找 NVIDIA 那張」;裝/移除虛擬顯示卡(例如 Meta Quest 的 Virtual Monitor)可能改變列舉順序,讓原本正確的 `1` 指到別的裝置。
+- **`devices connected: 0`,但線明明插著** → viewer 上次是被硬砍的(`Stop-Process -Force`、直接關終端機),裝置沒被釋放就卡死了。**只能實體拔掉 USB 再插回去。** 正常關法:UI 的 Quit 鈕,或 `POST /api/camera/release` 之後 `POST /api/shutdown`。
+- **人在畫面裡卻追不到** → 兩個常見原因:(1) 站在**深度視野**外 —— NFOV 水平只有 ~75°,比彩色畫面的 ~90° 窄,畫面邊緣的人可能根本不在追蹤範圍內,把 Kinect view 切到 Depth 就看得出真實覆蓋;(2) 超出深度距離,見 §6 的 `FIELD_KINECT_DEPTH_MODE`。
 - **Backend 下拉沒有「Azure Kinect」** → 缺其中之一:pykinect_azure 未裝 / 兩個 SDK 沒在預設路徑 / 不是 Windows。
 - **選了 Azure Kinect 卻跑成 MediaPipe** → tracker 建立失敗自動 fallback(看 console 的 `[PoseEngine] Azure Kinect unavailable`),最常見原因還是 GPU 編號錯。
 - **Kinect 開不起來(device open failed)** → RGB 鏡頭被別的程式以 webcam(UVC)佔住(OBS、瀏覽器、camera 下拉停在「Azure Kinect 4K Camera」的 preview)。關掉佔用者再 Enter。
