@@ -10,10 +10,42 @@ from pose_backends.azure_kinect import (
     KinectBody,
     body_quality,
     bbox_from_points,
+    resolve_depth_mode,
     sanitize_joints2d,
     transform_points_2d,
     pad_to_aspect,
 )
+
+
+class DepthModeTests(unittest.TestCase):
+    """NFOV unbinned only reaches ~3.9 m. Binning quadruples the IR signal per
+    pixel and reaches ~5.5 m at the same 30 fps, trading depth resolution --
+    a stage-dependent choice, so it is selectable rather than compiled in."""
+
+    def test_default_is_the_unbinned_narrow_mode(self):
+        self.assertEqual(resolve_depth_mode(None), "K4A_DEPTH_MODE_NFOV_UNBINNED")
+
+    def test_binned_narrow_mode_for_deeper_stages(self):
+        self.assertEqual(resolve_depth_mode("nfov_binned"),
+                         "K4A_DEPTH_MODE_NFOV_2X2BINNED")
+
+    def test_wide_mode_for_dancers_spread_sideways(self):
+        self.assertEqual(resolve_depth_mode("wfov_binned"),
+                         "K4A_DEPTH_MODE_WFOV_2X2BINNED")
+
+    def test_case_and_whitespace_are_forgiven(self):
+        self.assertEqual(resolve_depth_mode("  NFOV_Binned "),
+                         "K4A_DEPTH_MODE_NFOV_2X2BINNED")
+
+    def test_unknown_value_falls_back_instead_of_crashing_the_device_open(self):
+        self.assertEqual(resolve_depth_mode("nonsense"),
+                         "K4A_DEPTH_MODE_NFOV_UNBINNED")
+
+    def test_every_offered_mode_runs_at_the_hardcoded_30_fps(self):
+        # WFOV unbinned is the one mode capped at 15 fps; camera_fps is fixed at
+        # 30, so offering it would just fail the device open.
+        from pose_backends.azure_kinect import _DEPTH_MODES
+        self.assertNotIn("K4A_DEPTH_MODE_WFOV_UNBINNED", _DEPTH_MODES.values())
 
 
 def _conf(fill=2):
@@ -26,9 +58,31 @@ class BodyQualityTests(unittest.TestCase):
         self.assertAlmostEqual(quality, 0.8)
         self.assertTrue(valid)
 
-    def test_none_core_joint_invalidates(self):
+    def test_one_occluded_core_joint_still_counts(self):
+        # Turning sideways, or another dancer clipping one hip, used to throw
+        # the whole frame away even though K4ABT still tracked the body.
         conf = _conf(3)
         conf[18] = 0  # HIP_LEFT = NONE
+        quality, valid = body_quality(conf)
+        self.assertTrue(valid)
+
+    def test_both_hips_gone_invalidates(self):
+        # H36M pelvis is the midpoint of the hips and every metric is
+        # root-centred on it, so a fully invented pelvis must not pass.
+        conf = _conf(3)
+        conf[18] = conf[22] = 0
+        quality, valid = body_quality(conf)
+        self.assertFalse(valid)
+
+    def test_both_shoulders_gone_invalidates(self):
+        conf = _conf(3)
+        conf[5] = conf[12] = 0
+        quality, valid = body_quality(conf)
+        self.assertFalse(valid)
+
+    def test_one_hip_and_one_shoulder_gone_invalidates(self):
+        conf = _conf(3)
+        conf[18] = conf[5] = 0
         quality, valid = body_quality(conf)
         self.assertFalse(valid)
 
@@ -167,11 +221,21 @@ class PoseSourceSingleTests(unittest.TestCase):
 
     def test_invalid_body_returns_none(self):
         body = _fake_body(7)
-        body.joints[18, 3] = 0   # HIP_LEFT NONE
+        body.joints[18, 3] = body.joints[22, 3] = 0   # both hips NONE
         source = AzureKinectPoseSource(FakeRuntime(bodies=[body]))
         frame, h36m = source.estimate(_frame(), 1000.0)
         self.assertIsNone(h36m)
         self.assertFalse(source.last_pose_valid)
+
+    def test_one_occluded_hip_still_yields_a_pose(self):
+        # The common case on stage -- turning sideways, a dancer passing in
+        # front -- used to be discarded entirely.
+        body = _fake_body(7)
+        body.joints[18, 3] = 0   # HIP_LEFT NONE
+        source = AzureKinectPoseSource(FakeRuntime(bodies=[body]))
+        frame, h36m = source.estimate(_frame(), 1000.0)
+        self.assertEqual(h36m.shape, (17, 3))
+        self.assertTrue(source.last_pose_valid)
 
 
 class PoseSourceSingleModeOverlayTests(unittest.TestCase):

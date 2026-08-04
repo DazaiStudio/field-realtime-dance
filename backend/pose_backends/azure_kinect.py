@@ -22,10 +22,41 @@ import numpy as np
 
 # --- K4ABT joint indices used here (see keypoint_mapping for the mapping) ----
 _CORE_JOINTS = (5, 12, 18, 22)          # shoulders + hips
+# How many of those four must not be NONE. Requiring all four threw the whole
+# frame away whenever one shoulder or hip was occluded -- turning sideways,
+# another dancer passing in front, floor work -- while K4ABT was still tracking
+# the body perfectly well. Three tolerates one-sided occlusion; it still
+# rejects "both hips gone", where the H36M pelvis every metric is centred on
+# would be pure guesswork.
+_MIN_CORE_JOINTS = 3
 _MAPPED_JOINTS = (18, 19, 20, 22, 23, 24, 5, 6, 7, 12, 13, 14, 27)
 _CONF_QUALITY = {0: 0.0, 1: 0.4, 2: 0.8, 3: 1.0}
 
 KINECT_VIEWS = ("color", "depth")
+
+# Depth mode drives the working range, which is stage-dependent: NFOV unbinned
+# reaches ~3.9 m, binning it quadruples the IR signal per pixel for ~5.5 m at
+# the same 30 fps (half the depth resolution), and the WFOV modes trade reach
+# for a 120 deg spread. Selected with FIELD_KINECT_DEPTH_MODE.
+# WFOV unbinned is deliberately absent: it is the only mode capped at 15 fps,
+# and wfov_binned beats it on reach as well, so it would be a footgun next to
+# the hardcoded 30 fps camera setting.
+_DEPTH_MODES = {
+    "nfov": "K4A_DEPTH_MODE_NFOV_UNBINNED",             # ~0.5-3.9 m, 75 deg, 30 fps
+    "nfov_binned": "K4A_DEPTH_MODE_NFOV_2X2BINNED",     # ~0.5-5.5 m, 75 deg, 30 fps
+    "wfov_binned": "K4A_DEPTH_MODE_WFOV_2X2BINNED",     # ~0.25-2.9 m, 120 deg, 30 fps
+}
+DEFAULT_DEPTH_MODE = "nfov"
+
+
+def resolve_depth_mode(name=None) -> str:
+    """Depth mode key -> pykinect constant name.
+
+    Falls back to the default rather than raising: a typo in an environment
+    variable must not take the camera down mid-rehearsal.
+    """
+    key = str(name or "").strip().lower()
+    return _DEPTH_MODES.get(key, _DEPTH_MODES[DEFAULT_DEPTH_MODE])
 
 
 class KinectError(RuntimeError):
@@ -41,12 +72,18 @@ class KinectBody:
 
 def body_quality(confidences: np.ndarray) -> tuple[float, bool]:
     """K4ABT confidence levels (0..3) -> (quality 0..1, valid).
-    Quality = mean over the 13 joints the H36M mapping uses; a body is invalid
-    when any core joint (hips/shoulders) has NONE confidence."""
+
+    Quality = mean over the 13 joints the H36M mapping uses. A body is valid
+    when at least _MIN_CORE_JOINTS of the four shoulders/hips beat NONE, so at
+    most one may be missing -- which also means neither girdle is ever lost
+    whole, and the H36M pelvis and thorax every metric is measured against are
+    never pure guesswork.
+    """
     conf = np.asarray(confidences, dtype=int)
     levels = [_CONF_QUALITY.get(int(conf[i]), 0.0) for i in _MAPPED_JOINTS]
     quality = float(np.mean(levels)) if levels else 0.0
-    valid = all(int(conf[i]) > 0 for i in _CORE_JOINTS)
+    present = sum(1 for i in _CORE_JOINTS if int(conf[i]) > 0)
+    valid = present >= _MIN_CORE_JOINTS
     return quality, bool(valid)
 
 
@@ -482,7 +519,8 @@ class KinectRuntime:
 
         config = pykinect.default_configuration
         config.color_resolution = pykinect.K4A_COLOR_RESOLUTION_720P
-        config.depth_mode = pykinect.K4A_DEPTH_MODE_NFOV_UNBINNED
+        depth_mode = resolve_depth_mode(os.getenv("FIELD_KINECT_DEPTH_MODE"))
+        config.depth_mode = getattr(pykinect, depth_mode)
         config.camera_fps = pykinect.K4A_FRAMES_PER_SECOND_30
         config.synchronized_images_only = True
 
