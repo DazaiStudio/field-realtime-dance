@@ -61,6 +61,52 @@ class TestViewerMultiPersonOutput(unittest.TestCase):
             osc_viewer.processing_state["latest_metrics"]["energy"], 2.0
         )
 
+    def test_every_dancer_is_published_for_the_ui(self):
+        # The panels showed only the active dancer while OSC was already
+        # sending all of them, so a second dancer's stream could die unnoticed.
+        tracking = {
+            "enabled": True, "state": "tracking", "count": 2, "active_id": 5,
+            "tracks": [{"stable_id": 4, "state": "tracking"},
+                       {"stable_id": 5, "state": "tracking"}],
+        }
+        osc_viewer.set_analysis_result(
+            _metrics(2.0),
+            timestamp_ms=4000,
+            pose_valid=True,
+            tracking=tracking,
+            metrics_by_id={4: _metrics(1.0), 5: _metrics(2.0)},
+        )
+        by_id = osc_viewer.processing_state["latest_metrics_by_id"]
+        self.assertEqual(set(by_id), {4, 5})
+        self.assertAlmostEqual(by_id[4]["energy"], 1.0)
+        self.assertAlmostEqual(by_id[5]["energy"], 2.0)
+
+    def test_ui_metrics_by_id_reach_the_state_payload(self):
+        osc_viewer.set_analysis_result(
+            _metrics(7.0), timestamp_ms=5000, pose_valid=True,
+            metrics_by_id={3: _metrics(7.0)},
+        )
+        processing = osc_viewer.state_payload()["processing"]
+        self.assertAlmostEqual(processing["latest_metrics_by_id"][3]["energy"], 7.0)
+
+    def test_stale_dancers_drop_out_of_the_ui_list(self):
+        osc_viewer.set_analysis_result(
+            _metrics(1.0), timestamp_ms=6000, pose_valid=True,
+            tracking={"enabled": True, "state": "tracking", "count": 2, "active_id": 1,
+                      "tracks": [{"stable_id": 1, "state": "tracking"},
+                                 {"stable_id": 2, "state": "tracking"}]},
+            metrics_by_id={1: _metrics(1.0), 2: _metrics(2.0)},
+        )
+        self.assertEqual(set(osc_viewer.processing_state["latest_metrics_by_id"]), {1, 2})
+        # Dancer 2 leaves for good: their panel row must not linger forever.
+        osc_viewer.set_analysis_result(
+            _metrics(1.0), timestamp_ms=7000, pose_valid=True,
+            tracking={"enabled": True, "state": "tracking", "count": 1, "active_id": 1,
+                      "tracks": [{"stable_id": 1, "state": "tracking"}]},
+            metrics_by_id={1: _metrics(1.0)},
+        )
+        self.assertEqual(set(osc_viewer.processing_state["latest_metrics_by_id"]), {1})
+
     def test_single_person_display_ignores_registry_active_id(self):
         # Kinect keeps assigning stable ids in single-person mode, but the
         # single-person stream is always published as id 1 -- the UI panels and

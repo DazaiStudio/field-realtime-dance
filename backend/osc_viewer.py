@@ -132,6 +132,10 @@ processing_state = {
     "resize_ms": 0.0,
     "frame_size": None,
     "latest_metrics": {},
+    # Prepared (smoothed + normalised) values per dancer -- what actually goes
+    # out on the wire. The panels used to show only the active dancer, so a
+    # second dancer's stream could die without anyone seeing it.
+    "latest_metrics_by_id": {},
     "latest_raw_metrics": {},
     "latest_raw_metrics_by_id": {},
     "latest_skeleton": None,
@@ -760,6 +764,12 @@ def set_analysis_result(
         for pid in sorted(sk_by_id):
             if sk_by_id[pid] is not None:
                 osc_sender.send_skeleton(sk_by_id[pid], person_id=pid)
+    # Only dancers present this frame: last_prepared_by_id also retains state
+    # for briefly-occluded (holding) ids, which must not linger in the panel.
+    processing_state["latest_metrics_by_id"] = {
+        pid: filter_active_metrics(osc_sender.last_prepared_by_id.get(pid, {}))
+        for pid in sorted(by_id)
+    }
     prepared_metrics = osc_sender.last_prepared_by_id.get(current_display_person_id(), {})
     if calibration_state["active"] and calibration_countdown_remaining() <= 0.0:
         if pose_valid and has_usable_calibration_metrics(prepared_metrics):
@@ -2388,6 +2398,15 @@ VIEWER_HTML = """
     .output-skeleton input { width: 15px; min-height: 15px; }
     .address-list { display: grid; gap: 7px; color: var(--muted); font: 13px ui-monospace, monospace; }
     .address-list div { overflow-wrap: anywhere; }
+    .person-head {
+      margin-top: 9px;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .person-head:first-child { margin-top: 0; }
+    .person-head.active { color: var(--teal); }
     .skeleton-values {
       display: grid;
       gap: 5px;
@@ -3567,19 +3586,49 @@ VIEWER_HTML = """
       document.getElementById('outputTabSkeleton').setAttribute('aria-selected', outputTab === 'skeleton' ? 'true' : 'false');
     }
 
+    // Every dancer OSC is sending, not just the one the panels follow -- so a
+    // second dancer's stream going quiet is visible instead of silent.
+    function livePersonIds(payload = lastPayload) {
+      const byId = payload?.processing?.latest_metrics_by_id;
+      const ids = byId ? Object.keys(byId).map(Number).filter(Number.isFinite) : [];
+      ids.sort((a, b) => a - b);
+      return ids.length ? ids : [displayPersonId(payload)];
+    }
+
+    function trackStateFor(payload, id) {
+      const tracks = payload?.processing?.tracking?.tracks;
+      if (!Array.isArray(tracks)) return null;
+      const hit = tracks.find(t => Number(t?.stable_id) === Number(id));
+      return hit ? (hit.state || null) : null;
+    }
+
     function updateAddresses(payload = lastPayload) {
-      const metrics = payload?.processing?.latest_metrics || {};
+      const byId = payload?.processing?.latest_metrics_by_id || {};
+      const fallback = payload?.processing?.latest_metrics || {};
       const active = new Set(payload?.source?.osc_metrics || metricNames);
       const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
-      const personId = displayPersonId(payload);
+      const shownId = displayPersonId(payload);
+      const ids = livePersonIds(payload);
       const container = document.getElementById('addresses');
       container.innerHTML = '';
-      for (const name of orderedMetricNames(active)) {
-        if (!active.has(name)) continue;
-        const row = document.createElement('div');
-        const value = Number(metrics[name] ?? 0);
-        row.textContent = `${metricAddress(prefix, name, personId)}  ${formatMetric(value)}`;
-        container.appendChild(row);
+      for (const id of ids) {
+        const metrics = byId[id] ?? byId[String(id)] ?? fallback;
+        if (ids.length > 1) {
+          const head = document.createElement('div');
+          const isShown = Number(id) === Number(shownId);
+          head.className = isShown ? 'person-head active' : 'person-head';
+          const state = trackStateFor(payload, id);
+          const suffix = state && state !== 'tracking' ? ` ${state}` : '';
+          head.textContent = `id ${id}${suffix}${isShown ? ' (in panels)' : ''}`;
+          container.appendChild(head);
+        }
+        for (const name of orderedMetricNames(active)) {
+          if (!active.has(name)) continue;
+          const row = document.createElement('div');
+          const value = Number(metrics[name] ?? 0);
+          row.textContent = `${metricAddress(prefix, name, id)}  ${formatMetric(value)}`;
+          container.appendChild(row);
+        }
       }
       updateSkeletonValues(payload);
     }
