@@ -3513,7 +3513,11 @@ VIEWER_HTML = """
     }
 
     function displayPersonId(payload = lastPayload) {
-      const id = payload?.processing?.tracking?.active_id;
+      const tracking = payload?.processing?.tracking;
+      // Single-person mode publishes as id 1 whatever the registry picked, so
+      // the shown addresses must not follow a stale active_id.
+      if (!tracking?.enabled) return 1;
+      const id = tracking.active_id;
       return (id === null || id === undefined) ? 1 : id;
     }
 
