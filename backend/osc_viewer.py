@@ -130,6 +130,7 @@ processing_state = {
     # without it pose_ms/encode_ms cannot account for the frame budget.
     "read_ms": 0.0,
     "resize_ms": 0.0,
+    "frame_size": None,
     "latest_metrics": {},
     "latest_raw_metrics": {},
     "latest_raw_metrics_by_id": {},
@@ -689,6 +690,8 @@ def set_stream_frame(frame=None, encode_ms: float = 0.0, read_ms: float = 0.0,
     processing_state["resize_ms"] = float(resize_ms)
     if frame is not None:
         processing_state["signal_mean"] = float(frame.mean())
+        # The preset is a cap, so this is not always source_state width/height.
+        processing_state["frame_size"] = [int(frame.shape[1]), int(frame.shape[0])]
     if processing_state["elapsed_seconds"] > 0.25:
         processing_state["fps"] = processing_state["frame_count"] / processing_state["elapsed_seconds"]
     if (
@@ -787,9 +790,17 @@ def encode_frame(frame):
 
 
 def resize_frame(frame):
+    """Scale a frame down to the performance preset. The preset is a cap.
+
+    INTER_AREA is the shrink-optimised interpolation and the presets were
+    written for webcams that overshoot them. The Kinect views are smaller
+    (1280x720 colour, 1024x576 padded depth), so enlarging them bought no
+    detail -- K4ABT has already run on native depth by this point -- while
+    making the JPEG encode and the browser's compositing more expensive.
+    """
     target_width = int(source_state["width"])
     target_height = int(source_state["height"])
-    if frame.shape[1] == target_width and frame.shape[0] == target_height:
+    if frame.shape[1] <= target_width and frame.shape[0] <= target_height:
         return frame
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
@@ -3928,7 +3939,7 @@ VIEWER_HTML = """
         const oscTargetText = `${targets.length} output${targets.length === 1 ? '' : 's'}`;
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
         document.getElementById('metaD').textContent =
-          `cap ${Number(processing.read_ms || 0).toFixed(0)}ms / pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / ${trackStatus} / osc: ${oscTargetText}`;
+          `${Array.isArray(processing.frame_size) ? processing.frame_size.join('x') + ' / ' : ''}cap ${Number(processing.read_ms || 0).toFixed(0)}ms / pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / ${trackStatus} / osc: ${oscTargetText}`;
       }
       updateAddresses(payload);
 
