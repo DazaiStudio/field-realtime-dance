@@ -174,6 +174,70 @@ class PoseSourceSingleTests(unittest.TestCase):
         self.assertFalse(source.last_pose_valid)
 
 
+class PoseSourceSingleModeOverlayTests(unittest.TestCase):
+    """Single-person mode (tracking_enabled=False) draws only the active dancer.
+
+    K4ABT always reports every body it sees, so the registry keeps running to
+    pick a subject -- but the view must match the MediaPipe single-person path:
+    one skeleton, no bboxes, no id labels.
+    """
+
+    ACTIVE_JOINT = (0, 255, 255)
+    ACTIVE_LINE = (0, 255, 0)
+    # Non-active skeletons and the active bbox share this colour.
+    OTHER = (192, 211, 52)
+    OTHER_BBOX = (150, 142, 132)
+
+    def _drawn(self, frame):
+        """Which of the overlay's palette colours actually reached the frame.
+
+        Restricted to the palette so a failure names the colours instead of
+        dumping every anti-aliased shade in the image.
+        """
+        palette = {
+            "active joint": self.ACTIVE_JOINT,
+            "active line": self.ACTIVE_LINE,
+            "other": self.OTHER,
+            "other bbox": self.OTHER_BBOX,
+        }
+        return {name for name, bgr in palette.items()
+                if (frame == np.array(bgr, dtype=frame.dtype)).all(axis=2).any()}
+
+    @staticmethod
+    def _two_bodies():
+        # Second dancer is unambiguously smaller so auto_largest has no tie.
+        small = _fake_body(23, x_offset=500)
+        small.joints2d[20, 1] = small.joints2d[24, 1] = 380.0
+        return [_fake_body(11), small]
+
+    def test_only_the_active_skeleton_is_drawn(self):
+        source = AzureKinectPoseSource(FakeRuntime(bodies=self._two_bodies()))
+        frame, _ = source.estimate(_frame(), 1000.0)
+        # "other" also covers the active bbox, which shares that colour.
+        self.assertEqual(self._drawn(frame), {"active joint", "active line"})
+
+    def test_overlay_cache_holds_only_the_active_person(self):
+        source = AzureKinectPoseSource(FakeRuntime(bodies=self._two_bodies()))
+        source.estimate(_frame(), 1000.0)
+        self.assertEqual(list(source._overlay_points_by_id),
+                         [source.last_tracking["active_id"]])
+
+    def test_manual_id_selection_is_ignored(self):
+        # The target dropdown is a multi-person control; single mode always
+        # follows the largest dancer.
+        source = AzureKinectPoseSource(FakeRuntime(bodies=self._two_bodies()),
+                                       tracking_selection="id:2")
+        source.estimate(_frame(), 1000.0)
+        self.assertEqual(source.last_tracking["active_id"], 1)
+
+    def test_multi_mode_still_draws_every_skeleton_and_bbox(self):
+        source = AzureKinectPoseSource(FakeRuntime(bodies=self._two_bodies()),
+                                       tracking_enabled=True)
+        frame, _ = source.estimate(_frame(), 1000.0)
+        self.assertEqual(self._drawn(frame),
+                         {"active joint", "active line", "other", "other bbox"})
+
+
 class PoseSourceTrackedTests(unittest.TestCase):
     def _source(self, runtime):
         return AzureKinectPoseSource(runtime, tracking_enabled=True)

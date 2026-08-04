@@ -61,6 +61,27 @@ class TestViewerMultiPersonOutput(unittest.TestCase):
             osc_viewer.processing_state["latest_metrics"]["energy"], 2.0
         )
 
+    def test_single_person_display_ignores_registry_active_id(self):
+        # Kinect keeps assigning stable ids in single-person mode, but the
+        # single-person stream is always published as id 1 -- the UI panels and
+        # calibration must not follow an active_id that carries no metrics.
+        tracking = {
+            "enabled": False,
+            "state": "tracking",
+            "count": 1,
+            "active_id": 2,
+            "tracks": [{"stable_id": 2, "state": "tracking"}],
+        }
+        osc_viewer.set_analysis_result(
+            _metrics(4.0),
+            timestamp_ms=3000,
+            pose_valid=True,
+            tracking=tracking,
+        )
+        self.assertAlmostEqual(
+            osc_viewer.processing_state["latest_metrics"]["energy"], 4.0
+        )
+
     def test_single_person_fallback_prepares_id_1(self):
         osc_viewer.set_analysis_result(
             _metrics(3.0),

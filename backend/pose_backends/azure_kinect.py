@@ -213,7 +213,10 @@ class AzureKinectPoseSource:
 
         now = float(timestamp_ms) / 1000.0
         stable_tracks = self.track_registry.update(raw_tracks, now)
-        active, state = self.track_registry.choose_active(self.tracking_selection, frame.shape)
+        # The target dropdown is a multi-person control; single mode always
+        # follows the largest dancer.
+        selection = self.tracking_selection if self.tracking_enabled else "auto_largest"
+        active, state = self.track_registry.choose_active(selection, frame.shape)
         self._last_stable_tracks = stable_tracks
         self._last_active_track = active
 
@@ -229,9 +232,14 @@ class AzureKinectPoseSource:
                 continue
             h36m_by_id[int(track.stable_id)] = h36m
             overlay_by_id[int(track.stable_id)] = self._points_dict(pts2d)
-        self._overlay_points_by_id = overlay_by_id
 
         active_id = int(active.stable_id) if active is not None else None
+        if not self.tracking_enabled:
+            # K4ABT always reports every body it sees, but single mode shows the
+            # subject only, matching the MediaPipe single-person view.
+            overlay_by_id = {pid: pts for pid, pts in overlay_by_id.items() if pid == active_id}
+        self._overlay_points_by_id = overlay_by_id
+
         active_h36m = h36m_by_id.get(active_id) if active_id is not None else None
         if active is not None and active.raw_id is not None and int(active.raw_id) in data_by_raw:
             _, _, quality, valid = data_by_raw[int(active.raw_id)]
@@ -247,7 +255,9 @@ class AzureKinectPoseSource:
 
     def draw_cached_overlay(self, frame):
         active_id = self._last_active_track.stable_id if self._last_active_track is not None else None
-        tracks = [t for t in self._last_stable_tracks if t.state != "lost"]
+        # Boxes and id labels are multi-person affordances: single mode keeps the
+        # view clean, like MediaPipe's _draw_tracking_overlay early-return.
+        tracks = [t for t in self._last_stable_tracks if t.state != "lost"] if self.tracking_enabled else []
         for track in sorted(tracks, key=lambda item: bbox_area(item.bbox)):
             x1, y1, x2, y2 = [int(round(v)) for v in track.bbox]
             is_active = active_id is not None and int(track.stable_id) == int(active_id)

@@ -346,8 +346,14 @@ def safe_download_stem(name: str, fallback: str = "profile") -> str:
 
 
 def current_display_person_id() -> int:
-    """Stable id of the dancer the UI panels follow (active track, else 1)."""
+    """Stable id of the dancer the UI panels follow (active track, else 1).
+
+    Single-person mode publishes its stream as id 1 no matter what the registry
+    picked as active, so the panels and calibration must not chase an active_id
+    that carries no metrics."""
     tracking = processing_state.get("tracking") or {}
+    if not tracking.get("enabled"):
+        return 1
     active = tracking.get("active_id")
     try:
         return int(active) if active is not None else 1
@@ -2452,7 +2458,7 @@ VIEWER_HTML = """
                   <option value="depth">Depth</option>
                 </select>
               </label>
-              <label class="tracking-row" data-tooltip-title="Stable ID" data-tooltip-body="Uses YOLO person tracking before pose. Metrics follow one locked track id instead of whichever person is largest in the frame. Requires ultralytics tracking extras.">
+              <label class="tracking-row" data-tooltip-title="Stable ID" data-tooltip-body="Multi-person mode: every dancer keeps a stable id across occlusions and gets a bbox plus their own /field/&lt;id&gt;/&lt;metric&gt; stream. Off = one dancer only (the largest in frame), single skeleton, no boxes, published as id 1. MediaPipe needs the ultralytics tracking extras; Azure Kinect tracks bodies natively.">
                 <input id="stableTracking" name="tracking_enabled" type="checkbox" />
                 Stable ID
               </label>
