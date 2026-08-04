@@ -91,6 +91,62 @@ class TestDuplicateSuppression(unittest.TestCase):
         self.assertEqual([track.track_id for track in tracks], [1, 2])
 
 
+class TestStableIdsStayInASmallSet(unittest.TestCase):
+    """Stable ids are OSC addresses: /field/<id>/<metric>.
+
+    Ids used to climb forever, so after a few hours of dancers entering and
+    leaving a rehearsal the streams would be on /field/37/* while the Max and
+    TouchDesigner patches were still listening on /field/1/*. Nothing errors --
+    the receivers just go quiet. Ids are therefore reused once a track has
+    aged past the re-identification window and been dropped.
+    """
+
+    FAR = (900, 100, 1000, 300)      # nowhere near the other boxes, no re-id
+
+    def test_id_is_reused_after_a_dancer_is_gone_for_good(self):
+        registry = MultiPersonTrackRegistry(hold_seconds=0.5, reidentify_seconds=3.0)
+        registry.update([PersonTrack(10, (0, 0, 100, 200), 0.8)], now=1.0)
+        registry.update([], now=10.0)          # well past reidentify_seconds
+        tracks = registry.update([PersonTrack(77, self.FAR, 0.8)], now=11.0)
+
+        self.assertEqual([t.stable_id for t in tracks], [1])
+
+    def test_id_is_not_reused_while_re_identification_is_still_possible(self):
+        registry = MultiPersonTrackRegistry(hold_seconds=0.5, reidentify_seconds=8.0)
+        registry.update([PersonTrack(10, (0, 0, 100, 200), 0.8)], now=1.0)
+        registry.update([], now=2.0)           # lost, but still re-identifiable
+        tracks = registry.update([PersonTrack(77, self.FAR, 0.8)], now=3.0)
+
+        ids = sorted(t.stable_id for t in tracks)
+        self.assertEqual(ids, [1, 2])          # the newcomer must not steal id 1
+
+    def test_the_lowest_free_id_is_taken_not_the_next_number(self):
+        registry = MultiPersonTrackRegistry(hold_seconds=0.5, reidentify_seconds=3.0)
+        registry.update([
+            PersonTrack(10, (0, 0, 100, 200), 0.8),
+            PersonTrack(20, (300, 0, 420, 220), 0.9),
+        ], now=1.0)
+        # Dancer 1 leaves for good; dancer 2 stays on stage throughout.
+        registry.update([PersonTrack(20, (300, 0, 420, 220), 0.9)], now=10.0)
+        tracks = registry.update([
+            PersonTrack(20, (300, 0, 420, 220), 0.9),
+            PersonTrack(77, self.FAR, 0.8),
+        ], now=11.0)
+
+        self.assertEqual(sorted(t.stable_id for t in tracks), [1, 2])
+
+    def test_a_long_churn_never_climbs_past_the_headcount(self):
+        registry = MultiPersonTrackRegistry(hold_seconds=0.5, reidentify_seconds=2.0)
+        now = 1.0
+        for _ in range(20):                    # 20 dancers in and out, one at a time
+            registry.update([PersonTrack(500, (0, 0, 100, 200), 0.8)], now=now)
+            now += 5.0
+            registry.update([], now=now)       # gone long enough to be dropped
+            now += 1.0
+        tracks = registry.update([PersonTrack(600, (0, 0, 100, 200), 0.8)], now=now)
+        self.assertEqual([t.stable_id for t in tracks], [1])
+
+
 class TestMultiPersonTrackRegistry(unittest.TestCase):
     def test_assigns_stable_ids_to_multiple_people(self):
         registry = MultiPersonTrackRegistry()

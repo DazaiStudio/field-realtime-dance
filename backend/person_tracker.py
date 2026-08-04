@@ -310,13 +310,11 @@ class MultiPersonTrackRegistry:
         self.reidentify_min_iou = float(reidentify_min_iou)
         self.reidentify_max_center_distance = float(reidentify_max_center_distance)
         self.auto_switch_area_ratio = float(auto_switch_area_ratio)
-        self._next_stable_id = 1
         self._tracks: dict[int, StablePersonTrack] = {}
         self._raw_to_stable: dict[int, int] = {}
         self._last_active_id: Optional[int] = None
 
     def reset(self) -> None:
-        self._next_stable_id = 1
         self._tracks = {}
         self._raw_to_stable = {}
         self._last_active_id = None
@@ -410,9 +408,25 @@ class MultiPersonTrackRegistry:
         self._last_active_id = track.stable_id
         return track, track.state
 
+    def _lowest_free_id(self) -> int:
+        """Smallest id not currently held by a track.
+
+        Stable ids are OSC addresses (/field/<id>/<metric>), so they have to
+        stay in a small set: a monotonic counter would put a two-hour
+        rehearsal's dancers on /field/37/* while the receiving patches still
+        listen on /field/1/*, and nothing would report an error. Ids only free
+        up once update() drops a track for being older than
+        reidentify_seconds, so reuse can never steal the id of someone who
+        might still walk back in.
+        """
+        used = set(self._tracks)
+        candidate = 1
+        while candidate in used:
+            candidate += 1
+        return candidate
+
     def _new_track(self, raw: PersonTrack, now: float) -> int:
-        stable_id = self._next_stable_id
-        self._next_stable_id += 1
+        stable_id = self._lowest_free_id()
         self._tracks[stable_id] = StablePersonTrack(
             stable_id=stable_id,
             raw_id=int(raw.track_id),
