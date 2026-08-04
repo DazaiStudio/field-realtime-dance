@@ -238,6 +238,54 @@ class PoseSourceSingleModeOverlayTests(unittest.TestCase):
                          {"active joint", "active line", "other", "other bbox"})
 
 
+class OverlayFreshnessTests(unittest.TestCase):
+    """The drawn skeleton must not lag the video between analyses.
+
+    The frame source refreshes runtime.last_bodies on every read, but
+    estimate() only runs at analysis_fps, so the cached overlay would
+    otherwise sit up to one analysis interval behind the dancer.
+    """
+
+    def test_overlay_follows_newer_bodies_between_analyses(self):
+        runtime = FakeRuntime(bodies=[_fake_body(11)])
+        source = AzureKinectPoseSource(runtime)
+        source.estimate(_frame(), 1000.0)
+        before = dict(source._overlay_points_by_id[1])
+
+        moved = _fake_body(11)
+        moved.joints2d[:, 0] += 120.0        # dancer moved; no analysis yet
+        runtime.last_bodies = [moved]
+        source.draw_cached_overlay(_frame())
+
+        after = source._overlay_points_by_id[1]
+        self.assertEqual(after[3][0] - before[3][0], 120)
+        self.assertEqual(after[3][1], before[3][1])
+
+    def test_refresh_keeps_the_same_people(self):
+        # A newly visible body has no stable id until the next analysis; the
+        # draw path must never invent one.
+        runtime = FakeRuntime(bodies=[_fake_body(11)])
+        source = AzureKinectPoseSource(runtime)
+        source.estimate(_frame(), 1000.0)
+
+        runtime.last_bodies = [_fake_body(11), _fake_body(44, x_offset=500)]
+        source.draw_cached_overlay(_frame())
+
+        self.assertEqual(list(source._overlay_points_by_id), [1])
+
+    def test_missing_body_keeps_its_last_position(self):
+        # A dropped detection must not blank the skeleton mid-stride.
+        runtime = FakeRuntime(bodies=[_fake_body(11)])
+        source = AzureKinectPoseSource(runtime)
+        source.estimate(_frame(), 1000.0)
+        before = dict(source._overlay_points_by_id[1])
+
+        runtime.last_bodies = []
+        source.draw_cached_overlay(_frame())
+
+        self.assertEqual(source._overlay_points_by_id[1], before)
+
+
 class PoseSourceTrackedTests(unittest.TestCase):
     def _source(self, runtime):
         return AzureKinectPoseSource(runtime, tracking_enabled=True)

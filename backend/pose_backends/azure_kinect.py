@@ -253,7 +253,39 @@ class AzureKinectPoseSource:
             self.draw_cached_overlay(frame)
         return frame, active_h36m
 
+    def _refresh_overlay_points(self, frame):
+        """Re-project the drawn skeletons from the runtime's newest bodies.
+
+        K4ABT already ran for this frame -- the frame source calls it on every
+        read -- but estimate() is gated to analysis_fps, so without this the
+        skeleton would be drawn at a position up to one analysis interval old.
+
+        Only tracks that are already on screen are refreshed: a newly visible
+        body has no stable id until the next analysis, and a body that stopped
+        being reported keeps its last position rather than blinking out.
+        """
+        if not self._overlay_points_by_id:
+            return
+        bodies = {int(body.body_id): body
+                  for body in (getattr(self.runtime, "last_bodies", None) or [])}
+        if not bodies:
+            return
+        frame_h, frame_w = frame.shape[:2]
+        native_size = tuple(getattr(self.runtime, "native_view_size", (frame_w, frame_h)))
+        mirrored = bool(getattr(self.runtime, "mirrored", False))
+        raw_by_stable = {int(track.stable_id): int(track.raw_id)
+                         for track in self._last_stable_tracks if track.raw_id is not None}
+        for stable_id in self._overlay_points_by_id:
+            raw_id = raw_by_stable.get(int(stable_id))
+            body = bodies.get(raw_id) if raw_id is not None else None
+            if body is None:
+                continue
+            pts2d = transform_points_2d(body.joints2d, native_size,
+                                        (frame_w, frame_h), mirrored)
+            self._overlay_points_by_id[stable_id] = self._points_dict(pts2d)
+
     def draw_cached_overlay(self, frame):
+        self._refresh_overlay_points(frame)
         active_id = self._last_active_track.stable_id if self._last_active_track is not None else None
         # Boxes and id labels are multi-person affordances: single mode keeps the
         # view clean, like MediaPipe's _draw_tracking_overlay early-return.
