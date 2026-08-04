@@ -126,6 +126,10 @@ processing_state = {
     "analysis_fps": 0.0,
     "pose_ms": 0.0,
     "encode_ms": 0.0,
+    # Capture + body tracking (read_ms) is the stage that was never measured;
+    # without it pose_ms/encode_ms cannot account for the frame budget.
+    "read_ms": 0.0,
+    "resize_ms": 0.0,
     "latest_metrics": {},
     "latest_raw_metrics": {},
     "latest_raw_metrics_by_id": {},
@@ -673,13 +677,16 @@ def scan_camera_signals(max_cameras: int = 10) -> dict:
     return signals
 
 
-def set_stream_frame(frame=None, encode_ms: float = 0.0) -> None:
+def set_stream_frame(frame=None, encode_ms: float = 0.0, read_ms: float = 0.0,
+                     resize_ms: float = 0.0) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
     processing_state["last_frame_at"] = time.time()
     processing_state["elapsed_seconds"] = processing_state["last_frame_at"] - processing_state["started_at"]
     processing_state["frame_count"] += 1
     processing_state["encode_ms"] = float(encode_ms)
+    processing_state["read_ms"] = float(read_ms)
+    processing_state["resize_ms"] = float(resize_ms)
     if frame is not None:
         processing_state["signal_mean"] = float(frame.mean())
     if processing_state["elapsed_seconds"] > 0.25:
@@ -827,7 +834,11 @@ async def stream_live():
             and source_state["detect_enabled"]
         ):
             started = time.time()
+            read_started = time.perf_counter()
             ok, frame = await asyncio.to_thread(frame_source.read)
+            # On Kinect this covers the k4a capture AND the K4ABT inference:
+            # both run inside the frame source, not in the pose engine.
+            read_ms = (time.perf_counter() - read_started) * 1000.0
             if not ok:
                 missed_frames += 1
                 if missed_frames >= 5:
@@ -843,8 +854,10 @@ async def stream_live():
                     await asyncio.sleep(0.08)
                 continue
             missed_frames = 0
+            resize_started = time.perf_counter()
             frame = apply_live_mirror(frame)
             frame = resize_frame(frame)
+            resize_ms = (time.perf_counter() - resize_started) * 1000.0
 
             timestamp_ms = int(time.time() * 1000)
             processed = frame
@@ -892,7 +905,7 @@ async def stream_live():
             encode_started = time.perf_counter()
             encoded = await asyncio.to_thread(encode_frame, processed)
             encode_ms = (time.perf_counter() - encode_started) * 1000.0
-            set_stream_frame(frame, encode_ms)
+            set_stream_frame(frame, encode_ms, read_ms=read_ms, resize_ms=resize_ms)
             if encoded:
                 yield encoded
             frame_interval = 1.0 / max(float(source_state["target_fps"]), 1.0)
@@ -1451,6 +1464,8 @@ async def apply_input(
     processing_state["analysis_fps"] = 0.0
     processing_state["pose_ms"] = 0.0
     processing_state["encode_ms"] = 0.0
+    processing_state["read_ms"] = 0.0
+    processing_state["resize_ms"] = 0.0
     processing_state["latest_metrics"] = {}
     processing_state["latest_raw_metrics"] = {}
     processing_state["latest_raw_metrics_by_id"] = {}
@@ -3913,7 +3928,7 @@ VIEWER_HTML = """
         const oscTargetText = `${targets.length} output${targets.length === 1 ? '' : 's'}`;
         document.getElementById('metaC').textContent = `camera: ${cameraLabel}`;
         document.getElementById('metaD').textContent =
-          `pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / ${trackStatus} / osc: ${oscTargetText}`;
+          `cap ${Number(processing.read_ms || 0).toFixed(0)}ms / pose ${Number(processing.pose_ms || 0).toFixed(0)}ms / jpeg ${Number(processing.encode_ms || 0).toFixed(0)}ms / ${trackStatus} / osc: ${oscTargetText}`;
       }
       updateAddresses(payload);
 
