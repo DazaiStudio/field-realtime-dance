@@ -454,6 +454,13 @@ class KinectRuntime:
     same owner-token semantics as osc_viewer's camera globals."""
 
     POP_TIMEOUT_MS = 350
+    # Never wait forever for a capture: read() holds _lock for the whole
+    # capture+track cycle, and release() (called from the stream loop's
+    # finally, on the event loop) needs the same lock. A stalled device with
+    # the pykinect default of K4A_WAIT_INFINITE therefore freezes the entire
+    # server, not just the stream. Timing out drops to the existing
+    # missed_frames -> reopen recovery path instead.
+    CAPTURE_TIMEOUT_MS = 1000
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -550,7 +557,8 @@ class KinectRuntime:
                 self.last_error = "Kinect not open"
                 return False, None
             try:
-                capture = _guarded("capture", self._device.update)
+                capture = _guarded("capture", self._device.update,
+                                   timeout_in_ms=self.CAPTURE_TIMEOUT_MS)
                 body_frame = _guarded("body tracking", self._tracker.update,
                                       timeout_in_ms=self.POP_TIMEOUT_MS)
                 image = self._render_view(capture, body_frame)
