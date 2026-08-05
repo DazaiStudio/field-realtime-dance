@@ -90,7 +90,7 @@ for metric_name in METRIC_NAMES:
 source_state = {
     "source": "live",
     "camera_index": 0,
-    "mirror_live": True,
+    "mirror_live": False,
     "video_path": None,
     "video_name": None,
     "loop": True,
@@ -2481,7 +2481,7 @@ VIEWER_HTML = """
                     <select id="camera" name="camera_index">
                       <option value="0">0 - Camera 0</option>
                     </select>
-                    <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" checked /> Mirror camera</span>
+                    <span class="mirror-row"><input id="mirrorLive" name="mirror_live" type="checkbox" /> Mirror camera</span>
                   </div>
                 </label>
                 <label id="videoInputPanel" class="input-source-panel hidden">Video

@@ -43,7 +43,7 @@ python backend/osc_viewer.py
 
 ## Usage
 
-1. Pick a camera (mirrored by default), then press `Enter`.
+1. Pick a camera (tick **Mirror camera** if you want a mirrored view), then press `Enter`.
 2. Use the buttons at the bottom of the video: the **camera** icon turns the stream on/off, the **skeleton** icon turns pose detection (overlay + metrics + OSC) on/off.
 3. `Change Input` reopens the input card.
 
