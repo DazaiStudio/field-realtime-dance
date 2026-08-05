@@ -2005,7 +2005,7 @@ VIEWER_HTML = """
       display: grid;
       gap: 10px;
       padding: 12px;
-      border-bottom: 1px solid var(--line);
+      border-top: 1px solid var(--line);
       background: #171411;
     }
     .calibration-head {
@@ -2594,6 +2594,8 @@ VIEWER_HTML = """
       </section>
 
       <aside class="panel">
+        <div id="metrics" class="metric-grid"></div>
+        <div class="charts-link" style="padding:0 14px 12px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">Open live charts &#8599;</a></div>
         <div class="calibration-panel">
           <div class="calibration-head">
             <p class="section-title">Calibration</p>
@@ -2617,8 +2619,6 @@ VIEWER_HTML = """
             <input id="calibrationPresetFile" class="hidden" type="file" accept=".json,application/json" />
           </div>
         </div>
-        <div id="metrics" class="metric-grid"></div>
-        <div class="charts-link" style="padding:0 14px 12px;"><a href="/charts" target="_blank" style="color:var(--teal);text-decoration:none;font-size:13px;">Open live charts &#8599;</a></div>
         <div id="culturePanel" class="culture-panel hidden">
           <p class="section-title" data-tooltip-title="Culture Axis" data-tooltip-body="A rolling average of the 9 metrics compared against the Morris and BaYe training clips. 1.0 matches Morris, 0.0 matches BaYe, 0.5 sits between the two.">Culture Axis</p>
           <div class="culture-row">
