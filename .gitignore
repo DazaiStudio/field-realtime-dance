@@ -30,3 +30,8 @@ osc_viewer.*.log
 # YOLO weights are downloaded on first use of Stable ID with the MediaPipe backend
 yolov8n.pt
 logs/
+
+# Depth Anything V2 checkpoints (~95 MB each), fetched from HuggingFace.
+# The vendored source under vendor/ IS tracked; only the weights are not.
+models/depth_anything_v2/
+*.pth
