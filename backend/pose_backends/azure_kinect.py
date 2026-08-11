@@ -162,6 +162,9 @@ from keypoint_mapping import (  # noqa: E402
     _K4_L_HIP, _K4_L_KNEE, _K4_L_ANK, _K4_R_HIP, _K4_R_KNEE, _K4_R_ANK,
     _K4_NOSE, k4abt32_to_h36m17, mirror_h36m17,
 )
+from group_extent import GroupExtentTracker, hip_floor_position, union_bbox  # noqa: E402
+from group_overlay import draw_group_box  # noqa: E402
+from group_smoothing import GroupSmoother, smoothed_group_outputs  # noqa: E402
 from person_tracker import MultiPersonTrackRegistry, PersonTrack, bbox_area  # noqa: E402
 
 # H36M-17 skeleton edges for the overlay.
@@ -184,11 +187,22 @@ class AzureKinectPoseSource:
 
     def __init__(self, runtime, tracking_enabled: bool = False,
                  tracker_hold_seconds: float = 0.8,
-                 tracking_selection: str = "auto_largest", **_ignored):
+                 tracking_selection: str = "auto_largest",
+                 group_extent_enabled: bool = False,
+                 group_max_people: int = 4,
+                 group_smooth_cutoff: float = 0.0, **_ignored):
         self.runtime = runtime
         self.tracking_enabled = bool(tracking_enabled)
         self.tracking_selection = str(tracking_selection or "auto_largest")
         self.track_registry = MultiPersonTrackRegistry(hold_seconds=float(tracker_hold_seconds))
+        self.group_extent_enabled = bool(group_extent_enabled)
+        self.group_tracker = GroupExtentTracker(max_people=int(group_max_people))
+        self.group_smoother = GroupSmoother(group_smooth_cutoff)
+        self.last_group_extent = None
+        self._last_group_box = None
+        self.last_group_box_norm = None
+        # K4ABT gives absolute mm, so the floor-plane metre values are real.
+        self.group_extent_is_metric = True
         self.last_pose_quality = 0.0
         self.last_pose_valid = False
         self.last_h36m_by_id = {} if self.tracking_enabled else None
@@ -205,6 +219,21 @@ class AzureKinectPoseSource:
         if selection is not None:
             self.tracking_selection = str(selection or "auto_largest")
 
+    def configure_group_extent(self, enabled=None, max_people=None,
+                               smooth_cutoff=None, **_ignored):
+        """Group floor bbox is independent of stable id: it reads the raw
+        bodies, so it can be on with tracking off (and vice versa)."""
+        if enabled is not None and bool(enabled) != self.group_extent_enabled:
+            self.group_extent_enabled = bool(enabled)
+            self.group_tracker.reset()
+            self.group_smoother.reset()
+            self.last_group_extent = None
+            self._last_group_box = None
+        if max_people is not None:
+            self.group_tracker.max_people = max(1, int(max_people))
+        if smooth_cutoff is not None:
+            self.group_smoother.configure(smooth_cutoff)
+
     def reset_tracking(self):
         self.track_registry.reset()
         self._last_stable_tracks = []
@@ -212,6 +241,11 @@ class AzureKinectPoseSource:
         self._overlay_points_by_id = {}
         self.last_h36m_by_id = {} if self.tracking_enabled else None
         self.last_tracking = self._tracking_status("enabled" if self.tracking_enabled else "disabled")
+        self.group_tracker.reset()
+        self.group_smoother.reset()
+        self.last_group_extent = None
+        self._last_group_box = None
+        self.last_group_box_norm = None
 
     def estimate(self, frame, timestamp_ms: float, draw: bool = True):
         self.last_pose_quality = 0.0
@@ -222,6 +256,10 @@ class AzureKinectPoseSource:
             self._last_stable_tracks = []
             self._last_active_track = None
             self.last_h36m_by_id = {} if self.tracking_enabled else None
+            self.last_group_extent = None
+            self._last_group_box = None
+            self.last_group_box_norm = None
+            self.group_smoother.reset()
             self.last_tracking = self._tracking_status("error", error=str(error))
             return frame, None
 
@@ -229,9 +267,14 @@ class AzureKinectPoseSource:
         native_size = tuple(getattr(self.runtime, "native_view_size", (frame_w, frame_h)))
         mirrored = bool(getattr(self.runtime, "mirrored", False))
 
+        bodies = getattr(self.runtime, "last_bodies", []) or []
+        # Group inputs are gathered in the same pass as everything else so the
+        # drawn box and the metre values always describe the same set of bodies.
+        group_positions, group_boxes = [], []
+
         # Per-body: H36M skeleton (mirror-aware) + 2D points + registry track.
         raw_tracks, data_by_raw = [], {}
-        for body in getattr(self.runtime, "last_bodies", []) or []:
+        for body in bodies:
             quality, valid = body_quality(body.joints[:, 3])
             h36m = k4abt32_to_h36m17(body.joints)
             if mirrored:
@@ -247,6 +290,30 @@ class AzureKinectPoseSource:
             raw_tracks.append(PersonTrack(track_id=int(body.body_id), bbox=bbox,
                                           confidence=conf))
             data_by_raw[int(body.body_id)] = (h36m, pts2d, quality, valid)
+
+            if self.group_extent_enabled:
+                # Floor position comes off the RAW joints, never the H36M array
+                # -- that one is root-centered per dancer, so a bbox over it
+                # would always measure zero.
+                floor = hip_floor_position(body, mirrored=mirrored)
+                if floor is not None:
+                    group_positions.append(floor)
+                    group_boxes.append(bbox)
+
+        if self.group_extent_enabled:
+            group_now = float(timestamp_ms) / 1000.0
+            extent = self.group_tracker.update(group_positions, group_now)
+            (self.last_group_extent,
+             self._last_group_box,
+             self.last_group_box_norm) = smoothed_group_outputs(
+                self.group_smoother, extent, union_bbox(group_boxes),
+                frame.shape, group_now,
+            )
+        else:
+            self.last_group_extent = None
+            self._last_group_box = None
+            self.last_group_box_norm = None
+            self.group_smoother.reset()
 
         now = float(timestamp_ms) / 1000.0
         stable_tracks = self.track_registry.update(raw_tracks, now)
@@ -344,6 +411,8 @@ class AzureKinectPoseSource:
                 self._draw_points(frame, points, (0, 255, 255), (0, 255, 0))
             else:
                 self._draw_points(frame, points, (192, 211, 52), (192, 211, 52))
+        if self.group_extent_enabled and self._last_group_box is not None:
+            draw_group_box(frame, self._last_group_box, self.last_group_extent)
         return frame
 
     def close(self):
@@ -471,6 +540,7 @@ class KinectRuntime:
         self.view = "color"
         self.mirrored = False
         self.native_view_size = (1280, 720)
+        self.depth_mode_name = None
         self.last_bodies: list[KinectBody] = []
         self.last_error = None
         self._calibration_type_color = None
@@ -528,6 +598,8 @@ class KinectRuntime:
         config.color_resolution = pykinect.K4A_COLOR_RESOLUTION_720P
         depth_mode = resolve_depth_mode(os.getenv("FIELD_KINECT_DEPTH_MODE"))
         config.depth_mode = getattr(pykinect, depth_mode)
+        # Kept so the floor map can draw this mode's far range limit.
+        self.depth_mode_name = depth_mode
         config.camera_fps = pykinect.K4A_FRAMES_PER_SECOND_30
         config.synchronized_images_only = True
 

@@ -20,6 +20,12 @@ import uvicorn
 
 from calibration import CalibrationCollector, load_presets, normalize_presets, save_presets
 from culture_score import CultureScore
+from group_extent import LENGTH_SCALE
+from group_smoothing import (
+    DEFAULT_FRAMES as GROUP_SMOOTH_DEFAULT_FRAMES,
+    MAX_FRAMES as GROUP_SMOOTH_MAX_FRAMES,
+    cutoff_for_frames,
+)
 from frame_sources import KinectFrameSource, OpenCVFrameSource
 from osc_sender import METRIC_NAMES, OSC_ADDRESS_NAMES, OSCSender
 from pose_engine import PoseEngine, VALID_BACKENDS
@@ -44,9 +50,14 @@ camera_index_opened: Optional[int] = None
 camera_lock = threading.Lock()
 camera_cache = {"updated_at": 0.0, "cameras": []}
 camera_signal_cache = {"updated_at": 0.0, "signals": {}}
+# The two show machines (Nick / Mark). Targets are in-memory only and reset on
+# every restart, so these are the defaults rather than something to retype.
+DEFAULT_OSC_HOSTS = ("10.0.0.102", "10.0.0.103")
+DEFAULT_OSC_PORT = 9000
+
 osc_sender = OSCSender(
-    host=os.getenv("FIELD_OSC_HOST", "127.0.0.1"),
-    port=int(os.getenv("FIELD_OSC_PORT", "9000")),
+    host=os.getenv("FIELD_OSC_HOST", DEFAULT_OSC_HOSTS[0]),
+    port=int(os.getenv("FIELD_OSC_PORT", str(DEFAULT_OSC_PORT))),
     enabled=os.getenv("FIELD_OSC_ENABLED", "1") == "1",
     mode=os.getenv("FIELD_OSC_MODE", "raw"),
     alpha=float(os.getenv("FIELD_OSC_ALPHA", "1.0")),
@@ -77,6 +88,7 @@ PERFORMANCE_PRESETS = {
 DEFAULT_PERFORMANCE = "quality"
 DEFAULT_METRIC_EMA_FRAMES = 3.0
 DEFAULT_METRIC_ALPHA = 2.0 / (DEFAULT_METRIC_EMA_FRAMES + 1.0)
+DEFAULT_GROUP_SMOOTH_FRAMES = GROUP_SMOOTH_DEFAULT_FRAMES
 NO_SMOOTHING_ALPHA = 1.0
 CALIBRATION_COUNTDOWN_SECONDS = 3.0
 CAMERA_SCAN_MAX_INDEX = int(os.getenv("FIELD_CAMERA_SCAN_MAX_INDEX", "8"))
@@ -111,6 +123,13 @@ source_state = {
     "tracking_target": "auto_largest",
     "tracker_model": DEFAULT_TRACKER_MODEL,
     "tracker_yaml": DEFAULT_TRACKER_YAML,
+    "group_extent_enabled": False,
+    "group_max_people": 4,
+    "group_units": "m",
+    # Group box output smoothing, in analysis frames like the per-metric
+    # sliders (0 = off, raw passthrough). Converted to a One-Euro cutoff at the
+    # source; see group_smoothing.cutoff_for_frames.
+    "group_smooth_frames": DEFAULT_GROUP_SMOOTH_FRAMES,
     "smooth_enabled": False,
     "smooth_min_cutoff": 0.3,
     "applied_at": time.time(),
@@ -143,6 +162,7 @@ processing_state = {
     "pose_valid": False,
     "pose_quality": 0.0,
     "tracking": {"enabled": False, "state": "disabled", "count": 0},
+    "group_extent": None,
     "last_frame_at": None,
     "signal_mean": None,
     "morrisness": None,
@@ -176,6 +196,11 @@ def get_pose_engine() -> PoseEngine:
     tracking_selection = str(source_state.get("tracking_target") or "auto_largest")
     tracker_model = str(source_state.get("tracker_model") or DEFAULT_TRACKER_MODEL)
     tracker_yaml = str(source_state.get("tracker_yaml") or DEFAULT_TRACKER_YAML)
+    group_enabled = bool(source_state.get("group_extent_enabled", False))
+    group_max_people = int(source_state.get("group_max_people", 4))
+    group_smooth_cutoff = cutoff_for_frames(
+        source_state.get("group_smooth_frames", DEFAULT_GROUP_SMOOTH_FRAMES)
+    )
 
     if pose_engine is None:
         pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
@@ -184,7 +209,10 @@ def get_pose_engine() -> PoseEngine:
                                  tracking_enabled=tracking_enabled,
                                  tracker_model=tracker_model,
                                  tracker_yaml=tracker_yaml,
-                                 tracking_selection=tracking_selection)
+                                 tracking_selection=tracking_selection,
+                                 group_extent_enabled=group_enabled,
+                                 group_max_people=group_max_people,
+                                 group_smooth_cutoff=group_smooth_cutoff)
     elif pose_engine.backend_name != desired:
         old = pose_engine
         pose_engine = PoseEngine(model_path=str(pose_model_path), backend=desired,
@@ -193,7 +221,10 @@ def get_pose_engine() -> PoseEngine:
                                  tracking_enabled=tracking_enabled,
                                  tracker_model=tracker_model,
                                  tracker_yaml=tracker_yaml,
-                                 tracking_selection=tracking_selection)
+                                 tracking_selection=tracking_selection,
+                                 group_extent_enabled=group_enabled,
+                                 group_max_people=group_max_people,
+                                 group_smooth_cutoff=group_smooth_cutoff)
         try:
             old.close()
         except Exception:
@@ -204,6 +235,9 @@ def get_pose_engine() -> PoseEngine:
                                        tracker_model=tracker_model,
                                        tracker_yaml=tracker_yaml,
                                        selection=tracking_selection)
+    pose_engine.configure_group_extent(enabled=group_enabled,
+                                       max_people=group_max_people,
+                                       smooth_cutoff=group_smooth_cutoff)
     # Reflect the backend that actually loaded (it may have fallen back, e.g. to
     # MediaPipe on a machine without CUDA), so we don't retry-build every frame.
     source_state["pose_backend"] = pose_engine.backend_name
@@ -433,16 +467,41 @@ def is_broadcast_host(host: str) -> bool:
     return value == "255.255.255.255" or value.endswith(".255")
 
 
+def default_osc_targets() -> list[dict]:
+    """The two show machines, so a fresh start is already pointed at them.
+
+    Targets are not persisted anywhere -- they live in memory and reset on every
+    restart -- so before this the operator had to retype both hosts after each
+    one, and a missed retype fails silently: OSC just goes to localhost and the
+    receiving end sees nothing without an error anywhere.
+
+    Override with FIELD_OSC_TARGETS ("host:port,host:port") on another rig.
+    """
+    raw = os.getenv("FIELD_OSC_TARGETS", "").strip()
+    if raw:
+        pairs = []
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            host, _, port = chunk.rpartition(":")
+            pairs.append((host.strip() or chunk, int(port) if port.isdigit() else 9000))
+    else:
+        pairs = [(DEFAULT_OSC_HOSTS[0], DEFAULT_OSC_PORT),
+                 (DEFAULT_OSC_HOSTS[1], DEFAULT_OSC_PORT)]
+    return [{
+        "id": "default" if index == 0 else f"output-{index + 1}",
+        "name": f"Output {index + 1}",
+        "host": host,
+        "port": int(port),
+        "enabled": True,
+        "broadcast": is_broadcast_host(host),
+    } for index, (host, port) in enumerate(pairs)]
+
+
 def parse_osc_targets(raw: str, fallback_host: str, fallback_port: int) -> list[dict]:
     if not raw:
-        return [{
-            "id": "default",
-            "name": "Output 1",
-            "host": fallback_host,
-            "port": int(fallback_port),
-            "enabled": True,
-            "broadcast": is_broadcast_host(fallback_host),
-        }]
+        return default_osc_targets()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -718,6 +777,9 @@ def set_analysis_result(
     tracking: Optional[dict] = None,
     metrics_by_id: Optional[dict] = None,
     skeletons_by_id: Optional[dict] = None,
+    group_extent=None,
+    group_box=None,
+    group_metric: bool = False,
 ) -> None:
     if processing_state["started_at"] is None:
         processing_state["started_at"] = time.time()
@@ -757,6 +819,41 @@ def set_analysis_result(
             if isinstance(track, dict) and track.get("state") != "lost" and track.get("stable_id") is not None
         }
     osc_sender.send_metrics_multi(by_id, send_keys=active, keep_ids=keep_ids)
+    # Group extent is a stage-level measurement, not a dancer's, so it goes out
+    # id-free under /field/group/* alongside the /field/<id>/<metric> v2 schema
+    # rather than being folded into a dancer's stream.
+    if group_extent is not None:
+        state = {
+            "count": int(group_extent.count),
+            "held": bool(group_extent.held),
+            "metric": bool(group_metric),
+            "box": group_box,
+        }
+        # count/held describe the group on any backend; the metre values only
+        # mean anything where the sensor actually has depth. Publishing
+        # /field/group/width from MediaPipe would put screen fractions on an
+        # address a patch has every reason to read as metres.
+        osc_sender.send_named("group/count", float(group_extent.count))
+        osc_sender.send_named("group/held", 1.0 if group_extent.held else 0.0)
+        if group_metric:
+            units = source_state.get("group_units", "m")
+            payload = group_extent.as_osc(units=units)
+            state["units"] = units
+            state.update({
+                key.split("/", 1)[1]: value
+                for key, value in payload.items()
+                if key not in ("group/count", "group/held")
+            })
+            for name, value in payload.items():
+                if name in ("group/count", "group/held"):
+                    continue
+                osc_sender.send_named(name, value)
+        if group_box:
+            for key, value in group_box.items():
+                osc_sender.send_named(f"group/box_{key}", float(value))
+        processing_state["group_extent"] = state
+    else:
+        processing_state["group_extent"] = None
     if source_state.get("osc_skeleton"):
         sk_by_id = skeletons_by_id if skeletons_by_id is not None else (
             {1: skeleton} if skeleton is not None else {}
@@ -918,6 +1015,9 @@ async def stream_live():
                         tracking=getattr(engine, "last_tracking", None),
                         metrics_by_id=getattr(engine, "last_metrics_by_id", None),
                         skeletons_by_id=getattr(engine, "last_skeletons_by_id", None),
+                        group_extent=getattr(engine, "last_group_extent", None),
+                        group_box=getattr(engine, "last_group_box_norm", None),
+                        group_metric=getattr(engine, "group_extent_is_metric", False),
                     )
                     next_analysis_at = now + analysis_interval
                 elif source_state.get("overlay_enabled", True):
@@ -1072,6 +1172,9 @@ async def stream_video():
                     tracking=getattr(engine, "last_tracking", None),
                     metrics_by_id=getattr(engine, "last_metrics_by_id", None),
                     skeletons_by_id=getattr(engine, "last_skeletons_by_id", None),
+                    group_extent=getattr(engine, "last_group_extent", None),
+                    group_box=getattr(engine, "last_group_box_norm", None),
+                    group_metric=getattr(engine, "group_extent_is_metric", False),
                 )
                 next_analysis_at = now + analysis_interval
             elif source_state.get("overlay_enabled", True):
@@ -1222,6 +1325,21 @@ async def apply_smoothing(
         pose_engine.configure_smoothing(enabled=False,
                                         min_cutoff=source_state["smooth_min_cutoff"])
     return {"status": "disabled"}
+
+
+@app.post("/api/group_smoothing")
+async def apply_group_smoothing(frames: int = Form(...)):
+    """Live group-box output smoothing (no stream restart), in analysis frames.
+
+    Separate from /api/apply on purpose: that one is a whole-form overwrite
+    (SESSION_NOTES_20260810 §8), so dragging a slider through it would reset
+    every field the slider does not carry.
+    """
+    count = max(0, min(int(frames), GROUP_SMOOTH_MAX_FRAMES))
+    source_state["group_smooth_frames"] = count
+    if pose_engine is not None:
+        pose_engine.configure_group_extent(smooth_cutoff=cutoff_for_frames(count))
+    return {"status": "applied", "frames": count}
 
 
 @app.post("/api/metric_smoothing")
@@ -1395,6 +1513,10 @@ async def apply_input(
     kinect_view: str = Form("color"),
     tracking_enabled: bool = Form(False),
     tracking_target: str = Form("auto_largest"),
+    group_extent_enabled: bool = Form(False),
+    group_max_people: int = Form(4),
+    group_units: str = Form("m"),
+    group_smooth_frames: int = Form(DEFAULT_GROUP_SMOOTH_FRAMES),
     smooth_enabled: bool = Form(False),
     smooth_min_cutoff: float = Form(0.3),
     video: Optional[UploadFile] = File(None),
@@ -1425,6 +1547,14 @@ async def apply_input(
     source_state["kinect_view"] = kinect_view if kinect_view in ("color", "depth") else "color"
     source_state["tracking_enabled"] = bool(tracking_enabled)
     source_state["tracking_target"] = normalize_tracking_target(tracking_target)
+    source_state["group_extent_enabled"] = bool(group_extent_enabled)
+    source_state["group_max_people"] = max(1, min(int(group_max_people), 8))
+    source_state["group_units"] = group_units if group_units in LENGTH_SCALE else "m"
+    # Clamped, not rejected: an out-of-range frame count should not fail the
+    # whole apply. Same 0..10 range as the per-metric sliders.
+    source_state["group_smooth_frames"] = max(
+        0, min(int(group_smooth_frames), GROUP_SMOOTH_MAX_FRAMES)
+    )
     source_state["tracker_model"] = DEFAULT_TRACKER_MODEL
     source_state["tracker_yaml"] = DEFAULT_TRACKER_YAML
     source_state["osc_skeleton"] = bool(osc_skeleton)
@@ -1436,6 +1566,11 @@ async def apply_input(
     if pose_engine is not None and pose_engine.backend_name == source_state["pose_backend"]:
         pose_engine.configure_smoothing(enabled=source_state["smooth_enabled"],
                                         min_cutoff=source_state["smooth_min_cutoff"])
+        pose_engine.configure_group_extent(
+            enabled=source_state["group_extent_enabled"],
+            max_people=source_state["group_max_people"],
+            smooth_cutoff=cutoff_for_frames(source_state["group_smooth_frames"]),
+        )
 
     source_state["session_id"] += 1
     source_state["detect_enabled"] = bool(detect_enabled)
@@ -1768,6 +1903,10 @@ VIEWER_HTML = """
       letter-spacing: .06em;
     }
     .mirror-row input { width: 15px; min-height: 15px; }
+    .row-hint {
+      opacity: 0.62;
+      font-size: 11px;
+    }
     .tracking-row {
       display: flex;
       align-items: center;
@@ -2224,6 +2363,9 @@ VIEWER_HTML = """
       min-width: 0;
     }
     .metric-smooth-row .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 28px; text-align: right; white-space: nowrap; }
+    .group-smooth-slider { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .group-smooth-slider input[type=range] { flex: 1; min-width: 0; }
+    .group-smooth-slider .ms-val { color: var(--teal); font: 12px ui-monospace, monospace; min-width: 28px; text-align: right; white-space: nowrap; }
     .metric-readout {
       grid-column: 1 / -1;
       display: grid;
@@ -2413,6 +2555,9 @@ VIEWER_HTML = """
       color: var(--muted);
       font: 12px ui-monospace, monospace;
     }
+    .group-row {
+      grid-template-columns: minmax(150px, 1fr) minmax(90px, auto) !important;
+    }
     .skeleton-row {
       display: grid;
       grid-template-columns: 2.2ch minmax(88px, .7fr) repeat(3, minmax(54px, 1fr));
@@ -2507,6 +2652,23 @@ VIEWER_HTML = """
                 <input id="stableTracking" name="tracking_enabled" type="checkbox" />
                 Stable ID
               </label>
+              <label id="groupExtentRow" class="tracking-row hidden" data-tooltip-title="Group Box" data-tooltip-body="Draws one box around everyone on stage and sends it as /field/group/box_* (0-1 fractions of the frame) plus /field/group/count and /field/group/held. On Azure Kinect it also sends the real floor-plane size in metres (/field/group/width, /depth, /area, /diagonal, /cx, /cz). On MediaPipe there is no depth, so the screen box is all you get -- and it needs Stable ID on, because the person detector only runs there.">
+                <input id="groupExtent" name="group_extent_enabled" type="checkbox" />
+                Group Box <span id="groupExtentHint" class="row-hint"></span>
+              </label>
+              <label id="groupUnitsRow" class="model-row hidden">Group units
+                <select id="groupUnits" name="group_units">
+                  <option value="m">Metres</option>
+                  <option value="cm">Centimetres</option>
+                </select>
+              </label>
+              <label id="groupSmoothRow" class="model-row hidden">
+                Group smoothing
+                <span class="group-smooth-slider">
+                  <input id="groupSmooth" class="thin-range" name="group_smooth_frames" type="range" min="0" max="10" step="1" value="%DEFAULT_GROUP_SMOOTH_FRAMES%" data-tooltip-title="Group smoothing" data-tooltip-body="One-Euro filter on the group box before it goes out: it filters hard while the box is still and eases off when the cast moves, so the detector's jitter goes without adding lag to a fast crossing. Value is pose analysis frames, not rendered camera frames; 0f is off (raw). Applies to box_x1/y1/x2/y2 and, on Kinect, width/depth/area/diagonal/cx/cz. count and held are never smoothed -- they are gates, and 2.4 is not a number of dancers. The preview box shows the smoothed rectangle, so what you see is what is sent." />
+                  <span id="groupSmoothVal" class="ms-val">%DEFAULT_GROUP_SMOOTH_FRAMES%f</span>
+                </span>
+              </label>
               <div class="input-actions">
                 <button id="enterInputButton" class="enter-button" type="button">Enter</button>
                 <button id="enterCalibrationButton" class="calibrate-enter-button" type="button">Calibrate</button>
@@ -2582,6 +2744,7 @@ VIEWER_HTML = """
             <div class="output-tabs" role="tablist" aria-label="Output values">
               <button id="outputTabMetrics" class="output-tab active" type="button" role="tab" aria-selected="true">Metrics</button>
               <button id="outputTabSkeleton" class="output-tab" type="button" role="tab" aria-selected="false">Skeleton</button>
+              <button id="outputTabGroup" class="output-tab" type="button" role="tab" aria-selected="false">Group</button>
             </div>
             <label class="output-skeleton" data-tooltip-title="Skeleton OSC" data-tooltip-body="Send one OSC message per H36M joint under /sk, each with x y z values.">
               <input id="oscSkeleton" name="osc_skeleton" type="checkbox" />
@@ -2590,6 +2753,7 @@ VIEWER_HTML = """
           </div>
           <div id="addresses" class="address-list"></div>
           <div id="skeletonValues" class="skeleton-values hidden"></div>
+          <div id="groupValues" class="skeleton-values hidden"></div>
         </div>
       </section>
 
@@ -2640,6 +2804,7 @@ VIEWER_HTML = """
     const metricNames = %METRICS%;
     const oscAddressNames = %OSC_ADDRESS_NAMES%;
     const defaultMetricEmaFrames = %DEFAULT_METRIC_EMA_FRAMES%;
+    const defaultGroupSmoothFrames = %DEFAULT_GROUP_SMOOTH_FRAMES%;
     const metricsEl = document.getElementById('metrics');
     const metricOrderStorageKey = 'field.metricOrder.v1';
     const oscTargetsEl = document.getElementById('oscTargets');
@@ -3062,6 +3227,9 @@ VIEWER_HTML = """
       data.set('osc_skeleton', document.getElementById('oscSkeleton').checked ? 'true' : 'false');
       data.set('osc_mode', selectedOscMode());
       data.set('tracking_enabled', document.getElementById('stableTracking').checked ? 'true' : 'false');
+      data.set('group_extent_enabled', document.getElementById('groupExtent').checked ? 'true' : 'false');
+      data.set('group_units', document.getElementById('groupUnits').value);
+      data.set('group_smooth_frames', document.getElementById('groupSmooth').value || '0');
       data.set('tracking_target', document.getElementById('trackingTarget').value || 'auto_largest');
       data.set('smooth_enabled', 'false');
       data.set('smooth_min_cutoff', '0.3');
@@ -3335,6 +3503,15 @@ VIEWER_HTML = """
       inputDirty = true;
       trackingPanel.classList.toggle('hidden', !stableTrackingInput.checked);
     });
+    // Same dirty guard as the backend dropdown above: these are applied on
+    // Enter, so without it the 15Hz state sync unticks the box between the
+    // click and the keypress and the control looks broken.
+    document.getElementById('groupExtent').addEventListener('change', () => {
+      inputDirty = true;
+    });
+    document.getElementById('groupUnits').addEventListener('change', () => {
+      inputDirty = true;
+    });
     trackingTargetSelect.addEventListener('change', () => {
       if (isDetecting && stableTrackingInput.checked) {
         applyTrackingTarget();
@@ -3577,13 +3754,15 @@ VIEWER_HTML = """
     }
 
     function setOutputTab(tab) {
-      outputTab = tab === 'skeleton' ? 'skeleton' : 'metrics';
+      outputTab = ['skeleton', 'group'].includes(tab) ? tab : 'metrics';
       document.getElementById('addresses').classList.toggle('hidden', outputTab !== 'metrics');
       document.getElementById('skeletonValues').classList.toggle('hidden', outputTab !== 'skeleton');
-      document.getElementById('outputTabMetrics').classList.toggle('active', outputTab === 'metrics');
-      document.getElementById('outputTabSkeleton').classList.toggle('active', outputTab === 'skeleton');
-      document.getElementById('outputTabMetrics').setAttribute('aria-selected', outputTab === 'metrics' ? 'true' : 'false');
-      document.getElementById('outputTabSkeleton').setAttribute('aria-selected', outputTab === 'skeleton' ? 'true' : 'false');
+      document.getElementById('groupValues').classList.toggle('hidden', outputTab !== 'group');
+      for (const [name, id] of [['metrics', 'outputTabMetrics'], ['skeleton', 'outputTabSkeleton'], ['group', 'outputTabGroup']]) {
+        const button = document.getElementById(id);
+        button.classList.toggle('active', outputTab === name);
+        button.setAttribute('aria-selected', outputTab === name ? 'true' : 'false');
+      }
     }
 
     // Every dancer OSC is sending, not just the one the panels follow -- so a
@@ -3631,6 +3810,7 @@ VIEWER_HTML = """
         }
       }
       updateSkeletonValues(payload);
+      renderGroupValues(payload);
     }
 
     function updateSkeletonValues(payload = lastPayload) {
@@ -3658,6 +3838,67 @@ VIEWER_HTML = """
         row.innerHTML = `<span>${index}</span><span>${skeletonAddress(prefix, skeletonJoints[index], personId)}</span><span>x ${formatMetric(x)}</span><span>y ${formatMetric(y)}</span><span>z ${formatMetric(z)}</span>`;
         container.appendChild(row);
       });
+    }
+
+    function renderGroupValues(payload = lastPayload) {
+      const prefix = normalizePrefix(document.getElementById('oscNamespace').value);
+      const group = payload?.processing?.group_extent;
+      const container = document.getElementById('groupValues');
+      container.innerHTML = '';
+
+      if (!payload?.source?.group_extent_enabled) {
+        const off = document.createElement('div');
+        off.className = 'skeleton-empty';
+        off.textContent = 'Group Box is off — enable it in the input panel';
+        container.appendChild(off);
+        return;
+      }
+      if (!group) {
+        const empty = document.createElement('div');
+        empty.className = 'skeleton-empty';
+        empty.textContent = 'No group data yet — press Enter to start';
+        container.appendChild(empty);
+        return;
+      }
+
+      const header = document.createElement('div');
+      const held = group.held ? '  HELD (values are frozen)' : '';
+      header.textContent = `${prefix || ''}/group/*  n=${group.count}${held}`;
+      container.appendChild(header);
+
+      const row = (address, value, suffix) => {
+        const line = document.createElement('div');
+        line.className = 'skeleton-row group-row';
+        line.innerHTML =
+          `<span>${prefix || ''}/group/${address}</span>` +
+          `<span>${formatMetric(Number(value))}${suffix ? ' ' + suffix : ''}</span>`;
+        container.appendChild(line);
+      };
+
+      // Screen box: always present, on every backend.
+      const unit = group.metric ? (group.units === 'cm' ? 'cm' : 'm') : '';
+      for (const key of ['x1', 'y1', 'x2', 'y2', 'w', 'h', 'cx', 'cy']) {
+        row(`box_${key}`, group.box?.[key] ?? 0, '');
+      }
+      row('count', group.count, '');
+      row('held', group.held ? 1 : 0, '');
+
+      if (group.metric) {
+        const areaUnit = unit === 'cm' ? 'cm2' : 'm2';
+        row('width', group.width, unit);
+        row('depth', group.depth, unit);
+        row('area', group.area, areaUnit);
+        row('diagonal', group.diagonal, unit);
+        row('aspect', group.aspect, '');
+        row('cx', group.cx, unit);
+        row('cz', group.cz, unit);
+        row('units', group.units === 'cm' ? 100 : 1, '');
+      } else {
+        const note = document.createElement('div');
+        note.className = 'skeleton-empty';
+        note.textContent = 'Screen-space only (0-1). Real sizes need the Azure Kinect backend.';
+        container.appendChild(note);
+      }
     }
 
     function formatMetric(value) {
@@ -3749,10 +3990,50 @@ VIEWER_HTML = """
       updateKinectUi(select.value);
     }
 
+    function syncGroupSmooth(frames) {
+      const input = document.getElementById('groupSmooth');
+      const label = document.getElementById('groupSmoothVal');
+      if (!input || !label) return;
+      // Don't drag the slider out from under a hand that is on it.
+      if (document.activeElement === input) return;
+      const count = snapEmaFrames(frames ?? defaultGroupSmoothFrames);
+      input.value = String(count);
+      label.textContent = formatEmaFrames(count);
+      setRangeFill(input, count);
+    }
+
+    // Live, like the per-metric sliders: /api/apply is a whole-form overwrite,
+    // so pushing a slider drag through it would reset every other field.
+    (function initGroupSmooth() {
+      const input = document.getElementById('groupSmooth');
+      const label = document.getElementById('groupSmoothVal');
+      if (!input || !label) return;
+      setRangeFill(input, input.value);
+      input.addEventListener('input', async () => {
+        const count = snapEmaFrames(input.value);
+        label.textContent = formatEmaFrames(count);
+        setRangeFill(input, count);
+        const data = new FormData();
+        data.set('frames', String(count));
+        try { await fetch('/api/group_smoothing', { method: 'POST', body: data }); } catch (e) {}
+      });
+    })();
+
     let cameraBeforeKinect = null;
     function updateKinectUi(backendValue) {
       const isKinect = backendValue === 'azure_kinect';
       document.getElementById('kinectViewRow').classList.toggle('hidden', !isKinect);
+      // Both backends can draw the group box; only Kinect puts real metres
+      // behind it. Keep the control visible either way and say which you get.
+      document.getElementById('groupExtentRow').classList.remove('hidden');
+      const groupHint = document.getElementById('groupExtentHint');
+      if (groupHint) {
+        groupHint.textContent = isKinect ? '(real size)' : '(screen)';
+      }
+      // Units only apply to the metre values, which only the Kinect has.
+      document.getElementById('groupUnitsRow').classList.toggle('hidden', !isKinect);
+      // Smoothing applies to the screen box too, so it is useful on both.
+      document.getElementById('groupSmoothRow').classList.remove('hidden');
       const cameraSelect = document.getElementById('camera');
       if (isKinect) {
         // Park the (disabled) camera select on the Kinect entry so the UI
@@ -3939,6 +4220,9 @@ VIEWER_HTML = """
         setSourceMode(source.source === 'video' ? 'video' : 'live');
         document.getElementById('mirrorLive').checked = Boolean(source.mirror_live);
         stableTrackingInput.checked = Boolean(source.tracking_enabled);
+        document.getElementById('groupExtent').checked = Boolean(source.group_extent_enabled);
+        document.getElementById('groupUnits').value = source.group_units === 'cm' ? 'cm' : 'm';
+        syncGroupSmooth(source.group_smooth_frames);
         loopVideoInput.checked = Boolean(source.loop ?? true);
         previewVideo.loop = loopVideoInput.checked;
         const cameraSelect = document.getElementById('camera');
@@ -4067,6 +4351,7 @@ VIEWER_HTML = """
     });
     document.getElementById('outputTabMetrics').addEventListener('click', () => setOutputTab('metrics'));
     document.getElementById('outputTabSkeleton').addEventListener('click', () => setOutputTab('skeleton'));
+    document.getElementById('outputTabGroup').addEventListener('click', () => setOutputTab('group'));
     setOutputTab('metrics');
     renderOscTargets([{ id: 'default', name: 'Output 1', host: '127.0.0.1', port: 9000, enabled: true, broadcast: false }]);
     loadCameras();
@@ -4080,6 +4365,8 @@ VIEWER_HTML = """
     "%OSC_ADDRESS_NAMES%", json.dumps(OSC_ADDRESS_NAMES)
 ).replace(
     "%DEFAULT_METRIC_EMA_FRAMES%", str(int(DEFAULT_METRIC_EMA_FRAMES))
+).replace(
+    "%DEFAULT_GROUP_SMOOTH_FRAMES%", str(int(DEFAULT_GROUP_SMOOTH_FRAMES))
 )
 
 
@@ -4207,8 +4494,8 @@ def main():
     parser = argparse.ArgumentParser(description="Local FIELD input viewer with pose overlay, metrics, and OSC output.")
     parser.add_argument("--web-host", default="127.0.0.1")
     parser.add_argument("--web-port", type=int, default=9100)
-    parser.add_argument("--osc-host", default=os.getenv("FIELD_OSC_HOST", "127.0.0.1"))
-    parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", "9000")))
+    parser.add_argument("--osc-host", default=os.getenv("FIELD_OSC_HOST", DEFAULT_OSC_HOSTS[0]))
+    parser.add_argument("--osc-port", type=int, default=int(os.getenv("FIELD_OSC_PORT", str(DEFAULT_OSC_PORT))))
     parser.add_argument("--osc-mode", choices=["raw", "normalize", "fixed"], default=os.getenv("FIELD_OSC_MODE", "raw"))
     parser.add_argument("--osc-alpha", type=float, default=float(os.getenv("FIELD_OSC_ALPHA", "1.0")))
     parser.add_argument("--osc-namespace", default=os.getenv("FIELD_OSC_NAMESPACE", "/field"))
@@ -4230,13 +4517,24 @@ def main():
         alpha=args.osc_alpha,
         namespace=args.osc_namespace,
     )
+    # Both show machines are live from startup: nothing persists targets, and a
+    # forgotten retype after a restart is silent at the receiving end.
+    startup_targets = default_osc_targets()
+    if args.osc_host != DEFAULT_OSC_HOSTS[0] or args.osc_port != DEFAULT_OSC_PORT:
+        startup_targets = parse_osc_targets("", args.osc_host, args.osc_port)
+    try:
+        osc_sender.configure_targets(startup_targets)
+    except ValueError as exc:
+        print(f"OSC targets rejected, keeping the single primary output: {exc}")
+        startup_targets = parse_osc_targets("", args.osc_host, args.osc_port)
     default_preset_applied = False
     if PROJECT_DEFAULT_CALIBRATION_PRESET:
         default_preset_applied = apply_calibration_profile(PROJECT_DEFAULT_CALIBRATION_PRESET)
     print(f"FIELD input viewer: http://{args.web_host}:{args.web_port}")
     print(
-        f"OSC output: udp://{args.osc_host}:{args.osc_port} "
-        f"prefix={osc_sender.namespace} mode={osc_sender.mode} alpha={args.osc_alpha}"
+        "OSC output: "
+        + ", ".join(f"udp://{t['host']}:{t['port']}" for t in startup_targets)
+        + f" prefix={osc_sender.namespace} mode={osc_sender.mode} alpha={args.osc_alpha}"
     )
     if default_preset_applied:
         print(f"Default normalize profile: {PROJECT_DEFAULT_CALIBRATION_PRESET}")

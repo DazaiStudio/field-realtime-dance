@@ -17,12 +17,16 @@ import cv2
 import numpy as np
 
 from keypoint_mapping import mp33_to_h36m17, coco17_to_h36m17_3d
+from group_extent import GroupExtentTracker, union_bbox
+from group_overlay import draw_group_box
+from group_smoothing import GroupSmoother, smoothed_group_outputs
 from person_tracker import (
     MultiPersonTrackRegistry,
     UltralyticsPersonTracker,
     bbox_area,
     crop_frame,
     expand_bbox_rect,
+    suppress_duplicate_person_tracks,
 )
 
 os.environ.setdefault("GLOG_minloglevel", "2")
@@ -192,6 +196,9 @@ class MediaPipePoseSource:
         tracker_yaml: str = "bytetrack.yaml",
         tracker_hold_seconds: float = 0.8,
         tracking_selection: str = "auto_largest",
+        group_extent_enabled: bool = False,
+        group_max_people: int = 4,
+        group_smooth_cutoff: float = 0.0,
     ):
         _quiet_absl_logs()
         import mediapipe as mp
@@ -204,8 +211,19 @@ class MediaPipePoseSource:
         self.tracking_selection = str(tracking_selection or "auto_largest")
         self.tracker = None
         self.track_registry = MultiPersonTrackRegistry(hold_seconds=self.tracker_hold_seconds)
-        if self.tracking_enabled:
+        # Group state must be set before the preload check below reads it.
+        self.group_extent_enabled = bool(group_extent_enabled)
+        self.group_tracker = GroupExtentTracker(max_people=int(group_max_people))
+        self.group_smoother = GroupSmoother(group_smooth_cutoff)
+        # MediaPipe has no metric depth: the group box is screen-space only, so
+        # the metre-named OSC addresses must not be published from here.
+        self.group_extent_is_metric = False
+        self.last_group_extent = None
+        self._last_group_box = None
+        self.last_group_box_norm = None
+        if self.tracking_enabled or self.group_extent_enabled:
             # Load YOLO (and its first-use weight download) off the frame loop.
+            # The group box needs the detector too, even with Stable ID off.
             self._ensure_tracker().start_preload()
         self._ensure_model()
         self.landmarker = self._create_landmarker(mp.tasks.vision.RunningMode.VIDEO)
@@ -327,6 +345,8 @@ class MediaPipePoseSource:
 
     def _select_tracking_crop(self, frame, timestamp_ms: float):
         if not self.tracking_enabled:
+            # Unreachable in practice -- estimate() branches to the single-person
+            # path before ever getting here -- but kept as the honest guard.
             self.last_tracking = self._tracking_status("disabled")
             return
         tracker = self._ensure_tracker()
@@ -344,6 +364,7 @@ class MediaPipePoseSource:
         except Exception as exc:
             self._last_stable_tracks = []
             self._last_active_track = None
+            self._clear_group_box()
             self.last_tracking = self._tracking_status("error", error=str(exc))
             return
 
@@ -352,6 +373,7 @@ class MediaPipePoseSource:
         active, state = self.track_registry.choose_active(self.tracking_selection, frame.shape)
         self._last_stable_tracks = stable_tracks
         self._last_active_track = active
+        self._update_group_box(stable_tracks, frame.shape, now)
         if active is None:
             self.last_tracking = self._tracking_status(state, tracks=stable_tracks)
             return
@@ -410,6 +432,98 @@ class MediaPipePoseSource:
                 cv2.LINE_AA,
             )
 
+    def configure_group_extent(self, enabled=None, max_people=None,
+                               smooth_cutoff=None, **_ignored):
+        """Group box is independent of which dancer is 'active', but on this
+        backend it does need the person detector, which only runs when stable
+        tracking is on -- see _update_group_box."""
+        if enabled is not None and bool(enabled) != self.group_extent_enabled:
+            self.group_extent_enabled = bool(enabled)
+            self.group_tracker.reset()
+            self._clear_group_box()
+            if self.group_extent_enabled:
+                # Same reason as the constructor: never load YOLO on the frame
+                # loop, or the first group-box frame stalls the stream.
+                self._ensure_tracker().start_preload()
+        if max_people is not None:
+            self.group_tracker.max_people = max(1, int(max_people))
+        if smooth_cutoff is not None:
+            self.group_smoother.configure(smooth_cutoff)
+
+    def _clear_group_box(self):
+        self.last_group_extent = None
+        self._last_group_box = None
+        self.last_group_box_norm = None
+        # Drop the filter state too: whatever comes back next is a new entrance,
+        # not a continuation of the box that was on screen before the gap.
+        self.group_smoother.reset()
+
+    def _detect_group_only(self, frame, timestamp_ms: float):
+        """Group box with Stable ID off: raw detections, no identity at all.
+
+        Uses the detector's own boxes straight from this frame -- no registry,
+        no slot assignment, no re-identification. The hold logic still runs, so
+        a body the detector drops for a few frames does not read as the cast
+        closing up.
+        """
+        if not self.group_extent_enabled:
+            self._clear_group_box()
+            return
+        tracker = self._ensure_tracker()
+        if not tracker.is_ready():
+            if tracker.load_error:
+                self.last_tracking = self._tracking_status("error", error=tracker.load_error)
+            else:
+                tracker.start_preload()
+                self.last_tracking = self._tracking_status("loading")
+            self._clear_group_box()
+            return
+        try:
+            detections = tracker.track(frame)
+        except Exception as exc:
+            self.last_tracking = self._tracking_status("error", error=str(exc))
+            self._clear_group_box()
+            return
+        detections = suppress_duplicate_person_tracks(detections)
+        h, w = float(frame.shape[0]), float(frame.shape[1])
+        centres = [((float(d.bbox[0]) + float(d.bbox[2])) / 2.0 / max(w, 1.0),
+                    (float(d.bbox[1]) + float(d.bbox[3])) / 2.0 / max(h, 1.0))
+                   for d in detections]
+        now = float(timestamp_ms) / 1000.0
+        extent = self.group_tracker.update(centres, now)
+        (self.last_group_extent,
+         self._last_group_box,
+         self.last_group_box_norm) = smoothed_group_outputs(
+            self.group_smoother, extent, union_bbox([d.bbox for d in detections]),
+            frame.shape, now,
+        )
+
+    def _update_group_box(self, stable_tracks, frame_shape, now: float):
+        """Union of the live person boxes, plus count/hold bookkeeping.
+
+        The tracker is fed normalised box centres rather than metres -- this
+        backend has no depth -- so only its count and held flags are meaningful
+        here. The viewer publishes the metre-named addresses only when the
+        source reports group_extent_is_metric.
+        """
+        if not self.group_extent_enabled:
+            self._clear_group_box()
+            return
+        live = [t for t in stable_tracks if t.state != "lost" and t.bbox is not None]
+        h, w = float(frame_shape[0]), float(frame_shape[1])
+        centres = []
+        for track in live:
+            x1, y1, x2, y2 = [float(v) for v in track.bbox[:4]]
+            centres.append((((x1 + x2) / 2.0) / max(w, 1.0),
+                            ((y1 + y2) / 2.0) / max(h, 1.0)))
+        extent = self.group_tracker.update(centres, now)
+        (self.last_group_extent,
+         self._last_group_box,
+         self.last_group_box_norm) = smoothed_group_outputs(
+            self.group_smoother, extent, union_bbox([t.bbox for t in live]),
+            frame_shape, now,
+        )
+
     def draw_cached_overlay(self, frame):
         self._draw_tracking_overlay(frame)
         if self.tracking_enabled:
@@ -421,6 +535,8 @@ class MediaPipePoseSource:
                     self._draw_points(frame, points, joint_color=(192, 211, 52), line_color=(192, 211, 52))
         elif self._last_overlay_points:
             self._draw_points(frame, self._last_overlay_points)
+        if self.group_extent_enabled and self._last_group_box is not None:
+            draw_group_box(frame, self._last_group_box, self.last_group_extent)
         return frame
 
     def _detect_frame_pose(self, input_frame, timestamp_ms: float, stateless: bool = False):
@@ -521,8 +637,13 @@ class MediaPipePoseSource:
             self._last_overlay_points = points
         self._last_overlay_points_by_id = {}
         self.last_h36m_by_id = None
+        # The group box lives on this path too: it needs the person detector,
+        # not stable ids, and this is the branch taken with Stable ID off.
+        self._detect_group_only(frame, timestamp_ms)
         if draw and self._last_overlay_points:
             self._draw_points(frame, self._last_overlay_points)
+        if draw and self.group_extent_enabled and self._last_group_box is not None:
+            draw_group_box(frame, self._last_group_box, self.last_group_extent)
         return frame, h36m
 
     def close(self):

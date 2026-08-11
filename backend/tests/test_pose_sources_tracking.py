@@ -7,6 +7,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from group_extent import GroupExtentTracker  # noqa: E402
+from group_smoothing import GroupSmoother  # noqa: E402
 from person_tracker import StablePersonTrack  # noqa: E402
 from pose_sources import MediaPipePoseSource  # noqa: E402
 
@@ -24,6 +26,17 @@ def _bare_source(**overrides):
     src._last_overlay_points_by_id = {}
     src._last_stable_tracks = []
     src._last_active_track = None
+    # Group box off by default. estimate() consults these on every frame, and
+    # _detect_group_only reads them without getattr defaults on purpose -- a
+    # missing attribute should fail loudly here rather than be silently
+    # tolerated in production, where it once cost a whole analysis loop.
+    src.group_extent_enabled = False
+    src.group_extent_is_metric = False
+    src.group_tracker = GroupExtentTracker()
+    src.group_smoother = GroupSmoother(0.0)
+    src.last_group_extent = None
+    src._last_group_box = None
+    src.last_group_box_norm = None
     for key, value in overrides.items():
         setattr(src, key, value)
     return src

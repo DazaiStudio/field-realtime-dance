@@ -1,5 +1,10 @@
 # Session notes — 2026-08-05(anarc 的 Windows 機器,首次安裝 + Kinect 上機)
 
+> ⚠️ **後續進度見 `SESSION_NOTES_20260810.md`。**
+> 其中 **§1 的環境表已過時**(之後裝了 ultralytics + CUDA torch),
+> §5 的 OSC 契約**新增了 `/field/group/*` 一組位址**。
+> §4a 的深度覆蓋問題**仍未解**。
+
 > 這台是**新機器**,從零安裝。分支 `fix/mirror-default-off`(3 個 commit,**尚未 push**)。
 > 環境細節見 §1;**§4 是還沒做完的事**,下次接手從那裡開始。
 

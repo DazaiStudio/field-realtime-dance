@@ -19,7 +19,9 @@ class PoseEngine:
                  backend: str = "mediapipe", smoothing_enabled: bool = False,
                  smooth_min_cutoff: float = 1.5, smooth_beta: float = 0.0008,
                  tracking_enabled: bool = False, tracker_model: str = "yolov8n.pt",
-                 tracker_yaml: str = "bytetrack.yaml", tracking_selection: str = "auto_largest"):
+                 tracker_yaml: str = "bytetrack.yaml", tracking_selection: str = "auto_largest",
+                 group_extent_enabled: bool = False, group_max_people: int = 4,
+                 group_smooth_cutoff: float = 0.0):
         self.model_path = model_path
         self.backend_name = backend if backend in VALID_BACKENDS else "mediapipe"
         self.metrics_engine = DanceMetricsEngine(fps=30)
@@ -29,6 +31,12 @@ class PoseEngine:
         self.tracker_model = tracker_model
         self.tracker_yaml = tracker_yaml
         self.tracking_selection = str(tracking_selection or "auto_largest")
+        self.group_extent_enabled = bool(group_extent_enabled)
+        self.group_max_people = int(group_max_people)
+        self.group_smooth_cutoff = float(group_smooth_cutoff)
+        self.last_group_extent = None
+        self.last_group_box_norm = None
+        self.group_extent_is_metric = False
         self.last_pose_valid = False
         self.last_pose_quality = 0.0
         self.last_skeleton_h36m = None
@@ -51,6 +59,9 @@ class PoseEngine:
                     get_runtime(),
                     tracking_enabled=self.tracking_enabled,
                     tracking_selection=self.tracking_selection,
+                    group_extent_enabled=self.group_extent_enabled,
+                    group_max_people=self.group_max_people,
+                    group_smooth_cutoff=self.group_smooth_cutoff,
                 )
             except Exception as exc:
                 # pykinect/SDK missing -> degrade to MediaPipe, same pattern as
@@ -73,6 +84,9 @@ class PoseEngine:
             tracker_model=self.tracker_model,
             tracker_yaml=self.tracker_yaml,
             tracking_selection=self.tracking_selection,
+            group_extent_enabled=self.group_extent_enabled,
+            group_max_people=self.group_max_people,
+            group_smooth_cutoff=self.group_smooth_cutoff,
         )
 
     def set_backend(self, backend: str) -> None:
@@ -114,6 +128,29 @@ class PoseEngine:
                 selection=self.tracking_selection,
             )
 
+    def configure_group_extent(self, enabled: bool = None, max_people: int = None,
+                               smooth_cutoff: float = None) -> None:
+        """Both backends draw the group box; only Kinect can put real metres
+        behind it (MediaPipe has no depth, so it reports screen-space only).
+        Sources without the hook silently ignore this."""
+        if enabled is not None:
+            self.group_extent_enabled = bool(enabled)
+        if max_people is not None:
+            self.group_max_people = max(1, int(max_people))
+        if smooth_cutoff is not None:
+            self.group_smooth_cutoff = max(0.0, float(smooth_cutoff))
+        if hasattr(self.source, "configure_group_extent"):
+            self.source.configure_group_extent(
+                enabled=self.group_extent_enabled,
+                max_people=self.group_max_people,
+                smooth_cutoff=self.group_smooth_cutoff,
+            )
+        else:
+            self.last_group_extent = None
+
+    def group_extent_supported(self) -> bool:
+        return hasattr(self.source, "configure_group_extent")
+
     def set_metrics_fps(self, fps):
         self.metrics_engine.set_fps(fps)
         for engine in self._metric_engines.values():
@@ -143,6 +180,14 @@ class PoseEngine:
         self.last_pose_valid = False
         self.last_skeleton_h36m = None
         self.last_tracking = getattr(self.source, "last_tracking", {"enabled": False, "state": "disabled", "count": 0})
+        # Group extent rides beside the per-dancer path, not inside it: it is
+        # measured from raw bodies and stays valid whether or not stable id and
+        # its metrics pipeline are running.
+        self.last_group_extent = getattr(self.source, "last_group_extent", None)
+        self.last_group_box_norm = getattr(self.source, "last_group_box_norm", None)
+        self.group_extent_is_metric = bool(
+            getattr(self.source, "group_extent_is_metric", False)
+        )
 
         poses_by_id = getattr(self.source, "last_h36m_by_id", None)
         if self.tracking_enabled and isinstance(poses_by_id, dict):
